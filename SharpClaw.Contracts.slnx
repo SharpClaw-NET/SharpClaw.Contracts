@@ -1,4 +1,6 @@
 <Solution>
   <Project Path="SharpClaw.Contracts/SharpClaw.Contracts.csproj" />
   <Project Path="SharpClaw.Contracts.Tests/SharpClaw.Contracts.Tests.csproj" />
+  <Project Path="SharpClaw.Gateway.Contracts/SharpClaw.Gateway.Contracts.csproj" />
+  <Project Path="SharpClaw.Gateway.Contracts.Tests/SharpClaw.Gateway.Contracts.Tests.csproj" />
 </Solution>
