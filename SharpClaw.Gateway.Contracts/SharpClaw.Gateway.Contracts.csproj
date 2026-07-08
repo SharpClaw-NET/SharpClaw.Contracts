@@ -15,9 +15,9 @@
     <Description>Gateway contracts for SharpClaw module-contributed endpoint groups, gateway dispatch, and queued gateway responses.</Description>
     <PackageTags>sharpclaw;gateway;contracts;modules</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/mkn8rn/SharpClaw.Contracts</RepositoryUrl>
+    <RepositoryUrl>https://github.com/SharpClaw-NET/SharpClaw.Contracts</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageProjectUrl>https://github.com/mkn8rn/SharpClaw.Contracts</PackageProjectUrl>
+    <PackageProjectUrl>https://github.com/SharpClaw-NET/SharpClaw.Contracts</PackageProjectUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 

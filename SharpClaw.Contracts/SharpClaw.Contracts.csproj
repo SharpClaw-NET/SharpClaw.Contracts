@@ -15,9 +15,9 @@
     <Description>Contracts and interfaces for building SharpClaw core and runtime modules. Provides ISharpClawCoreModule, ISharpClawRuntimeModule, DTOs, and shared abstractions.</Description>
     <PackageTags>sharpclaw;modules;contracts;sdk</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/mkn8rn/SharpClaw.Contracts</RepositoryUrl>
+    <RepositoryUrl>https://github.com/SharpClaw-NET/SharpClaw.Contracts</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageProjectUrl>https://github.com/mkn8rn/SharpClaw.Contracts</PackageProjectUrl>
+    <PackageProjectUrl>https://github.com/SharpClaw-NET/SharpClaw.Contracts</PackageProjectUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
