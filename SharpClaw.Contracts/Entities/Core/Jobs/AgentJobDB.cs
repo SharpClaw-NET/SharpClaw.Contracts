@@ -50,9 +50,6 @@ public class AgentJobDB : BaseEntity
     public PermissionClearance EffectiveClearance { get; set; } = PermissionClearance.Unset;
 
     // ── Outcome ───────────────────────────────────────────────────
-    public string? ResultData { get; set; }
-    public string? ErrorLog { get; set; }
-
     // ── Token usage (accumulated during chat-driven tool calls) ───
 
     /// <summary>
@@ -82,5 +79,4 @@ public class AgentJobDB : BaseEntity
     public ChannelDB Channel { get; set; } = null!;
 
     // ── Logs ──────────────────────────────────────────────────────
-    public ICollection<AgentJobLogEntryDB> LogEntries { get; set; } = [];
 }

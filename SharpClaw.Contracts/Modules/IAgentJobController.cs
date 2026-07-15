@@ -1,5 +1,5 @@
 using SharpClaw.Contracts.DTOs.AgentActions;
-using SharpClaw.Contracts.Entities.Core.Jobs;
+using SharpClaw.Contracts.Enums;
 
 namespace SharpClaw.Contracts.Modules;
 
@@ -16,12 +16,12 @@ public interface IAgentJobController
         CancellationToken ct = default);
 
     /// <summary>Stops a running job, optionally restricted to an action-key prefix.</summary>
-    Task<AgentJobResponse?> StopJobAsync(
+    Task<AgentJobDetailResponse?> StopJobAsync(
         Guid jobId,
         string? requiredActionPrefix = null,
         CancellationToken ct = default);
 
-    /// <summary>Appends a log entry to a job.</summary>
+    /// <summary>Appends a diagnostic event to a job.</summary>
     Task AddJobLogAsync(
         Guid jobId,
         string message,
@@ -41,7 +41,7 @@ public interface IAgentJobController
         Task.FromException(new NotSupportedException(
             "The host does not support module-completed jobs."));
 
-    /// <summary>Marks a job as failed and records the exception details.</summary>
+    /// <summary>Marks a job as failed and records the exception diagnostics.</summary>
     Task MarkJobFailedAsync(
         Guid jobId,
         Exception exception,

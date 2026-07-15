@@ -10,29 +10,22 @@ namespace SharpClaw.Contracts.Modules;
 public interface IAgentJobReader
 {
     /// <summary>
-    /// Returns the full job response for <paramref name="jobId"/>,
+    /// Returns the compact persisted job detail for <paramref name="jobId"/>,
     /// or <see langword="null"/> if it does not exist.
     /// </summary>
-    Task<AgentJobResponse?> GetJobAsync(Guid jobId, CancellationToken ct = default);
-
-    /// <summary>
-    /// Returns all jobs whose <c>ActionKey</c> starts with
-    /// <paramref name="actionKeyPrefix"/>, optionally filtered by
-    /// <c>ResourceId</c>.
-    /// </summary>
-    Task<IReadOnlyList<AgentJobResponse>> ListJobsByActionPrefixAsync(
-        string actionKeyPrefix,
-        Guid? resourceId = null,
+    Task<AgentJobDetailResponse?> GetJobAsync(
+        Guid jobId,
         CancellationToken ct = default);
 
     /// <summary>
-    /// Returns lightweight job summaries (no segments or logs) whose
-    /// <c>ActionKey</c> starts with <paramref name="actionKeyPrefix"/>,
-    /// optionally filtered by <c>ResourceId</c>.
+    /// Returns a bounded page of job summaries whose <c>ActionKey</c> starts
+    /// with <paramref name="actionKeyPrefix"/>.
     /// </summary>
-    Task<IReadOnlyList<AgentJobSummaryResponse>> ListJobSummariesByActionPrefixAsync(
+    Task<AgentJobSummaryPageResponse> ListJobSummariesByActionPrefixAsync(
         string actionKeyPrefix,
         Guid? resourceId = null,
+        string? cursor = null,
+        int take = 50,
         CancellationToken ct = default);
 
     /// <summary>

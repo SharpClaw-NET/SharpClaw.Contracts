@@ -102,7 +102,6 @@ public static class ForeignModuleHostCapabilityProtocol
     public const string JobCancelPath = "/.sharpclaw/host/job/cancel";
     public const string JobCancelStaleByActionPrefixPath = "/.sharpclaw/host/job/cancel-stale-by-action-prefix";
     public const string JobGetPath = "/.sharpclaw/host/job/get";
-    public const string JobListByActionPrefixPath = "/.sharpclaw/host/job/list-by-action-prefix";
     public const string JobListSummariesByActionPrefixPath = "/.sharpclaw/host/job/list-summaries-by-action-prefix";
     public const string JobExistsWithActionPrefixPath = "/.sharpclaw/host/job/exists-with-action-prefix";
     public const string ProtocolContractsListPath = "/.sharpclaw/host/contracts/list";

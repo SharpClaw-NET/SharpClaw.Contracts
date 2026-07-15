@@ -6,8 +6,8 @@ namespace SharpClaw.Contracts.Entities.Core.Tasks;
 
 /// <summary>
 /// A single execution of a <see cref="TaskDefinitionDB"/>.  Tracks
-/// lifecycle status, parameter values, latest emitted output, and
-/// timing information.
+/// lifecycle status, parameter values, and timing information. Execution
+/// diagnostics and emitted output are owned by the host's diagnostic store.
 /// </summary>
 public class TaskInstanceDB : BaseEntity
 {
@@ -26,30 +26,10 @@ public class TaskInstanceDB : BaseEntity
     /// </summary>
     public string? ParameterValuesJson { get; set; }
 
-    /// <summary>
-    /// JSON snapshot of the last object passed to <c>Emit()</c>.
-    /// Updated on every emission so listeners that connect late
-    /// can receive the current state.
-    /// </summary>
-    public string? OutputSnapshotJson { get; set; }
-
     /// <summary>Error message when <see cref="Status"/> is <see cref="TaskInstanceStatus.Failed"/>.</summary>
     public string? ErrorMessage { get; set; }
 
     // ── Shared data snapshots ────────────────────────────────────
-
-    /// <summary>
-    /// Latest light shared data text written by agents during execution.
-    /// Updated on every write for debug/log purposes.
-    /// </summary>
-    public string? LightDataSnapshot { get; set; }
-
-    /// <summary>
-    /// JSON snapshot of all big shared data entries.  Updated on every
-    /// write/remove for debug/log purposes.  Format:
-    /// <c>[{ "id": "...", "title": "...", "content": "...", "createdAt": "..." }, ...]</c>
-    /// </summary>
-    public string? BigDataSnapshotJson { get; set; }
 
     // ── Timing ───────────────────────────────────────────────────
 
@@ -82,6 +62,4 @@ public class TaskInstanceDB : BaseEntity
 
     // ── Navigation ────────────────────────────────────────────────
 
-    public ICollection<TaskExecutionLogDB> LogEntries { get; set; } = [];
-    public ICollection<TaskOutputEntryDB> OutputEntries { get; set; } = [];
 }

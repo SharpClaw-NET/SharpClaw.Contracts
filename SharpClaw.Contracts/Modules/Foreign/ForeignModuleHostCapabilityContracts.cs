@@ -61,6 +61,8 @@ public sealed record ForeignModuleJobActionPrefixRequest
 {
     public string ActionKeyPrefix { get; init; } = string.Empty;
     public Guid? ResourceId { get; init; }
+    public string? Cursor { get; init; }
+    public int Take { get; init; } = 50;
 }
 
 public sealed record ForeignModuleJobExistsWithActionPrefixRequest
@@ -69,13 +71,10 @@ public sealed record ForeignModuleJobExistsWithActionPrefixRequest
     public string ActionKeyPrefix { get; init; } = string.Empty;
 }
 
-public sealed record ForeignModuleJobGetResponse(AgentJobResponse? Job);
+public sealed record ForeignModuleJobGetResponse(AgentJobDetailResponse? Job);
 
-public sealed record ForeignModuleJobListResponse(
-    IReadOnlyList<AgentJobResponse> Jobs);
-
-public sealed record ForeignModuleJobSummaryListResponse(
-    IReadOnlyList<AgentJobSummaryResponse> Jobs);
+public sealed record ForeignModuleJobSummaryPageResponse(
+    AgentJobSummaryPageResponse Page);
 
 public sealed record ForeignModuleCapabilityAck(
     bool Accepted = true,

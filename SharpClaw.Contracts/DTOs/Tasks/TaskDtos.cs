@@ -1,4 +1,5 @@
 using SharpClaw.Contracts.DTOs.Chat;
+using SharpClaw.Contracts.DTOs.Diagnostics;
 using SharpClaw.Contracts.Enums;
 
 namespace SharpClaw.Contracts.DTOs.Tasks;
@@ -89,14 +90,18 @@ public sealed record TaskTriggerSourceResponse(
     string Type,
     bool IsCustom);
 
-public sealed record TaskInstanceResponse(
+public sealed record TaskInstanceDetailResponse(
     Guid Id,
     Guid TaskDefinitionId,
     string TaskName,
     TaskInstanceStatus Status,
-    string? OutputSnapshotJson,
+    string? ErrorCode,
     string? ErrorMessage,
-    IReadOnlyList<TaskExecutionLogResponse> Logs,
+    DiagnosticCompleteness DiagnosticCompleteness,
+    long? FinalLogSequence,
+    long LogRecordCount,
+    long? FinalOutputSequence,
+    long OutputRecordCount,
     DateTimeOffset CreatedAt,
     DateTimeOffset? StartedAt,
     DateTimeOffset? CompletedAt,
@@ -113,16 +118,26 @@ public sealed record TaskInstanceSummaryResponse(
     DateTimeOffset? StartedAt,
     DateTimeOffset? CompletedAt);
 
-public sealed record TaskExecutionLogResponse(
-    string Message,
-    string Level,
-    DateTimeOffset Timestamp);
+public sealed record TaskInstanceSummaryPageResponse(
+    IReadOnlyList<TaskInstanceSummaryResponse> Records,
+    string? NextCursor,
+    bool HasMore);
 
-public sealed record TaskOutputEntryResponse(
-    Guid Id,
+public sealed record TaskOutputRecordResponse(
     long Sequence,
+    DateTimeOffset Timestamp,
     string? Data,
-    DateTimeOffset Timestamp);
+    ExecutionArtifactResponse? Artifact = null);
+
+public sealed record TaskOutputPageResponse(
+    IReadOnlyList<TaskOutputRecordResponse> Records,
+    string? NextCursor,
+    bool HasMore,
+    int ReturnedRecords,
+    int ReturnedBytes,
+    long SnapshotLastSequence,
+    long FirstAvailableSequence,
+    long ExpiredRecordCount);
 
 public sealed record TaskValidationResponse(
     bool IsValid,
