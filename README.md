@@ -1,8 +1,8 @@
 # SharpClaw.Contracts
 
 SharpClaw.Contracts is the public MIT-licensed contract package for SharpClaw.
-It contains the DTOs, records, interfaces, module descriptors, task extension
-contracts, provider contracts, and persistence-facing abstractions that
+It contains the DTOs, records, interfaces, module descriptors, provider
+contracts, and persistence-facing abstractions that
 SharpClaw implementations and modules are allowed to reference.
 
 Install the package when a module or integration needs to compile against the
@@ -14,7 +14,7 @@ dotnet add package SharpClaw.Contracts
 ```
 
 Core pipeline modules should reference this package when they only need to
-contribute provider, tool, task-parser, storage-contract, permission, or other
+contribute provider, tool, storage-contract, permission, or other
 pure pipeline behavior through `ISharpClawCoreModule`. Runtime modules should
 reference it through `ISharpClawRuntimeModule` when they also expose application
 surfaces such as CLI commands, API endpoints, gateway routes, or frontend

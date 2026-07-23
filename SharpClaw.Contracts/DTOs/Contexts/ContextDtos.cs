@@ -41,7 +41,7 @@ public sealed record ContextAllowedAgentsResponse(
 
 /// <summary>
 /// The effective permission for an action type after resolving the
-/// context → channel / task override chain.
+/// context → channel override chain.
 /// </summary>
 public sealed record EffectivePermissionResponse(
     string ActionKey,

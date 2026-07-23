@@ -5,10 +5,9 @@ using SharpClaw.Contracts.Entities.Core;
 namespace SharpClaw.Contracts.Entities.Core.Context;
 
 /// <summary>
-/// Groups channels and tasks under a shared set of pre-authorised
+/// Groups channels under a shared set of pre-authorised
 /// permissions.  Context-level permission grants apply automatically to
-/// every channel and task within the context unless overridden by a
-/// per-channel or per-task grant.
+/// every channel within the context unless overridden by a per-channel grant.
 /// </summary>
 public class ChannelContextDB : BaseEntity
 {
@@ -19,7 +18,7 @@ public class ChannelContextDB : BaseEntity
 
     /// <summary>
     /// Optional permission set for this context. Applies automatically to
-    /// every channel and task within the context unless overridden.
+    /// every channel within the context unless overridden.
     /// </summary>
     public Guid? PermissionSetId { get; set; }
     public PermissionSetDB? PermissionSet { get; set; }
