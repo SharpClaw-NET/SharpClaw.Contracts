@@ -1,5 +1,4 @@
 using SharpClaw.Contracts.DTOs.AgentActions;
-using SharpClaw.Contracts.DTOs.Tasks;
 using SharpClaw.Contracts.Enums;
 
 namespace SharpClaw.Contracts.DTOs.Chat;
@@ -8,7 +7,6 @@ public sealed record ChatRequest(
     string Message,
     Guid? AgentId = null,
     string ClientType = WellKnownClientKeys.Api,
-    TaskChatContext? TaskContext = null,
     string? ExternalUsername = null,
     string? ExternalDisplayName = null);
 public sealed record ChatMessageResponse(

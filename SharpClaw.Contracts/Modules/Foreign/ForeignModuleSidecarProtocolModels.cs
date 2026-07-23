@@ -2,7 +2,6 @@ using System.Text.Json;
 using SharpClaw.Contracts.DTOs.Providers;
 using SharpClaw.Contracts.Modules;
 using SharpClaw.Contracts.Providers;
-using SharpClaw.Contracts.Tasks;
 
 namespace SharpClaw.Contracts.Modules.Foreign;
 
@@ -46,13 +45,6 @@ public sealed record ForeignModuleDiscoveryResponse(
     IReadOnlyList<ModuleFrontendContribution>? FrontendContributions = null,
     IReadOnlyList<ModuleStorageContractDescriptor>? StorageContracts = null,
     IReadOnlyList<ForeignModuleCliCommandDescriptor>? CliCommands = null,
-    ForeignModuleTaskParserDescriptor? TaskParser = null,
-    IReadOnlyList<TaskOperationDescriptor>? TaskOperationDescriptors = null,
-    IReadOnlyList<ForeignModuleTaskOperationExecutorDescriptor>? TaskOperationExecutors = null,
-    IReadOnlyList<ForeignModuleTaskTriggerSourceDescriptor>? TaskTriggerSources = null,
-    IReadOnlyList<ForeignModuleTaskTriggerBindingSideEffectDescriptor>? TaskTriggerBindingSideEffects = null,
-    IReadOnlyList<ForeignModuleTaskMetricProviderDescriptor>? TaskMetricProviders = null,
-    IReadOnlyList<ForeignModuleTaskEventSinkDescriptor>? TaskEventSinks = null,
     IReadOnlyList<ForeignModuleProviderPluginDescriptor>? ProviderPlugins = null);
 
 public sealed record ForeignModuleEndpointDescriptor(
@@ -216,143 +208,6 @@ public sealed record ForeignModuleProtocolContractInvocationRequest(
 
 public sealed record ForeignModuleProtocolContractInvocationResponse(
     JsonElement Result);
-
-public sealed record ForeignModuleTaskParserDescriptor(
-    IReadOnlyList<ForeignModuleTaskParserOperationMapping>? OperationKeyMappings = null,
-    IReadOnlyList<ForeignModuleTaskParserEventMapping>? EventTriggerMappings = null,
-    IReadOnlyList<string>? SingleArgExpressionMethods = null,
-    IReadOnlyList<ForeignModuleTaskTriggerAttributeHandlerDescriptor>? TriggerAttributeHandlers = null);
-
-public sealed record ForeignModuleTaskParserOperationMapping(
-    string MethodName,
-    string StatementKey,
-    string ModuleId);
-
-public sealed record ForeignModuleTaskParserEventMapping(
-    string MethodName,
-    string TriggerKey,
-    string ModuleId);
-
-public sealed record ForeignModuleTaskTriggerAttributeHandlerDescriptor(
-    string Name,
-    IReadOnlyList<string>? NamedStringArgs = null,
-    IReadOnlyList<string>? NamedIntArgs = null,
-    IReadOnlyList<string>? NamedDoubleArgs = null);
-
-public sealed record ForeignModuleTaskOperationExecutorDescriptor(
-    string ModuleId,
-    IReadOnlyList<string> OperationKeys,
-    bool SupportsInvocation = false);
-
-public sealed record ForeignModuleTaskTriggerSourceDescriptor(
-    IReadOnlyList<string> TriggerKeys,
-    bool OwnsBindingPersistence = false);
-
-public sealed record ForeignModuleTaskTriggerBindingSideEffectDescriptor(
-    string TriggerKey);
-
-public sealed record ForeignModuleTaskMetricProviderDescriptor(
-    string MetricName,
-    string Description);
-
-public sealed record ForeignModuleTaskEventSinkDescriptor(
-    SharpClawEventType SubscribedEvents);
-
-public sealed record ForeignModuleTaskTriggerAttributeHandleRequest(
-    int ProtocolVersion,
-    string ModuleId,
-    string HandlerName,
-    ForeignModuleTaskTriggerAttributeContextDescriptor Context);
-
-public sealed record ForeignModuleTaskTriggerAttributeContextDescriptor(
-    string AttributeName,
-    int Line,
-    int ArgumentCount,
-    IReadOnlyList<string?> StringArgs,
-    IReadOnlyList<int?> IntArgs,
-    IReadOnlyList<string?> RawArgs,
-    IReadOnlyDictionary<string, string?> NamedStringArgs,
-    IReadOnlyDictionary<string, int?> NamedIntArgs,
-    IReadOnlyDictionary<string, double?> NamedDoubleArgs);
-
-public sealed record ForeignModuleTaskTriggerAttributeHandleResponse(
-    TaskTriggerDefinition? Trigger = null,
-    IReadOnlyList<ForeignModuleTaskTriggerAttributeDiagnostic>? Diagnostics = null);
-
-public sealed record ForeignModuleTaskTriggerAttributeDiagnostic(
-    TaskTriggerAttributeDiagnosticSeverity Severity,
-    string Code,
-    string Message);
-
-public sealed record ForeignModuleTaskTriggerStartRequest(
-    int ProtocolVersion,
-    string ModuleId,
-    IReadOnlyList<string> TriggerKeys,
-    IReadOnlyList<ForeignModuleTaskTriggerSourceContextDescriptor> Contexts);
-
-public sealed record ForeignModuleTaskTriggerStopRequest(
-    int ProtocolVersion,
-    string ModuleId,
-    IReadOnlyList<string> TriggerKeys);
-
-public sealed record ForeignModuleTaskTriggerSourceContextDescriptor(
-    Guid TaskDefinitionId,
-    TaskTriggerDefinition Definition);
-
-public sealed record ForeignModuleTaskTriggerDefinitionRequest(
-    int ProtocolVersion,
-    string ModuleId,
-    string TriggerKey,
-    TaskTriggerDefinition Definition);
-
-public sealed record ForeignModuleTaskTriggerBindingValueResponse(
-    string? Value);
-
-public sealed record ForeignModuleTaskTriggerSyncBindingsRequest(
-    int ProtocolVersion,
-    string ModuleId,
-    IReadOnlyList<string> TriggerKeys,
-    TaskDefinitionDescriptor Definition,
-    IReadOnlyList<TaskTriggerDefinition> OwnedTriggers);
-
-public sealed record ForeignModuleTaskTriggerSyncBindingsResponse(
-    bool Changed);
-
-public sealed record ForeignModuleTaskTriggerRemoveBindingsRequest(
-    int ProtocolVersion,
-    string ModuleId,
-    IReadOnlyList<string> TriggerKeys,
-    Guid DefinitionId);
-
-public sealed record ForeignModuleTaskTriggerBindingCreatedRequest(
-    int ProtocolVersion,
-    string ModuleId,
-    string TriggerKey,
-    TaskDefinitionDescriptor Definition,
-    TaskTriggerDefinition Trigger,
-    TaskTriggerBindingDescriptor Binding);
-
-public sealed record ForeignModuleTaskTriggerBindingRemovedRequest(
-    int ProtocolVersion,
-    string ModuleId,
-    string TriggerKey,
-    TaskTriggerBindingDescriptor Binding);
-
-public sealed record ForeignModuleTaskMetricValueRequest(
-    int ProtocolVersion,
-    string ModuleId,
-    string MetricName);
-
-public sealed record ForeignModuleTaskMetricValueResponse(
-    double Value);
-
-public sealed record ForeignModuleTaskEventSinkRequest(
-    int ProtocolVersion,
-    string ModuleId,
-    SharpClawEvent Event);
-
-public sealed record ForeignModuleTaskAckResponse(
-    bool Accepted = true);
 
 public sealed record ForeignModuleProviderPluginDescriptor(
     string ProviderKey,

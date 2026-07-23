@@ -6,7 +6,7 @@ namespace SharpClaw.Contracts.Modules;
 
 /// <summary>
 /// Contract for a SharpClaw Core module. Core modules extend the pure
-/// SharpClaw pipeline: providers, tools, task/parser hooks, resource and
+/// SharpClaw pipeline: providers, tools, resource and
 /// permission descriptors, module storage, contracts, health, and lifecycle.
 /// They cannot publish application runtime surfaces such as CLI commands,
 /// API endpoints, gateway routes, or frontend contributions.

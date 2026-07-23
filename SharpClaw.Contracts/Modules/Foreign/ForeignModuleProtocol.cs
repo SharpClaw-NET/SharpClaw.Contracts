@@ -30,19 +30,6 @@ public static class ForeignModuleProtocol
     public const string ResourceIdsPath = "/.sharpclaw/resources/ids";
     public const string ResourceLookupPath = "/.sharpclaw/resources/lookup";
     public const string CliExecutePath = "/.sharpclaw/cli/execute";
-    public const string TaskOperationExecutePath = "/.sharpclaw/tasks/operations/execute";
-    public const string TaskOperationInvokePath = "/.sharpclaw/tasks/operations/invoke";
-    public const string TaskTriggerAttributeHandlePath = "/.sharpclaw/tasks/triggers/attributes/handle";
-    public const string TaskTriggerStartPath = "/.sharpclaw/tasks/triggers/start";
-    public const string TaskTriggerStopPath = "/.sharpclaw/tasks/triggers/stop";
-    public const string TaskTriggerBindingValuePath = "/.sharpclaw/tasks/triggers/binding-value";
-    public const string TaskTriggerBindingFilterPath = "/.sharpclaw/tasks/triggers/binding-filter";
-    public const string TaskTriggerSyncBindingsPath = "/.sharpclaw/tasks/triggers/sync-bindings";
-    public const string TaskTriggerRemoveBindingsPath = "/.sharpclaw/tasks/triggers/remove-bindings";
-    public const string TaskTriggerBindingCreatedPath = "/.sharpclaw/tasks/triggers/bindings/created";
-    public const string TaskTriggerBindingRemovedPath = "/.sharpclaw/tasks/triggers/bindings/removed";
-    public const string TaskMetricValuePath = "/.sharpclaw/tasks/metrics/value";
-    public const string TaskEventSinkPath = "/.sharpclaw/tasks/events/sink";
     public const string ProviderModelsListPath = "/.sharpclaw/providers/models/list";
     public const string ProviderCapabilitiesResolvePath = "/.sharpclaw/providers/capabilities/resolve";
     public const string ProviderChatCompletionPath = "/.sharpclaw/providers/chat/complete";
@@ -67,7 +54,6 @@ public static class ForeignModuleCapability
     public const string ModuleContributionDescriptors = "moduleContributionDescriptors";
     public const string LifecycleHooks = "lifecycleHooks";
     public const string HostCapabilities = "hostCapabilities";
-    public const string TaskRuntime = "taskRuntime";
     public const string ProviderPlugins = "providerPlugins";
 }
 
@@ -106,15 +92,6 @@ public static class ForeignModuleHostCapabilityProtocol
     public const string JobExistsWithActionPrefixPath = "/.sharpclaw/host/job/exists-with-action-prefix";
     public const string ProtocolContractsListPath = "/.sharpclaw/host/contracts/list";
     public const string ProtocolContractInvokePath = "/.sharpclaw/host/contracts/invoke";
-    public const string TaskValidatePath = "/.sharpclaw/host/tasks/validate";
-    public const string TaskCreatePath = "/.sharpclaw/host/tasks/create";
-    public const string TaskGetPath = "/.sharpclaw/host/tasks/get";
-    public const string TaskListPath = "/.sharpclaw/host/tasks/list";
-    public const string TaskUpdatePath = "/.sharpclaw/host/tasks/update";
-    public const string TaskDeletePath = "/.sharpclaw/host/tasks/delete";
-    public const string TaskLaunchPath = "/.sharpclaw/host/tasks/launch";
-    public const string TaskContextExecuteStatementsPath = "/.sharpclaw/host/tasks/context/execute-statements";
-    public const string TaskContextExecuteEventHandlerPath = "/.sharpclaw/host/tasks/context/event-handler/execute";
     public const string CoreAgentIdsPath = "/.sharpclaw/host/core/agents/ids";
     public const string CoreChannelIdsPath = "/.sharpclaw/host/core/channels/ids";
     public const string CoreAgentLookupPath = "/.sharpclaw/host/core/agents/lookup";

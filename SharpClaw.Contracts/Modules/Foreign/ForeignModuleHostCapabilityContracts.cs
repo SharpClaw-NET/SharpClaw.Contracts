@@ -1,10 +1,8 @@
 using System.Text.Json;
 using SharpClaw.Contracts.DTOs.AgentActions;
 using SharpClaw.Contracts.DTOs.Chat;
-using SharpClaw.Contracts.DTOs.Tasks;
 using SharpClaw.Contracts.Modules;
 using SharpClaw.Contracts.Modules.Foreign;
-using SharpClaw.Contracts.Tasks;
 
 namespace SharpClaw.Contracts.Modules.Foreign;
 
@@ -93,62 +91,6 @@ public sealed record ForeignModuleProtocolContractInvokeRequest
 public sealed record ForeignModuleProtocolContractInvokeResponse(
     JsonElement Result);
 
-public sealed record ForeignModuleTaskSourceRequest
-{
-    public string SourceText { get; init; } = string.Empty;
-}
-
-public sealed record ForeignModuleTaskIdRequest
-{
-    public Guid Id { get; init; }
-}
-
-public sealed record ForeignModuleTaskUpdateRequest
-{
-    public Guid Id { get; init; }
-    public string? SourceText { get; init; }
-    public bool? IsActive { get; init; }
-}
-
-public sealed record ForeignModuleTaskGetResponse(
-    TaskDefinitionResponse? Definition);
-
-public sealed record ForeignModuleTaskListResponse(
-    IReadOnlyList<TaskDefinitionResponse> Definitions);
-
-public sealed record ForeignModuleTaskDeleteResponse(bool Deleted);
-
-public sealed record ForeignModuleTaskLaunchRequest
-{
-    public Guid TaskDefinitionId { get; init; }
-    public IReadOnlyDictionary<string, string>? ParameterValues { get; init; }
-    public Guid? CallerAgentId { get; init; }
-    public Guid? ChannelId { get; init; }
-    public Guid? ContextId { get; init; }
-}
-
-public sealed record ForeignModuleTaskLaunchResponse(Guid InstanceId);
-
-public sealed record ForeignModuleTaskContextExecuteStatementsRequest
-{
-    public string ContextId { get; init; } = string.Empty;
-    public Guid? ChannelId { get; init; }
-    public IReadOnlyDictionary<string, JsonElement>? Variables { get; init; }
-    public IReadOnlyList<ForeignModuleTaskStatementInvocationDescriptor> Statements { get; init; } = [];
-}
-
-public sealed record ForeignModuleTaskContextExecuteEventHandlerRequest
-{
-    public string HandlerId { get; init; } = string.Empty;
-    public Guid? ChannelId { get; init; }
-    public IReadOnlyDictionary<string, JsonElement>? Variables { get; init; }
-}
-
-public sealed record ForeignModuleTaskContextExecutionResponse(
-    TaskStatementResult Result,
-    Guid ChannelId,
-    IReadOnlyDictionary<string, JsonElement> Variables);
-
 public sealed record ForeignModuleIdsResponse(IReadOnlyList<Guid> Ids);
 
 public sealed record ForeignModuleLookupItemsResponse(
@@ -190,34 +132,7 @@ public sealed record ForeignModuleConversationSteeringListResponse(
 
 public sealed record ForeignModuleQueueMetricsResponse(
     double PendingJobCount,
-    double PendingTaskCount,
     double SchedulerPendingJobCount);
-
-public sealed record ForeignModuleHostAgentChatRequest
-{
-    public Guid InstanceId { get; init; }
-    public string TaskName { get; init; } = string.Empty;
-    public string Message { get; init; } = string.Empty;
-    public Guid? AgentId { get; init; }
-}
-
-public sealed record ForeignModuleHostAgentChatToThreadRequest
-{
-    public Guid InstanceId { get; init; }
-    public string TaskName { get; init; } = string.Empty;
-    public Guid ThreadId { get; init; }
-    public string Message { get; init; } = string.Empty;
-    public Guid? AgentId { get; init; }
-}
-
-public sealed record ForeignModuleHostAgentTextResponse(string? Text);
-
-public sealed record ForeignModuleHostAgentParseStructuredResponseRequest
-{
-    public Guid InstanceId { get; init; }
-    public string Text { get; init; } = string.Empty;
-    public string? TypeName { get; init; }
-}
 
 public sealed record ForeignModuleHostAgentFindRequest
 {
@@ -225,22 +140,6 @@ public sealed record ForeignModuleHostAgentFindRequest
 }
 
 public sealed record ForeignModuleHostAgentIdResponse(Guid? Id);
-
-public sealed record ForeignModuleHostAgentCreateAgentRequest
-{
-    public Guid InstanceId { get; init; }
-    public string Name { get; init; } = string.Empty;
-    public Guid ModelId { get; init; }
-    public string? SystemPrompt { get; init; }
-    public string? CustomId { get; init; }
-}
-
-public sealed record ForeignModuleHostAgentCreateThreadRequest
-{
-    public Guid InstanceId { get; init; }
-    public Guid? ChannelId { get; init; }
-    public string? ThreadName { get; init; }
-}
 
 public sealed record ForeignModuleHostAgentCreateRoleRequest
 {
@@ -257,21 +156,6 @@ public sealed record ForeignModuleHostAgentAssignRoleRequest
 {
     public Guid AgentId { get; init; }
     public Guid RoleId { get; init; }
-}
-
-public sealed record ForeignModuleHostAgentCreateChannelRequest
-{
-    public Guid InstanceId { get; init; }
-    public string Title { get; init; } = string.Empty;
-    public Guid AgentId { get; init; }
-    public string? CustomId { get; init; }
-}
-
-public sealed record ForeignModuleHostAgentAddAllowedAgentRequest
-{
-    public Guid InstanceId { get; init; }
-    public Guid AgentId { get; init; }
-    public Guid? ChannelId { get; init; }
 }
 
 public sealed record ForeignModuleAgentCreateRequest

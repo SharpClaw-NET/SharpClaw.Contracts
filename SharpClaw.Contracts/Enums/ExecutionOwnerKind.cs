@@ -5,7 +5,4 @@ public enum ExecutionOwnerKind
 {
     /// <summary>An agent action job.</summary>
     AgentJob = 0,
-
-    /// <summary>A task instance.</summary>
-    TaskInstance = 1,
 }

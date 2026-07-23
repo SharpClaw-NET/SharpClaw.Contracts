@@ -2,7 +2,6 @@ using System.Text.Json;
 using SharpClaw.Contracts.Modules;
 using SharpClaw.Contracts.Modules.Foreign;
 using SharpClaw.Contracts.Providers;
-using SharpClaw.Contracts.Tasks;
 
 namespace SharpClaw.Contracts.Tests;
 
@@ -54,7 +53,7 @@ public sealed class ForeignModuleProtocolModelTests
             "demo",
             ModuleManifestRuntimeInfo.DotNet,
             "10.0.9",
-            [ForeignModuleCapability.Endpoints, ForeignModuleCapability.TaskRuntime]);
+            [ForeignModuleCapability.Endpoints]);
 
         var json = JsonSerializer.Serialize(response, JsonOptions);
         var roundTrip = JsonSerializer.Deserialize<ForeignModuleHandshakeResponse>(json, JsonOptions)!;
@@ -66,38 +65,6 @@ public sealed class ForeignModuleProtocolModelTests
         Assert.Equal(response.Runtime, roundTrip.Runtime);
         Assert.Equal(response.RuntimeVersion, roundTrip.RuntimeVersion);
         Assert.Equal(response.Capabilities, roundTrip.Capabilities);
-    }
-
-    [Fact]
-    public void TaskOperationExecutionRequestPreservesSnapshotAndVariables()
-    {
-        var instanceId = Guid.Parse("11111111-1111-1111-1111-111111111111");
-        var channelId = Guid.Parse("22222222-2222-2222-2222-222222222222");
-        var request = new ForeignModuleTaskOperationExecutionRequest(
-            ForeignModuleProtocol.Version,
-            "demo.module",
-            "demo.echo",
-            new ForeignModuleTaskOperationExecutionContextSnapshot(
-                instanceId,
-                channelId,
-                new Dictionary<string, JsonElement>
-                {
-                    ["count"] = JsonSerializer.SerializeToElement(3),
-                },
-                [new ForeignModuleTaskEventHandlerSnapshot("demo.event", "item", "handler-1")],
-                "ctx-1"),
-            ["hello"],
-            "count",
-            "result");
-
-        var json = JsonSerializer.Serialize(request, JsonOptions);
-        var roundTrip = JsonSerializer.Deserialize<ForeignModuleTaskOperationExecutionRequest>(json, JsonOptions)!;
-
-        Assert.Equal("demo.echo", roundTrip.OperationKey);
-        Assert.Equal(instanceId, roundTrip.Context.InstanceId);
-        Assert.Equal(3, roundTrip.Context.Variables!["count"].GetInt32());
-        Assert.Equal("handler-1", roundTrip.Context.EventHandlers![0].HandlerCallbackId);
-        Assert.Equal("result", roundTrip.ResultVariable);
     }
 
     [Fact]
@@ -117,13 +84,6 @@ public sealed class ForeignModuleProtocolModelTests
                     SupportsStreaming: true,
                     SupportsDynamicCompletionBehavior: true)
             ],
-            TaskOperationExecutors:
-            [
-                new ForeignModuleTaskOperationExecutorDescriptor(
-                    "demo.module",
-                    ["demo.echo"],
-                    SupportsInvocation: true)
-            ],
             ProviderPlugins:
             [
                 new ForeignModuleProviderPluginDescriptor(
@@ -138,42 +98,9 @@ public sealed class ForeignModuleProtocolModelTests
 
         Assert.Equal("echo", roundTrip.Tools![0].Name);
         Assert.Equal("CanEcho", roundTrip.Tools![0].Permission!.DelegateTo);
-        Assert.True(roundTrip.TaskOperationExecutors![0].SupportsInvocation);
         Assert.Equal("Demo Provider", roundTrip.ProviderPlugins![0].ParameterSpec!.ProviderName);
         Assert.True(roundTrip.ProviderPlugins![0].ParameterSpec!.SupportsStrictTools);
     }
-
-    [Fact]
-    public void TaskStatementDescriptorProjectionPreservesNestedShape()
-    {
-        var nested = new TestTaskStatementInvocation("demo.child", RawExpression: "value");
-        var statement = new TestTaskStatementInvocation(
-            "demo.parent",
-            VariableName: "item",
-            ResultVariable: "result",
-            Arguments: ["one", "two"],
-            Body: [nested]);
-
-        var descriptor = ForeignModuleTaskStatementInvocationDescriptor.From(statement);
-
-        Assert.Equal("demo.parent", descriptor.StatementKey);
-        Assert.Equal("item", descriptor.VariableName);
-        Assert.Equal(["one", "two"], descriptor.Arguments);
-        Assert.Equal("demo.child", descriptor.Body![0].StatementKey);
-        Assert.Equal("value", descriptor.Body![0].RawExpression);
-    }
-
-    private sealed record TestTaskStatementInvocation(
-        string StatementKey,
-        string? VariableName = null,
-        string? TypeName = null,
-        string? ResultVariable = null,
-        string? RawExpression = null,
-        IReadOnlyList<string>? Arguments = null,
-        string? ModuleTriggerKey = null,
-        string? HandlerParameter = null,
-        IReadOnlyList<ITaskStatementInvocation>? Body = null,
-        IReadOnlyList<ITaskStatementInvocation>? ElseBody = null) : ITaskStatementInvocation;
 
     private sealed class TestCompletionParameterSpec : ICompletionParameterSpec
     {
