@@ -11,7 +11,6 @@ string? ActionKey = null,
 Guid? ResourceId = null,
 Guid? AgentId = null,
 Guid? CallerAgentId = null,
-string? ScriptJson = null,
 string? WorkingDirectory = null);
 
 public sealed record ApproveAgentJobRequest(
@@ -38,7 +37,6 @@ public sealed record AgentJobResponse(
     DateTimeOffset CreatedAt,
     DateTimeOffset? StartedAt,
     DateTimeOffset? CompletedAt,
-    string? ScriptJson = null,
     string? WorkingDirectory = null,
     TokenUsageResponse? JobCost = null,
     ChannelCostResponse? ChannelCost = null);
@@ -64,7 +62,6 @@ public sealed record AgentJobDetailResponse(
     DateTimeOffset CreatedAt,
     DateTimeOffset? StartedAt,
     DateTimeOffset? CompletedAt,
-    string? ScriptJson = null,
     string? WorkingDirectory = null,
     TokenUsageResponse? JobCost = null,
     ChannelCostResponse? ChannelCost = null);

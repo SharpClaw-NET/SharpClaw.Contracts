@@ -33,12 +33,6 @@ public class AgentJobDB : BaseEntity
     public Guid? ResourceId { get; set; }
 
     /// <summary>
-    /// Payload submitted with the job.  The format depends on the
-    /// action type or module envelope.
-    /// </summary>
-    public string? ScriptJson { get; set; }
-
-    /// <summary>
     /// Absolute path where the dangerous shell process should be
     /// spawned.  Overrides the <see cref="SystemUserDB.WorkingDirectory"/>
     /// when set.  Not validated or sandboxed — dangerous by design.

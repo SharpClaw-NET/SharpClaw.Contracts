@@ -25,6 +25,20 @@ public sealed class ModuleManifestRuntimeInfoTests
     }
 
     [Fact]
+    public void PublicRuntimeContractExposesOnlyDotNetAndHostModeMetadata()
+    {
+        var publicProperties = typeof(ModuleManifestRuntimeInfo)
+            .GetProperties()
+            .Select(property => property.Name)
+            .OrderBy(name => name)
+            .ToArray();
+
+        Assert.Equal(
+            ["DotNetDefault", "HostMode", "IsDotNet", "IsInProcessHostMode", "IsSidecarHostMode", "ModuleType", "Runtime"],
+            publicProperties);
+    }
+
+    [Fact]
     public void EnsureDotNetEntryAssemblyAllowsDllFileName()
     {
         var manifest = CreateManifest(entryAssembly: "Demo.Module.dll");
@@ -70,38 +84,15 @@ public sealed class ModuleManifestRuntimeInfoTests
     }
 
     [Fact]
-    public void EnsureDotNetEntryAssemblyRejectsScriptRuntime()
+    public void EnsureDotNetEntryAssemblyRejectsUnsupportedRuntime()
     {
         var manifest = CreateManifest(entryAssembly: "Demo.Module.dll");
-        var runtime = new ModuleManifestRuntimeInfo(ModuleManifestRuntimeInfo.Node, "index.js");
+        var runtime = new ModuleManifestRuntimeInfo("unsupported-runtime");
 
         var ex = Assert.Throws<NotSupportedException>(() =>
             runtime.EnsureDotNetEntryAssembly(manifest));
 
-        Assert.Contains("node", ex.Message);
-    }
-
-    [Fact]
-    public void EnsureScriptEntrypointAllowsRelativeEntrypoint()
-    {
-        var manifest = CreateManifest(entryAssembly: "");
-        var runtime = new ModuleManifestRuntimeInfo(ModuleManifestRuntimeInfo.Node, "index.js");
-
-        runtime.EnsureScriptEntrypoint(manifest);
-    }
-
-    [Fact]
-    public void EnsureScriptEntrypointRejectsRootedPath()
-    {
-        var manifest = CreateManifest(entryAssembly: "");
-        var runtime = new ModuleManifestRuntimeInfo(
-            ModuleManifestRuntimeInfo.Python,
-            Path.GetFullPath("module.py"));
-
-        var ex = Assert.Throws<InvalidOperationException>(() =>
-            runtime.EnsureScriptEntrypoint(manifest));
-
-        Assert.Contains("script entrypoint", ex.Message);
+        Assert.Contains("dotnet", ex.Message);
     }
 
     [Fact]
