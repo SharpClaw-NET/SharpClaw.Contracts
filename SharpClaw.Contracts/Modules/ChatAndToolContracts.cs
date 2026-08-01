@@ -3,6 +3,11 @@ using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Contracts.Modules;
 
+public sealed record ToolHoldRequirement(
+    string Code,
+    string Description,
+    string? ApprovalContract = null);
+
 /// <summary>Input for one direct chat turn.</summary>
 public sealed record ChatTurnInput(
     string Message,

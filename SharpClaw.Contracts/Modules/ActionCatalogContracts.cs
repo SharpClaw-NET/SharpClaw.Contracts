@@ -85,6 +85,7 @@ public static class SharpClawActionCatalog
         "provider.client.create",
         "provider.request.prepare",
         "provider.request.serialize",
+        "provider.request.serialize.after",
         "provider.request.send",
         "provider.stream.open",
         "provider.stream.chunk.receive",

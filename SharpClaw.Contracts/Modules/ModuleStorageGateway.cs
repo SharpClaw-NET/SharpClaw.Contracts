@@ -12,6 +12,12 @@ public interface IModuleStorageGateway
         string operation,
         JsonElement parameters,
         CancellationToken ct = default);
+
+    Task<ModuleStorageMutationAndOutboxResult> CommitMutationAndOutboxAsync(
+        string moduleId,
+        string storageName,
+        ModuleStorageMutationAndOutboxRequest request,
+        CancellationToken ct = default);
 }
 
 public interface IModuleStorageContractProvider
@@ -33,6 +39,15 @@ public static class ModuleStorageOperations
     public const string List = "list";
     public const string Query = "query";
     public const string Claim = "claim";
+    public const string MutateAndOutbox = "mutateAndOutbox";
+}
+
+public static class ModuleStorageErrors
+{
+    public const string RevisionConflict = "revision_conflict";
+    public const string StaleClaim = "stale_claim";
+    public const string FencingRejected = "fencing_rejected";
+    public const string AtomicCommitRejected = "atomic_commit_rejected";
 }
 
 public static class ModuleStorageComparisonOperators
@@ -94,12 +109,68 @@ public sealed record ModuleDocumentClaimPayload(
     ModuleDocumentIndexOrder? OrderBy,
     int? Limit,
     object Patch,
-    object? Indexes = null);
+    object? Indexes = null,
+    long? ExpectedRevision = null,
+    ModuleStorageClaimFence? Fence = null);
 
 public sealed record ModuleDocumentWrite<T>(
     string Key,
     T Value,
+    object? Indexes = null,
+    long? ExpectedRevision = null);
+
+public sealed record ModuleDocumentDelete(
+    string Key,
+    long? ExpectedRevision = null,
+    ModuleStorageClaimFence? Fence = null);
+
+public sealed record ModuleStorageRevision(string Key, long Revision);
+
+/// <summary>Revision and fencing data required for one claimed mutation.</summary>
+public sealed record ModuleStorageClaimFence(
+    Guid ClaimId,
+    Guid FencingToken,
+    DateTimeOffset LeaseExpiresAt,
+    long ExpectedRevision);
+
+public sealed record ModuleDocumentRecord<T>(
+    string Key,
+    T? Value,
+    long Revision,
     object? Indexes = null);
+
+public sealed record ModuleStorageMutation(
+    string Operation,
+    string Key,
+    JsonElement? Value = null,
+    JsonElement? Patch = null,
+    object? Indexes = null,
+    long? ExpectedRevision = null);
+
+public sealed record ModuleStorageOutboxMessage(
+    string MessageType,
+    string IdempotencyKey,
+    JsonElement Payload,
+    DateTimeOffset? NotBefore = null);
+
+/// <summary>
+/// One atomic state and outbox commit. The host must reject the whole request
+/// when any expected revision or fence is stale.
+/// </summary>
+public sealed record ModuleStorageMutationAndOutboxRequest(
+    IReadOnlyList<ModuleStorageMutation> Mutations,
+    IReadOnlyList<ModuleStorageOutboxMessage> Outbox,
+    ModuleStorageClaimFence? Fence = null);
+
+public sealed record ModuleStorageMutationAndOutboxResult(
+    IReadOnlyList<ModuleStorageRevision> Revisions,
+    IReadOnlyList<string> OutboxMessageIds,
+    long CommitRevision);
+
+public sealed record ModuleStorageRevisionConflict(
+    string Key,
+    long? ExpectedRevision,
+    long ActualRevision);
 
 public sealed class ModuleDocumentStore<T>(
     IModuleStorageGateway gateway,
@@ -113,6 +184,17 @@ public sealed class ModuleDocumentStore<T>(
     };
 
     public async Task<T?> GetAsync(string key, CancellationToken ct = default)
+    {
+        var record = await GetRecordAsync(key, ct);
+        if (record is null)
+            return default;
+
+        return record.Value;
+    }
+
+    public async Task<ModuleDocumentRecord<T>?> GetRecordAsync(
+        string key,
+        CancellationToken ct = default)
     {
         using var parameters = JsonDocument.Parse(
             JsonSerializer.Serialize(new { key }, _jsonOptions));
@@ -131,7 +213,22 @@ public sealed class ModuleDocumentStore<T>(
             return default;
         }
 
-        return value.Deserialize<T>(_jsonOptions);
+        var item = value.Deserialize<T>(_jsonOptions);
+        if (item is null)
+            return default;
+
+        var responseKey = response.TryGetProperty("key", out var keyElement)
+            ? keyElement.GetString() ?? key
+            : key;
+        var revision = response.TryGetProperty("revision", out var revisionElement)
+            && revisionElement.TryGetInt64(out var parsedRevision)
+            ? parsedRevision
+            : 0;
+        JsonElement? indexes = response.TryGetProperty("indexes", out var indexesElement)
+            ? indexesElement.Clone()
+            : null;
+
+        return new ModuleDocumentRecord<T>(responseKey, item, revision, indexes);
     }
 
     public async Task<IReadOnlyList<T>> ListAsync(CancellationToken ct = default)
@@ -144,7 +241,10 @@ public sealed class ModuleDocumentStore<T>(
             parameters.RootElement,
             ct);
 
-        return DeserializeRecords(response);
+        return DeserializeDocumentRecords(response)
+            .Where(record => record.Value is not null)
+            .Select(record => record.Value!)
+            .ToArray();
     }
 
     public ModuleDocumentQuery<T> Query() => new(this);
@@ -155,7 +255,9 @@ public sealed class ModuleDocumentStore<T>(
         string key,
         T value,
         object? indexes = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        long? expectedRevision = null,
+        ModuleStorageClaimFence? fence = null)
     {
         var payload = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
@@ -163,6 +265,8 @@ public sealed class ModuleDocumentStore<T>(
             ["value"] = value,
         };
         if (indexes is not null) payload["indexes"] = indexes;
+        if (expectedRevision is not null) payload["expectedRevision"] = expectedRevision;
+        if (fence is not null) payload["fence"] = fence;
 
         using var parameters = JsonDocument.Parse(JsonSerializer.Serialize(payload, _jsonOptions));
         await gateway.InvokeAsync(
@@ -182,12 +286,13 @@ public sealed class ModuleDocumentStore<T>(
         var payload = new
         {
             records = records.Select(record => new
-            {
-                key = record.Key,
-                value = record.Value,
-                indexes = record.Indexes,
-            }).ToArray(),
-        };
+                {
+                    key = record.Key,
+                    value = record.Value,
+                    indexes = record.Indexes,
+                    expectedRevision = record.ExpectedRevision,
+                }).ToArray(),
+            };
 
         using var parameters = JsonDocument.Parse(JsonSerializer.Serialize(payload, _jsonOptions));
         var response = await gateway.InvokeAsync(
@@ -202,10 +307,23 @@ public sealed class ModuleDocumentStore<T>(
             : 0;
     }
 
-    public async Task<bool> DeleteAsync(string key, CancellationToken ct = default)
+    public Task<bool> DeleteAsync(string key, CancellationToken ct = default) =>
+        DeleteAsync(key, ct, null);
+
+    public async Task<bool> DeleteAsync(
+        string key,
+        CancellationToken ct,
+        long? expectedRevision,
+        ModuleStorageClaimFence? fence = null)
     {
-        using var parameters = JsonDocument.Parse(
-            JsonSerializer.Serialize(new { key }, _jsonOptions));
+        var payload = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["key"] = key,
+        };
+        if (expectedRevision is not null) payload["expectedRevision"] = expectedRevision;
+        if (fence is not null) payload["fence"] = fence;
+
+        using var parameters = JsonDocument.Parse(JsonSerializer.Serialize(payload, _jsonOptions));
         var response = await gateway.InvokeAsync(
             moduleId,
             storageName,
@@ -237,17 +355,59 @@ public sealed class ModuleDocumentStore<T>(
             : 0;
     }
 
+    public async Task<int> DeleteManyAsync(
+        IEnumerable<ModuleDocumentDelete> records,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+
+        using var parameters = JsonDocument.Parse(
+            JsonSerializer.Serialize(new { records = records.ToArray() }, _jsonOptions));
+        var response = await gateway.InvokeAsync(
+            moduleId,
+            storageName,
+            ModuleStorageOperations.BatchDelete,
+            parameters.RootElement,
+            ct);
+
+        return response.TryGetProperty("deleted", out var deleted) && deleted.TryGetInt32(out var count)
+            ? count
+            : 0;
+    }
+
     internal Task<IReadOnlyList<T>> QueryAsync(
         ModuleDocumentQueryPayload payload,
         CancellationToken ct) =>
         InvokeRecordsAsync(ModuleStorageOperations.Query, payload, ct);
+
+    internal Task<IReadOnlyList<ModuleDocumentRecord<T>>> QueryRecordsAsync(
+        ModuleDocumentQueryPayload payload,
+        CancellationToken ct) =>
+        InvokeDocumentRecordsAsync(ModuleStorageOperations.Query, payload, ct);
 
     internal Task<IReadOnlyList<T>> ClaimAsync(
         ModuleDocumentClaimPayload payload,
         CancellationToken ct) =>
         InvokeRecordsAsync(ModuleStorageOperations.Claim, payload, ct);
 
+    internal Task<IReadOnlyList<ModuleDocumentRecord<T>>> ClaimRecordsAsync(
+        ModuleDocumentClaimPayload payload,
+        CancellationToken ct) =>
+        InvokeDocumentRecordsAsync(ModuleStorageOperations.Claim, payload, ct);
+
     private async Task<IReadOnlyList<T>> InvokeRecordsAsync(
+        string operation,
+        object payload,
+        CancellationToken ct)
+    {
+        var records = await InvokeDocumentRecordsAsync(operation, payload, ct);
+        return records
+            .Where(record => record.Value is not null)
+            .Select(record => record.Value!)
+            .ToArray();
+    }
+
+    private async Task<IReadOnlyList<ModuleDocumentRecord<T>>> InvokeDocumentRecordsAsync(
         string operation,
         object payload,
         CancellationToken ct)
@@ -260,10 +420,10 @@ public sealed class ModuleDocumentStore<T>(
             parameters.RootElement,
             ct);
 
-        return DeserializeRecords(response);
+        return DeserializeDocumentRecords(response);
     }
 
-    private IReadOnlyList<T> DeserializeRecords(JsonElement response)
+    private IReadOnlyList<ModuleDocumentRecord<T>> DeserializeDocumentRecords(JsonElement response)
     {
         if (!response.TryGetProperty("records", out var records)
             || records.ValueKind != JsonValueKind.Array)
@@ -271,7 +431,7 @@ public sealed class ModuleDocumentStore<T>(
             return [];
         }
 
-        var result = new List<T>();
+        var result = new List<ModuleDocumentRecord<T>>();
         foreach (var record in records.EnumerateArray())
         {
             if (!record.TryGetProperty("value", out var value)
@@ -280,8 +440,21 @@ public sealed class ModuleDocumentStore<T>(
                 continue;
             }
 
-            if (value.Deserialize<T>(_jsonOptions) is { } item)
-                result.Add(item);
+            if (value.Deserialize<T>(_jsonOptions) is not { } item)
+                continue;
+
+            var key = record.TryGetProperty("key", out var keyElement)
+                ? keyElement.GetString() ?? string.Empty
+                : string.Empty;
+            var revision = record.TryGetProperty("revision", out var revisionElement)
+                && revisionElement.TryGetInt64(out var parsedRevision)
+                ? parsedRevision
+                : 0;
+            JsonElement? indexes = record.TryGetProperty("indexes", out var indexesElement)
+                ? indexesElement.Clone()
+                : null;
+
+            result.Add(new ModuleDocumentRecord<T>(key, item, revision, indexes));
         }
 
         return result;
@@ -318,6 +491,12 @@ public sealed class ModuleDocumentQuery<T>
     public Task<IReadOnlyList<T>> ToListAsync(CancellationToken ct = default) =>
         _store.QueryAsync(new ModuleDocumentQueryPayload(_filters.ToArray(), _orderBy, _limit), ct);
 
+    public Task<IReadOnlyList<ModuleDocumentRecord<T>>> ToRecordsAsync(
+        CancellationToken ct = default) =>
+        _store.QueryRecordsAsync(
+            new ModuleDocumentQueryPayload(_filters.ToArray(), _orderBy, _limit),
+            ct);
+
     internal ModuleDocumentQuery<T> AddFilter(
         string indexName,
         string comparisonOperator,
@@ -342,6 +521,8 @@ public sealed class ModuleDocumentClaim<T>
     private int? _limit;
     private object? _patch;
     private object? _indexes;
+    private long? _expectedRevision;
+    private ModuleStorageClaimFence? _fence;
 
     internal ModuleDocumentClaim(ModuleDocumentStore<T> store)
     {
@@ -370,13 +551,54 @@ public sealed class ModuleDocumentClaim<T>
         return this;
     }
 
+    public ModuleDocumentClaim<T> AtRevision(long expectedRevision)
+    {
+        if (expectedRevision < 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedRevision));
+
+        _expectedRevision = expectedRevision;
+        return this;
+    }
+
+    public ModuleDocumentClaim<T> WithFence(ModuleStorageClaimFence fence)
+    {
+        ArgumentNullException.ThrowIfNull(fence);
+        _fence = fence;
+        return this;
+    }
+
     public Task<IReadOnlyList<T>> ToListAsync(CancellationToken ct = default)
     {
         if (_patch is null)
             throw new InvalidOperationException("Module storage claim requires a patch before execution.");
 
         return _store.ClaimAsync(
-            new ModuleDocumentClaimPayload(_filters.ToArray(), _orderBy, _limit, _patch, _indexes),
+            new ModuleDocumentClaimPayload(
+                _filters.ToArray(),
+                _orderBy,
+                _limit,
+                _patch,
+                _indexes,
+                _expectedRevision,
+                _fence),
+            ct);
+    }
+
+    public Task<IReadOnlyList<ModuleDocumentRecord<T>>> ToRecordsAsync(
+        CancellationToken ct = default)
+    {
+        if (_patch is null)
+            throw new InvalidOperationException("Module storage claim requires a patch before execution.");
+
+        return _store.ClaimRecordsAsync(
+            new ModuleDocumentClaimPayload(
+                _filters.ToArray(),
+                _orderBy,
+                _limit,
+                _patch,
+                _indexes,
+                _expectedRevision,
+                _fence),
             ct);
     }
 

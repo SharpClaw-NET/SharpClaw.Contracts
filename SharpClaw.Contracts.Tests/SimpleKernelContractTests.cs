@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Reflection;
 using SharpClaw.Contracts.Modules;
 
 namespace SharpClaw.Contracts.Tests;
@@ -160,16 +162,35 @@ public sealed class SimpleKernelContractTests
     [Fact]
     public void JobsCatalogHas46FamiliesAnd138UniqueKeys()
     {
-        Assert.Equal(46, JobsActionCoverageManifest.FamilyCount);
-        Assert.Equal(138, JobsActionCoverageManifest.KeyCount);
-        Assert.Equal(138, JobsActionCoverageManifest.Keys.Select(key => key.Value).Distinct().Count());
+        Assert.Equal(46, SharpClawActionCatalog.JobsFamilies.Count);
+        Assert.Equal(138, SharpClawActionCatalog.Jobs.Count);
+        Assert.Equal(138, SharpClawActionCatalog.Jobs.Select(key => key.Value).Distinct().Count());
 
-        foreach (var family in JobsActionCoverageManifest.Families)
+        foreach (var family in SharpClawActionCatalog.JobsFamilies)
         {
-            Assert.Contains(new SharpClawActionKey(family), JobsActionCoverageManifest.Keys);
-            Assert.Contains(new SharpClawActionKey($"{family}.before"), JobsActionCoverageManifest.Keys);
-            Assert.Contains(new SharpClawActionKey($"{family}.after"), JobsActionCoverageManifest.Keys);
+            Assert.Contains(new SharpClawActionKey(family), SharpClawActionCatalog.Jobs);
+            Assert.Contains(new SharpClawActionKey($"{family}.before"), SharpClawActionCatalog.Jobs);
+            Assert.Contains(new SharpClawActionKey($"{family}.after"), SharpClawActionCatalog.Jobs);
         }
+    }
+
+    [Fact]
+    public void EveryTypedActionAndCheckpointKeyIsInCatalog()
+    {
+        var typedKeys = typeof(SharpClawActions)
+            .GetNestedTypes(BindingFlags.Public)
+            .SelectMany(type => type.GetFields(BindingFlags.Public | BindingFlags.Static))
+            .Where(field => field.FieldType == typeof(SharpClawActionKey))
+            .Select(field => (SharpClawActionKey)field.GetValue(null)!)
+            .Concat(typeof(SharpClawCheckpoints)
+                .GetNestedTypes(BindingFlags.Public)
+                .SelectMany(type => type.GetFields(BindingFlags.Public | BindingFlags.Static))
+                .Where(field => field.FieldType == typeof(SharpClawActionKey))
+                .Select(field => (SharpClawActionKey)field.GetValue(null)!))
+            .ToArray();
+
+        Assert.NotEmpty(typedKeys);
+        Assert.All(typedKeys, key => Assert.Contains(key, SharpClawActionCatalog.All));
     }
 
     [Fact]
@@ -182,8 +203,7 @@ public sealed class SimpleKernelContractTests
             DateTimeOffset.UtcNow.AddMinutes(1),
             4);
         var start = new HookInvokeStart(
-            1,
-            4,
+            Header(4),
             handle.InvocationId,
             null,
             Guid.NewGuid(),
@@ -206,17 +226,18 @@ public sealed class SimpleKernelContractTests
                 ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap),
             new RequestPrincipal("user-1"),
             ExtensionFeatureSet.Empty,
-            DateTimeOffset.UtcNow.AddSeconds(30),
             handle);
-        var replacement = new ContinueReplacement(
+        var replacement = new SidecarEffectRequest(
+            Header(5),
             handle.HandleId,
-            5,
+            SidecarContinuationCommand.ContinueReplacement,
             CreateElement(new { value = 2 }),
             "bounded replacement");
         var outcome = new ContinuationOutcome(
+            Header(6),
             handle.HandleId,
-            6,
             ActionOutcomeKind.Uncertain,
+            ActionOutcomeCertainty.Uncertain,
             ActionSafePoint.AfterTerminal,
             Uncertainty: new ActionUncertainty(
                 "external_unknown",
@@ -236,10 +257,297 @@ public sealed class SimpleKernelContractTests
         var roundTrip = JsonSerializer.Deserialize<SidecarExchangeFixture>(json, JsonOptions)!;
 
         Assert.Equal(start.Continuation.HandleId, roundTrip.Start.Continuation.HandleId);
-        Assert.Equal(2, roundTrip.Replacement.Replacement.GetProperty("value").GetInt32());
+        Assert.Equal(2, roundTrip.Replacement.Value!.Value.GetProperty("value").GetInt32());
         Assert.Equal(ActionOutcomeKind.Uncertain, roundTrip.Outcome.Kind);
         Assert.Equal("receipt-1", roundTrip.Outcome.Uncertainty!.ReceiptReference);
         Assert.Equal(ActionSafePoint.AfterTerminal, roundTrip.Outcome.SafePoint);
+    }
+
+    [Fact]
+    public void SidecarDiscoveryCarriesDefinitionsAndRejectsSchemaMismatch()
+    {
+        var header = Header();
+        var definition = new SidecarActionDefinition(
+            new SharpClawActionKey("demo.action"),
+            1,
+            "demo",
+            new JsonSchemaReference("demo.input", 1, "input-hash"),
+            new JsonSchemaReference("demo.result", 1, "result-hash"),
+            ActionInterceptionCapabilities.Inspect,
+            ContainsSensitiveData: false,
+            HasIrreversibleEffects: false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "demo"),
+            null,
+            [ActionSafePoint.BeforeTerminal],
+            ContractVersionRange.Exact(1));
+        var discovery = new SidecarDiscoveryEnvelope(
+            header,
+            "demo.module",
+            "contract-hash",
+            new SidecarProtocolOffer(1, 1, [SidecarPayloadMode.Untyped], new SidecarPayloadLimits()),
+            [new SidecarActionSubscription(
+                SidecarHookTargetKind.Exact,
+                definition.ActionKey,
+                null,
+                ContractVersionRange.Exact(1),
+                new JsonSchemaReference("demo.input", 1, "wrong-input-hash"),
+                definition.ResultSchema,
+                ActionInterceptionCapabilities.Inspect,
+                SidecarPayloadMode.Untyped,
+                new HookOrdering("demo"))],
+            [],
+            [definition],
+            [],
+            [new SidecarToolHandlerDefinition(
+                "demo.tool",
+                "handler-1",
+                "Demo tool",
+                new JsonSchemaReference("demo.tool.input", 1),
+                new JsonSchemaReference("demo.tool.result", 1),
+                SupportsStreaming: true,
+                Durable: false,
+                RequiresApproval: false)],
+            [new SidecarLifecycleHandlerDefinition(
+                SidecarLifecycleCallKind.Start,
+                "start-1",
+                null,
+                new JsonSchemaReference("demo.start.result", 1),
+                ContractVersionRange.Exact(1),
+                TimeSpan.FromSeconds(5))],
+            [new ModuleFeatureDescriptor("demo.feature", 1, "demo.module", 1024)]);
+
+        var validation = SidecarDiscoveryValidator.Validate(discovery);
+
+        Assert.False(validation.Accepted);
+        Assert.Equal(SidecarProtocolErrors.SchemaMismatch, validation.ErrorCode);
+        Assert.DoesNotContain(
+            typeof(SidecarDiscoveryEnvelope).GetProperties(),
+            property => property.Name.Contains("Approval", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void SidecarEffectsAndMessagesUseHeaderAndSupportTerminalCancellation()
+    {
+        var effect = new SidecarEffectRequest(
+            Header(8),
+            Guid.NewGuid(),
+            SidecarContinuationCommand.Cancel,
+            Code: "user_cancelled",
+            Message: "The caller cancelled the action.");
+
+        Assert.Equal(1, effect.Header.ProtocolVersion);
+        Assert.Equal(8, effect.Header.Sequence);
+        Assert.True(effect.Header.Size.IsWithinLimit);
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            SidecarProtocolPhase.Invoking,
+            SidecarProtocolMessageKind.EffectRequest,
+            SidecarContinuationCommand.Cancel));
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            SidecarProtocolPhase.EffectAccepted,
+            SidecarProtocolMessageKind.ContinuationOutcome));
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            SidecarProtocolPhase.OutcomeSent,
+            SidecarProtocolMessageKind.HookOutcome));
+    }
+
+    [Fact]
+    public void SidecarEffectCatalogCoversEveryPreTerminalEffectAndPhase()
+    {
+        var handle = Guid.NewGuid();
+        var sequence = 10L;
+
+        foreach (var command in Enum.GetValues<SidecarContinuationCommand>())
+        {
+            var request = new SidecarEffectRequest(
+                Header(sequence++),
+                handle,
+                command,
+                Value: CreateElement(new { value = 1 }),
+                Reason: "conformance",
+                Code: "test",
+                Message: "test",
+                Defer: new ActionDeferRequest(
+                    DateTimeOffset.UtcNow.AddMinutes(1),
+                    "conformance"),
+                Backoff: TimeSpan.FromMilliseconds(5));
+
+            Assert.Equal(command, request.Command);
+            Assert.True(SidecarProtocolStateMachine.CanApply(
+                SidecarProtocolPhase.Invoking,
+                request.MessageKind,
+                command));
+        }
+
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            SidecarProtocolPhase.EffectRequested,
+            SidecarProtocolMessageKind.EffectAccepted));
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            SidecarProtocolPhase.OutcomeSent,
+            SidecarProtocolMessageKind.HookCompleted));
+        Assert.False(SidecarProtocolStateMachine.CanApply(
+            SidecarProtocolPhase.Completed,
+            SidecarProtocolMessageKind.EffectRequest,
+            SidecarContinuationCommand.Repeat));
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            SidecarProtocolPhase.Invoking,
+            SidecarProtocolMessageKind.Error));
+        var disconnected = new SidecarProtocolError(
+            Header(20),
+            SidecarProtocolErrors.Disconnected,
+            "The sidecar disconnected.");
+        Assert.Equal(SidecarProtocolErrors.Disconnected, disconnected.Code);
+    }
+
+    [Fact]
+    public void ForgedSensitiveApprovalIsRejectedByStrictDiscoveryDeserialization()
+    {
+        const string forged = "{\"moduleId\":\"module\",\"sensitiveApproval\":{\"moduleId\":\"module\"}}";
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+        };
+
+        Assert.Throws<JsonException>(() =>
+            JsonSerializer.Deserialize<SidecarDiscoveryEnvelope>(forged, options));
+    }
+
+    [Fact]
+    public void DuplexStreamCarriesMutationCancellationAcknowledgementAndCredit()
+    {
+        var streamId = Guid.NewGuid();
+        var chunk = new SidecarStreamChunk(
+            Header(),
+            streamId,
+            3,
+            CreateElement(new { token = "hello" }),
+            IsFinal: false,
+            new SidecarStreamMutation(
+                SidecarStreamMutationKind.Transform,
+                CreateElement(new { token = "HELLO" }),
+                "uppercase"));
+        var control = new SidecarStreamControl(
+            Header(4),
+            streamId,
+            SidecarStreamControlKind.GrantCredit,
+            AcknowledgeSequence: 3,
+            CreditBytes: 4096,
+            CreditChunks: 4);
+        var acknowledgement = new SidecarStreamAcknowledgement(
+            Header(5),
+            streamId,
+            AcknowledgeSequence: 3,
+            GrantedBytes: 4096,
+            GrantedChunks: 4);
+
+        Assert.Equal(SidecarStreamMutationKind.Transform, chunk.Mutation!.Kind);
+        Assert.Equal(SidecarStreamControlKind.GrantCredit, control.Control);
+        Assert.Equal(3, acknowledgement.AcknowledgeSequence);
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            SidecarProtocolPhase.Invoking,
+            SidecarProtocolMessageKind.StreamControl));
+    }
+
+    [Fact]
+    public void StorageContractsCarryRevisionFenceAndAtomicOutbox()
+    {
+        var fence = new ModuleStorageClaimFence(
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            DateTimeOffset.UtcNow.AddMinutes(1),
+            ExpectedRevision: 7);
+        var request = new ModuleStorageMutationAndOutboxRequest(
+            [new ModuleStorageMutation(
+                ModuleStorageOperations.Upsert,
+                "job-1",
+                JsonSerializer.SerializeToElement(new { status = "complete" }),
+                ExpectedRevision: 7)],
+            [new ModuleStorageOutboxMessage(
+                "job.completed",
+                "idempotency-1",
+                JsonSerializer.SerializeToElement(new { id = "job-1" }))],
+            fence);
+
+        var json = JsonSerializer.Serialize(request, JsonOptions);
+        var roundTrip = JsonSerializer.Deserialize<ModuleStorageMutationAndOutboxRequest>(json, JsonOptions)!;
+
+        Assert.Equal(7, roundTrip.Fence!.ExpectedRevision);
+        Assert.Equal(7, roundTrip.Mutations[0].ExpectedRevision);
+        Assert.Equal("idempotency-1", roundTrip.Outbox[0].IdempotencyKey);
+        Assert.Equal("revision_conflict", ModuleStorageErrors.RevisionConflict);
+        Assert.Equal("stale_claim", ModuleStorageErrors.StaleClaim);
+        Assert.Equal("fencing_rejected", ModuleStorageErrors.FencingRejected);
+    }
+
+    [Fact]
+    public void StorageClaimsExposeExpectedRevisionAndFencingData()
+    {
+        var fence = new ModuleStorageClaimFence(
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            DateTimeOffset.UtcNow.AddMinutes(1),
+            ExpectedRevision: 12);
+        var payload = new ModuleDocumentClaimPayload(
+            [],
+            null,
+            1,
+            new { status = "running" },
+            ExpectedRevision: 12,
+            Fence: fence);
+        var write = new ModuleDocumentWrite<string>(
+            "job-1",
+            "complete",
+            ExpectedRevision: 12);
+        var delete = new ModuleDocumentDelete(
+            "job-1",
+            ExpectedRevision: 13,
+            Fence: fence);
+
+        var json = JsonSerializer.Serialize(new { payload, write, delete }, JsonOptions);
+
+        Assert.Contains("expectedRevision", json, StringComparison.Ordinal);
+        Assert.Contains(fence.FencingToken.ToString(), json, StringComparison.Ordinal);
+        Assert.Equal(12, payload.ExpectedRevision);
+        Assert.Equal(12, write.ExpectedRevision);
+        Assert.Equal(13, delete.ExpectedRevision);
+    }
+
+    [Fact]
+    public void StorageConflictAndAtomicCommitSurfacesPreserveRecoveryData()
+    {
+        var conflict = new ModuleStorageRevisionConflict("job-1", 6, 7);
+        var result = new ModuleStorageMutationAndOutboxResult(
+            [new ModuleStorageRevision("job-1", 8)],
+            ["outbox-1"],
+            CommitRevision: 8);
+
+        var json = JsonSerializer.Serialize(new { conflict, result }, JsonOptions);
+        var roundTrip = JsonSerializer.Deserialize<JsonElement>(json, JsonOptions);
+
+        Assert.Equal(6, roundTrip.GetProperty("conflict").GetProperty("expectedRevision").GetInt64());
+        Assert.Equal(7, roundTrip.GetProperty("conflict").GetProperty("actualRevision").GetInt64());
+        Assert.Equal(8, roundTrip.GetProperty("result").GetProperty("commitRevision").GetInt64());
+        Assert.Equal("outbox-1", roundTrip.GetProperty("result").GetProperty("outboxMessageIds")[0].GetString());
+        Assert.Equal("atomic_commit_rejected", ModuleStorageErrors.AtomicCommitRejected);
+    }
+
+    [Fact]
+    public void RetiredLookupCliAndJobsFeatureTypesAreAbsent()
+    {
+        var names = typeof(ISharpClawModule).Assembly
+            .GetTypes()
+            .Select(type => type.FullName ?? type.Name)
+            .ToArray();
+
+        Assert.DoesNotContain(names, name => name.EndsWith("ModuleCliCommand", StringComparison.Ordinal));
+        Assert.DoesNotContain(names, name => name.EndsWith("ModuleCliScope", StringComparison.Ordinal));
+        Assert.DoesNotContain(names, name => name.EndsWith("JobsContracts", StringComparison.Ordinal));
+        Assert.DoesNotContain(names, name => name.EndsWith("JobStatus", StringComparison.Ordinal));
+        Assert.DoesNotContain(names, name => name.EndsWith("JobDocument", StringComparison.Ordinal));
+        Assert.DoesNotContain(names, name => name.EndsWith("JobHandlerResult", StringComparison.Ordinal));
+        Assert.DoesNotContain(typeof(IModuleLifecycleManager).GetMethods(), method =>
+            method.Name is "FindToolByName" or "IsToolPrefixRegistered");
+        Assert.Contains(typeof(ICliContributionBuilder).GetMethods(), method =>
+            method.GetParameters().Any(parameter => parameter.ParameterType == typeof(ModuleCliCommandDescriptor)));
     }
 
     [Fact]
@@ -297,8 +605,11 @@ public sealed class SimpleKernelContractTests
     private static JsonElement CreateElement<T>(T value) =>
         JsonSerializer.SerializeToElement(value, JsonOptions);
 
+    private static SidecarMessageHeader Header(long sequence = 1) =>
+        new(1, sequence, DateTimeOffset.UtcNow.AddMinutes(1), new SidecarMessageSizeAuthority(128, 1024));
+
     private sealed record SidecarExchangeFixture(
         HookInvokeStart Start,
-        ContinueReplacement Replacement,
+        SidecarEffectRequest Replacement,
         ContinuationOutcome Outcome);
 }

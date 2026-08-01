@@ -102,7 +102,8 @@ public interface IEndpointContributionBuilder
 
 public interface ICliContributionBuilder
 {
-    void Add<TContribution>();
+    void Add<THandler>(ModuleCliCommandDescriptor descriptor)
+        where THandler : IModuleCliHandler;
 }
 
 public interface IUiContributionBuilder
