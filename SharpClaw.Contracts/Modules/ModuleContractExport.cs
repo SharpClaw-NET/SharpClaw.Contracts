@@ -3,14 +3,14 @@ namespace SharpClaw.Contracts.Modules;
 /// <summary>
 /// Describes a service contract that a module provides to other modules.
 /// The providing module must register an implementation of <see cref="ServiceType"/>
-/// in DI via <see cref="ISharpClawCoreModule.ConfigureServices"/>.
+/// in DI by the providing module.
 /// Any module that declares a <see cref="ModuleContractRequirement"/> with
 /// the same <see cref="ContractName"/> is considered a dependent and will be
 /// initialized after this module.
 /// </summary>
 /// <remarks>
 /// Contract interfaces should live in shared assemblies (e.g.
-/// <c>SharpClaw.Contracts</c>) so that both provider and consumer modules
+/// <c>SharpClaw.Contracts</c>) so that provider and consumer modules
 /// reference the same CLR type. Assemblies loaded from the default
 /// <see cref="System.Runtime.Loader.AssemblyLoadContext"/> are shared across
 /// all module load contexts, ensuring type identity.

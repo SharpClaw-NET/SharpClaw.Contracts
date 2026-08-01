@@ -12,4 +12,5 @@ public sealed record ModuleStateResponse(
     bool Registered,
     bool IsExternal,
     DateTimeOffset? CreatedAt,
-    DateTimeOffset? UpdatedAt);
+    DateTimeOffset? UpdatedAt,
+    string? ContractHash = null);

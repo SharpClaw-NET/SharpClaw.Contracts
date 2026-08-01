@@ -1,6 +1,5 @@
 using System.Reflection;
 using SharpClaw.Contracts.Modules;
-using SharpClaw.Contracts.Modules.Foreign;
 
 namespace SharpClaw.Contracts.Tests;
 
@@ -52,18 +51,6 @@ public sealed class InProcessModuleSecretReaderTests
             typeof(Task<string?>),
             typeof(string),
             typeof(CancellationToken));
-    }
-
-    [Fact]
-    public void ContractIsNotPartOfForeignModuleProtocolSurface()
-    {
-        Assert.Equal(
-            "SharpClaw.Contracts.Modules",
-            typeof(IInProcessModuleSecretReader).Namespace);
-
-        Assert.Equal(
-            "SharpClaw.Contracts.Modules.Foreign",
-            typeof(ForeignModuleProtocol).Namespace);
     }
 
     private static void AssertMethod(

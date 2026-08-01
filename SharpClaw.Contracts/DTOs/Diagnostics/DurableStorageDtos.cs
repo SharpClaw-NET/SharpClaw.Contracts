@@ -1,5 +1,3 @@
-using SharpClaw.Contracts.Enums;
-
 namespace SharpClaw.Contracts.DTOs.Diagnostics;
 
 public sealed record ExecutionArtifactResponse(
@@ -32,7 +30,7 @@ public sealed record DurableLogPageResponse(
 
 public sealed record ExecutionAuditEventResponse(
     Guid Id,
-    ExecutionOwnerKind OwnerKind,
+    string OwnerKind,
     Guid OwnerId,
     string EventKind,
     string? PreviousState,

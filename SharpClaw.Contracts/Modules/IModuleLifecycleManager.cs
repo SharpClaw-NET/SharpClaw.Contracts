@@ -1,9 +1,7 @@
 namespace SharpClaw.Contracts.Modules;
 
 /// <summary>
-/// Host-side interface for external module lifecycle operations (load, unload,
-/// reload) and tool lookup. Implemented by <c>ModuleService</c>; injected into
-/// modules that need to manage or introspect the module roster at runtime.
+/// Host-side interface for module lifecycle operations and neutral tool lookup.
 /// </summary>
 public interface IModuleLifecycleManager
 {
@@ -21,10 +19,9 @@ public interface IModuleLifecycleManager
 
     /// <summary>
     /// Finds a tool by its fully-qualified name across all loaded modules.
-    /// Returns the owning module's <see cref="ISharpClawCoreModule"/> and the resolved
-    /// tool name, or <c>null</c> if no match is found.
+    /// Returns the owning module and the resolved tool name, or <c>null</c>.
     /// </summary>
-    (ISharpClawCoreModule Module, string ToolName)? FindToolByName(string toolName);
+    (ISharpClawModule Module, string ToolName)? FindToolByName(string toolName);
 
     /// <summary>Loads an external module from the given directory.</summary>
     Task<ModuleStateResponse> LoadExternalAsync(

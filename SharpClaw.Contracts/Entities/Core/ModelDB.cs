@@ -25,5 +25,4 @@ public class ModelDB : BaseEntity
     public Guid ProviderId { get; set; }
     public ProviderDB Provider { get; set; } = null!;
 
-    public ICollection<AgentDB> Agents { get; set; } = [];
 }

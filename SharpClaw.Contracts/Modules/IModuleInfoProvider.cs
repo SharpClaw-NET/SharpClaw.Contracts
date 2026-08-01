@@ -13,8 +13,7 @@ public interface IModuleInfoProvider
 
 /// <summary>
 /// Lightweight descriptor of a registered module, safe to cross the
-/// module boundary without exposing Core's <c>ISharpClawCoreModule</c>
-/// implementation details.
+/// module boundary without exposing host implementation details.
 /// </summary>
 /// <param name="Id">Module identifier (e.g. <c>"sharpclaw_dangerous_shell"</c>).</param>
 /// <param name="ToolPrefix">Short prefix used in tool and CLI names.</param>

@@ -1,8 +1,7 @@
 namespace SharpClaw.Contracts.Modules;
 
 /// <summary>
-/// Result of a module health check. Modules return this from
-/// <see cref="ISharpClawCoreModule.HealthCheckAsync"/>.
+/// Result of a module health check.
 /// </summary>
 public sealed record ModuleHealthStatus(
     /// <summary>Whether the module considers itself healthy.</summary>

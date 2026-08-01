@@ -34,5 +34,8 @@ public sealed record ModuleManifest(
     [property: JsonPropertyName("requires")] ModuleManifestContractRef[]? Requires = null,
     [property: JsonPropertyName("runtime")] string? Runtime = null,
     [property: JsonPropertyName("moduleType")] string? ModuleType = null,
-    [property: JsonPropertyName("hostMode")] string? HostMode = null
+    [property: JsonPropertyName("hostMode")] string? HostMode = null,
+    [property: JsonPropertyName("features")] ModuleManifestFeatureRef[]? Features = null,
+    [property: JsonPropertyName("requestedHooks")] ModuleManifestHookRequest[]? RequestedHooks = null,
+    [property: JsonPropertyName("requestedEvents")] ModuleManifestEventRequest[]? RequestedEvents = null
 );

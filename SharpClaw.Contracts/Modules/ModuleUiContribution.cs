@@ -5,10 +5,7 @@ namespace SharpClaw.Contracts.Modules;
 /// in client applications. Clients render these elements at the designated
 /// <see cref="ContributionPoint"/> based on <see cref="ElementType"/>.
 /// <para>
-/// Runtime modules return these from
-/// <see cref="ISharpClawRuntimeModule.GetUiContributions"/>
-/// during registration. The host exposes them via the
-/// <c>GET /modules/ui-contributions</c> endpoint.
+/// Application modules register these through the application builder.
 /// </para>
 /// </summary>
 /// <param name="ContributionPoint">

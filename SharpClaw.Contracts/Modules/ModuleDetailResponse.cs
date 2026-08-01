@@ -18,8 +18,9 @@ public sealed record ModuleDetailResponse(
     string? License,
     string[]? Platforms,
     int ExecutionTimeoutSeconds,
-    int ToolCount,
-    int InlineToolCount,
+    int ActionCount,
+    int EventCount,
+    int FeatureCount,
     string[] ExportedContracts,
     string[] RequiredContracts,
     bool AllRequirementsSatisfied);
