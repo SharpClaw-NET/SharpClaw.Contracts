@@ -378,16 +378,19 @@ public sealed class SimpleKernelContractTests
         var toolResult = new SidecarToolHandlerResult(
             Header(2),
             invocationId,
+            "tool-handler",
             CreateElement(new { value = 2 }),
             new JsonSchemaReference("demo.tool.result", 1, "result-hash"));
         var toolCancelled = new SidecarToolHandlerCancelled(
             Header(3),
             invocationId,
+            "tool-handler",
             "cancelled",
             "The caller cancelled the tool.");
         var toolFailed = new SidecarToolHandlerFailed(
             Header(4),
             invocationId,
+            "tool-handler",
             new ExecutionError("tool_failed", "The tool failed."));
         var lifecycleStart = new SidecarLifecycleHandlerInvokeStart(
             Header(5),
@@ -399,17 +402,20 @@ public sealed class SimpleKernelContractTests
             Header(6),
             lifecycleStart.InvocationId,
             SidecarLifecycleCallKind.Start,
+            "lifecycle-handler",
             CreateElement(new { started = true }));
         var lifecycleCancelled = new SidecarLifecycleHandlerCancelled(
             Header(7),
             lifecycleStart.InvocationId,
-            SidecarLifecycleCallKind.Stop,
+            SidecarLifecycleCallKind.Start,
+            "lifecycle-handler",
             "cancelled",
             "The lifecycle call was cancelled.");
         var lifecycleFailed = new SidecarLifecycleHandlerFailed(
             Header(8),
             lifecycleStart.InvocationId,
-            SidecarLifecycleCallKind.HealthCheck,
+            SidecarLifecycleCallKind.Start,
+            "lifecycle-handler",
             new ExecutionError("health_failed", "The health check failed."));
         var envelope = new UntypedEventEnvelope(
             new UntypedEventDescriptor(
@@ -438,6 +444,7 @@ public sealed class SimpleKernelContractTests
             .Select((delivery, index) => (ISidecarProtocolMessage)new SidecarEventListenerAcknowledgement(
                 Header(12 + index),
                 ((SidecarEventListenerDelivery)delivery).DeliveryId,
+                ((SidecarEventListenerDelivery)delivery).ListenerId,
                 ((SidecarEventListenerDelivery)delivery).Delivery,
                 Accepted: true))
             .ToArray();
@@ -546,16 +553,20 @@ public sealed class SimpleKernelContractTests
     }
 
     [Fact]
-    public void SidecarStateRejectsDuplicateUseExpiryCancellationAndLateStream()
+    public void SidecarStateRequiresSidecarOutcomeAndHostCompletionAndRejectsDuplicateUse()
     {
         var now = DateTimeOffset.UtcNow;
+        var invocationId = Guid.NewGuid();
         var handle = Guid.NewGuid();
         var state = new SidecarProtocolState(
-            Guid.NewGuid(),
+            SidecarExchangeKind.ActionHook,
+            invocationId,
             handle,
             SidecarProtocolPhase.Invoking,
             LastSequence: 1,
-            now.AddMinutes(1));
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: new SidecarPayloadLimits());
         var effect = new SidecarEffectRequest(
             Header(2),
             handle,
@@ -588,12 +599,82 @@ public sealed class SimpleKernelContractTests
         Assert.False(duplicate.Accepted);
         Assert.Equal(SidecarProtocolErrors.ContinuationAlreadyUsed, duplicate.ErrorCode);
 
-        var replacement = new SidecarResultReplacement(
+        var sidecarOutcome = new HookOutcome(
             Header(6),
             handle,
-            CreateElement(new { value = 4 }),
-            "validated replacement");
-        var completed = SidecarProtocolStateMachine.Validate(outcome.State, replacement, now);
+            SidecarHookOutcomeKind.Completed);
+        var sidecarOutcomeAccepted = SidecarProtocolStateMachine.Validate(outcome.State, sidecarOutcome, now);
+        Assert.True(sidecarOutcomeAccepted.Accepted);
+        Assert.Equal(SidecarProtocolPhase.SidecarOutcomeSent, sidecarOutcomeAccepted.State!.Phase);
+
+        var completedWithoutReplacement = SidecarProtocolStateMachine.Validate(
+            sidecarOutcomeAccepted.State,
+            new HookCompleted(
+                Header(7),
+                handle,
+                ActionOutcomeKind.Completed,
+                ActionOutcomeCertainty.Certain),
+            now);
+        Assert.True(completedWithoutReplacement.Accepted);
+        Assert.Equal(SidecarProtocolPhase.Completed, completedWithoutReplacement.State!.Phase);
+
+        var replacementState = new SidecarProtocolState(
+            SidecarExchangeKind.ActionHook,
+            invocationId,
+            handle,
+            SidecarProtocolPhase.Invoking,
+            LastSequence: 1,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: new SidecarPayloadLimits());
+        var replacementAccepted = SidecarProtocolStateMachine.Validate(
+            replacementState,
+            effect with { Header = Header(2) },
+            now);
+        replacementAccepted = SidecarProtocolStateMachine.Validate(
+            replacementAccepted.State!,
+            effectAccepted with { Header = Header(3) },
+            now);
+        replacementAccepted = SidecarProtocolStateMachine.Validate(
+            replacementAccepted.State!,
+            continuation with { Header = Header(4) },
+            now);
+        replacementAccepted = SidecarProtocolStateMachine.Validate(
+            replacementAccepted.State!,
+            sidecarOutcome with { Header = Header(5) },
+            now);
+        replacementAccepted = SidecarProtocolStateMachine.Validate(
+            replacementAccepted.State!,
+            new SidecarResultReplacement(
+                Header(6),
+                handle,
+                CreateElement(new { value = 4 }),
+                "validated replacement"),
+            now);
+        Assert.True(replacementAccepted.Accepted);
+        Assert.Equal(SidecarProtocolPhase.SidecarOutcomeSent, replacementAccepted.State!.Phase);
+        Assert.True(replacementAccepted.State.ResultReplacementAccepted);
+
+        var duplicateReplacement = SidecarProtocolStateMachine.Validate(
+            replacementAccepted.State,
+            new SidecarResultReplacement(
+                Header(7),
+                handle,
+                CreateElement(new { value = 5 }),
+                "second replacement"),
+            now);
+        Assert.False(duplicateReplacement.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ContinuationAlreadyUsed, duplicateReplacement.ErrorCode);
+
+        var completed = SidecarProtocolStateMachine.Validate(
+            replacementAccepted.State,
+            new HookCompleted(
+                Header(8),
+                handle,
+                ActionOutcomeKind.Completed,
+                ActionOutcomeCertainty.Certain,
+                CreateElement(new { value = 4 })),
+            now);
         Assert.True(completed.Accepted);
         Assert.Equal(SidecarProtocolPhase.Completed, completed.State!.Phase);
 
@@ -606,7 +687,7 @@ public sealed class SimpleKernelContractTests
 
         var expired = SidecarProtocolStateMachine.Validate(
             state with { Deadline = now.AddSeconds(-1) },
-            effect with { Header = Header(8) },
+            effect with { Header = Header(20) },
             now);
         Assert.False(expired.Accepted);
         Assert.Equal(SidecarProtocolErrors.DeadlineExceeded, expired.ErrorCode);
@@ -629,7 +710,329 @@ public sealed class SimpleKernelContractTests
         Assert.True(disconnected.Accepted);
         Assert.Equal(SidecarProtocolPhase.Rejected, disconnected.State!.Phase);
         Assert.DoesNotContain(typeof(HookOutcome).GetProperties(), property =>
-            property.Name is "Uncertainty" or "RequestedEffect");
+            property.Name is "Result" or "Uncertainty" or "RequestedEffect");
+    }
+
+    [Fact]
+    public void SidecarStateRejectsCrossExchangeIdentitiesAndPrematureAcknowledgements()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var limits = new SidecarPayloadLimits();
+        var startInvocationId = Guid.NewGuid();
+        var startHandle = new ContinuationHandle(
+            Guid.NewGuid(),
+            startInvocationId,
+            "hook-a",
+            now.AddMinutes(1),
+            Sequence: 1);
+        var startState = new SidecarProtocolState(
+            SidecarExchangeKind.ActionHook,
+            Guid.Empty,
+            Guid.Empty,
+            SidecarProtocolPhase.Negotiated,
+            LastSequence: 0,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: limits);
+        var started = SidecarProtocolStateMachine.Validate(
+            startState,
+            new HookInvokeStart(
+                Header(1),
+                startInvocationId,
+                null,
+                Guid.NewGuid(),
+                "hook-a",
+                new SharpClawActionKey("demo.action"),
+                1,
+                SidecarPayloadMode.Untyped,
+                CreateElement(new { value = 1 }),
+                null,
+                new ActionCapabilityGrant(
+                    new SharpClawActionKey("demo.action"),
+                    1,
+                    ActionInterceptionCapabilities.Inspect),
+                new RequestPrincipal("user-1"),
+                ExtensionFeatureSet.Empty,
+                startHandle),
+            now);
+        Assert.True(started.Accepted);
+        Assert.Equal(startHandle.HandleId, started.State!.ContinuationHandleId);
+        Assert.Equal(startInvocationId, started.State.InvocationId);
+
+        var actionHandle = Guid.NewGuid();
+        var actionState = new SidecarProtocolState(
+            SidecarExchangeKind.ActionHook,
+            Guid.NewGuid(),
+            actionHandle,
+            SidecarProtocolPhase.SidecarOutcomeSent,
+            LastSequence: 1,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: limits);
+        var wrongCompletion = SidecarProtocolStateMachine.Validate(
+            actionState,
+            new HookCompleted(
+                Header(2),
+                Guid.NewGuid(),
+                ActionOutcomeKind.Completed,
+                ActionOutcomeCertainty.Certain),
+            now);
+        Assert.False(wrongCompletion.Accepted);
+        Assert.Equal(SidecarProtocolErrors.InvalidContinuationHandle, wrongCompletion.ErrorCode);
+
+        var toolInvocation = Guid.NewGuid();
+        var toolState = new SidecarProtocolState(
+            SidecarExchangeKind.ToolHandler,
+            Guid.Empty,
+            Guid.Empty,
+            SidecarProtocolPhase.Negotiated,
+            LastSequence: 0,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: limits);
+        var toolStart = new SidecarToolHandlerInvokeStart(
+            Header(1),
+            toolInvocation,
+            "demo.tool",
+            "handler-a",
+            CreateElement(new { value = 1 }),
+            new JsonSchemaReference("demo.input", 1, "input-hash"),
+            new RequestPrincipal("user-1"));
+        var toolStarted = SidecarProtocolStateMachine.Validate(toolState, toolStart, now);
+        Assert.True(toolStarted.Accepted);
+        var wrongToolResult = SidecarProtocolStateMachine.Validate(
+            toolStarted.State!,
+            new SidecarToolHandlerResult(
+                Header(2),
+                toolInvocation,
+                "handler-b",
+                CreateElement(new { value = 2 }),
+                new JsonSchemaReference("demo.result", 1, "result-hash")),
+            now);
+        Assert.False(wrongToolResult.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ExchangeIdentityMismatch, wrongToolResult.ErrorCode);
+
+        var lifecycleState = new SidecarProtocolState(
+            SidecarExchangeKind.LifecycleHandler,
+            Guid.Empty,
+            Guid.Empty,
+            SidecarProtocolPhase.Negotiated,
+            LastSequence: 0,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: limits);
+        var lifecycleStart = new SidecarLifecycleHandlerInvokeStart(
+            Header(1),
+            Guid.NewGuid(),
+            SidecarLifecycleCallKind.Start,
+            "handler-a",
+            null);
+        var lifecycleStarted = SidecarProtocolStateMachine.Validate(lifecycleState, lifecycleStart, now);
+        Assert.True(lifecycleStarted.Accepted);
+        var wrongLifecycleResult = SidecarProtocolStateMachine.Validate(
+            lifecycleStarted.State!,
+            new SidecarLifecycleHandlerResult(
+                Header(2),
+                lifecycleStart.InvocationId,
+                SidecarLifecycleCallKind.Stop,
+                "handler-a",
+                null),
+            now);
+        Assert.False(wrongLifecycleResult.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ExchangeIdentityMismatch, wrongLifecycleResult.ErrorCode);
+
+        var envelope = new UntypedEventEnvelope(
+            new UntypedEventDescriptor(
+                new SharpClawEventKey("demo.event"),
+                1,
+                "demo",
+                EventInterceptionCapabilities.Inspect,
+                new JsonSchemaReference("demo.event", 1, "event-hash"),
+                ContainsSensitiveData: false),
+            Guid.NewGuid(),
+            null,
+            Guid.NewGuid(),
+            now,
+            "demo.module",
+            CreateElement(new { value = 1 }));
+        var listenerState = new SidecarProtocolState(
+            SidecarExchangeKind.EventListener,
+            Guid.Empty,
+            Guid.Empty,
+            SidecarProtocolPhase.Negotiated,
+            LastSequence: 0,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: limits);
+        var deliveryId = Guid.NewGuid();
+        var earlyAcknowledgement = SidecarProtocolStateMachine.Validate(
+            listenerState,
+            new SidecarEventListenerAcknowledgement(
+                Header(1),
+                deliveryId,
+                "listener-a",
+                EventDelivery.Inline,
+                Accepted: true),
+            now);
+        Assert.False(earlyAcknowledgement.Accepted);
+        Assert.Equal(SidecarProtocolErrors.DeliveryNotPending, earlyAcknowledgement.ErrorCode);
+
+        var delivery = new SidecarEventListenerDelivery(
+            Header(2),
+            deliveryId,
+            "listener-a",
+            envelope,
+            EventDelivery.Inline,
+            RequiresAcknowledgement: true);
+        var delivered = SidecarProtocolStateMachine.Validate(listenerState, delivery, now);
+        Assert.True(delivered.Accepted);
+        var wrongAcknowledgement = SidecarProtocolStateMachine.Validate(
+            delivered.State!,
+            new SidecarEventListenerAcknowledgement(
+                Header(3),
+                deliveryId,
+                "listener-b",
+                EventDelivery.Inline,
+                Accepted: true),
+            now);
+        Assert.False(wrongAcknowledgement.Accepted);
+        Assert.Equal(SidecarProtocolErrors.DeliveryNotPending, wrongAcknowledgement.ErrorCode);
+
+        var acknowledged = SidecarProtocolStateMachine.Validate(
+            delivered.State!,
+            new SidecarEventListenerAcknowledgement(
+                Header(4),
+                deliveryId,
+                "listener-a",
+                EventDelivery.Inline,
+                Accepted: true),
+            now);
+        Assert.True(acknowledged.Accepted);
+        Assert.False(acknowledged.State!.DeliveryAcknowledgementPending);
+
+        var streamState = new SidecarProtocolState(
+            SidecarExchangeKind.Stream,
+            Guid.Empty,
+            Guid.Empty,
+            SidecarProtocolPhase.Invoking,
+            LastSequence: 0,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: limits,
+            StreamId: Guid.NewGuid());
+        var wrongStream = SidecarProtocolStateMachine.Validate(
+            streamState,
+            new SidecarStreamChunk(
+                Header(1),
+                Guid.NewGuid(),
+                1,
+                CreateElement(new { value = 1 }),
+                IsFinal: true),
+            now);
+        Assert.False(wrongStream.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ExchangeIdentityMismatch, wrongStream.ErrorCode);
+    }
+
+    [Fact]
+    public void SidecarStateUsesNegotiatedVersionAndHostPayloadLimit()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var state = new SidecarProtocolState(
+            SidecarExchangeKind.ActionHook,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            SidecarProtocolPhase.Invoking,
+            LastSequence: 1,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: new SidecarPayloadLimits(ProtocolMessageBytes: 1024));
+        var effect = new SidecarEffectRequest(
+            Header(2) with { ProtocolVersion = 2 },
+            state.ContinuationHandleId,
+            SidecarContinuationCommand.ContinueOriginal);
+        var wrongVersion = SidecarProtocolStateMachine.Validate(state, effect, now);
+        Assert.False(wrongVersion.Accepted);
+        Assert.Equal(SidecarProtocolErrors.UnsupportedVersion, wrongVersion.ErrorCode);
+
+        var forgedMaximum = new SidecarEffectRequest(
+            Header(2) with
+            {
+                Size = new SidecarMessageSizeAuthority(128, int.MaxValue),
+            },
+            state.ContinuationHandleId,
+            SidecarContinuationCommand.ContinueOriginal);
+        var oversized = SidecarProtocolStateMachine.Validate(state, forgedMaximum, now);
+        Assert.False(oversized.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, oversized.ErrorCode);
+    }
+
+    [Fact]
+    public void SidecarDiscoveryValidatesEveryWildcardDescriptorWithHostApproval()
+    {
+        var inputSchema = new JsonSchemaReference("demo.input", 1, "input-hash");
+        var resultSchema = new JsonSchemaReference("demo.result", 1, "result-hash");
+        var host = new SidecarHostDescriptorCatalog(
+            [
+                new SidecarHostActionDescriptor(
+                    new SharpClawActionKey("demo.one"),
+                    1,
+                    "demo",
+                    inputSchema,
+                    resultSchema,
+                    ActionInterceptionCapabilities.Inspect,
+                    ContainsSensitiveData: false,
+                    ContractVersionRange.Exact(1)),
+                new SidecarHostActionDescriptor(
+                    new SharpClawActionKey("demo.two"),
+                    1,
+                    "demo",
+                    inputSchema,
+                    new JsonSchemaReference("other.result", 1, "other-hash"),
+                    ActionInterceptionCapabilities.Inspect,
+                    ContainsSensitiveData: false,
+                    ContractVersionRange.Exact(1)),
+            ],
+            []);
+        var discovery = new SidecarDiscoveryEnvelope(
+            Header(),
+            "demo.module",
+            "contract-hash",
+            new SidecarProtocolOffer(1, 1, [SidecarPayloadMode.Untyped], new SidecarPayloadLimits()),
+            [new SidecarActionSubscription(
+                SidecarHookTargetKind.Wildcard,
+                null,
+                null,
+                ContractVersionRange.Exact(1),
+                inputSchema,
+                resultSchema,
+                ActionInterceptionCapabilities.Inspect,
+                SidecarPayloadMode.Untyped,
+                new HookOrdering("demo"))],
+            [],
+            [],
+            [],
+            [],
+            [],
+            []);
+
+        var schemaMismatch = SidecarDiscoveryValidator.Validate(discovery, host);
+        Assert.False(schemaMismatch.Accepted);
+        Assert.Equal(SidecarProtocolErrors.SchemaMismatch, schemaMismatch.ErrorCode);
+
+        var sensitiveHost = new SidecarHostDescriptorCatalog(
+            [new SidecarHostActionDescriptor(
+                new SharpClawActionKey("demo.sensitive"),
+                1,
+                "demo",
+                inputSchema,
+                resultSchema,
+                ActionInterceptionCapabilities.Inspect,
+                ContainsSensitiveData: true,
+                ContractVersionRange.Exact(1))],
+            []);
+        var sensitiveRejected = SidecarDiscoveryValidator.Validate(discovery, sensitiveHost);
+        Assert.False(sensitiveRejected.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ForgedApproval, sensitiveRejected.ErrorCode);
     }
 
     [Fact]
@@ -664,7 +1067,7 @@ public sealed class SimpleKernelContractTests
             SidecarProtocolPhase.EffectRequested,
             SidecarProtocolMessageKind.EffectAccepted));
         Assert.True(SidecarProtocolStateMachine.CanApply(
-            SidecarProtocolPhase.OutcomeSent,
+            SidecarProtocolPhase.SidecarOutcomeSent,
             SidecarProtocolMessageKind.HookCompleted));
         Assert.False(SidecarProtocolStateMachine.CanApply(
             SidecarProtocolPhase.Completed,
@@ -739,14 +1142,19 @@ public sealed class SimpleKernelContractTests
             Generation: 3,
             Revision: 7);
         var commit = new ModuleStorageCommitIdentity(Guid.NewGuid(), "idempotency-1");
-        var eventEnvelope = new ModuleStorageEventEnvelope(
+        var eventEnvelope = new UntypedEventEnvelope(
+            new UntypedEventDescriptor(
+                new SharpClawEventKey("jobs.completed"),
+                1,
+                "jobs",
+                EventInterceptionCapabilities.Inspect,
+                new JsonSchemaReference("jobs.completed", 1, "event-hash"),
+                ContainsSensitiveData: false),
             Guid.NewGuid(),
-            new SharpClawEventKey("jobs.completed"),
-            1,
-            new JsonSchemaReference("jobs.completed", 1, "event-hash"),
-            EventDelivery.Durable,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            DateTimeOffset.UtcNow,
             "module-a",
-            "module-a.jobs",
             JsonSerializer.SerializeToElement(new { id = "job-1" }));
         var request = new ModuleStorageMutationAndOutboxRequest(
             commit,
@@ -756,8 +1164,8 @@ public sealed class SimpleKernelContractTests
                 JsonSerializer.SerializeToElement(new { status = "complete" }),
                 ExpectedRevision: 7)],
             [new ModuleStorageOutboxMessage(
-                commit,
-                eventEnvelope)],
+                eventEnvelope,
+                EventDelivery.Durable)],
             authority);
 
         var json = JsonSerializer.Serialize(request, JsonOptions);
@@ -767,9 +1175,10 @@ public sealed class SimpleKernelContractTests
         Assert.Equal("module-a", roundTrip.Authority!.OwnerId);
         Assert.Equal(3, roundTrip.Authority.Generation);
         Assert.Equal(7, roundTrip.Mutations[0].ExpectedRevision);
-        Assert.Equal("idempotency-1", roundTrip.Outbox[0].Commit.IdempotencyKey);
-        Assert.Equal("jobs.completed", roundTrip.Outbox[0].Event.EventKey.Value);
-        Assert.Equal(EventDelivery.Durable, roundTrip.Outbox[0].Event.Delivery);
+        Assert.Equal("idempotency-1", roundTrip.Commit.IdempotencyKey);
+        Assert.Equal("jobs.completed", roundTrip.Outbox[0].Event.Descriptor.Key.Value);
+        Assert.Equal("jobs", roundTrip.Outbox[0].Event.Descriptor.Category);
+        Assert.Equal(EventDelivery.Durable, roundTrip.Outbox[0].Delivery);
         Assert.Equal("revision_conflict", ModuleStorageErrors.RevisionConflict);
         Assert.Equal("stale_claim", ModuleStorageErrors.StaleClaim);
         Assert.Equal("fencing_rejected", ModuleStorageErrors.FencingRejected);
@@ -785,14 +1194,15 @@ public sealed class SimpleKernelContractTests
             DateTimeOffset.UtcNow.AddMinutes(1),
             Generation: 4,
             Revision: 12);
-        var payload = new ModuleDocumentClaimPayload(
+        var payload = new ModuleStorageClaimRequest(
+            "module-a",
             [],
             null,
             1,
             new { status = "running" },
             ExpectedRevision: 12,
             Authority: authority,
-            OwnerId: "module-a");
+            Indexes: null);
         var write = new ModuleDocumentWrite<string>(
             "job-1",
             "complete",
@@ -854,7 +1264,7 @@ public sealed class SimpleKernelContractTests
     {
         var missingGetKey = new StubStorageGateway(_ =>
             JsonSerializer.SerializeToElement(new { found = true, value = "value", revision = 1 }));
-        var getStore = new ModuleDocumentStore<string>(missingGetKey, "module-a", "documents");
+        var getStore = new ModuleDocumentStore<string>(missingGetKey, "module-a", "documents", "module-a");
         var getFailure = await Assert.ThrowsAsync<ModuleStorageContractException>(() =>
             getStore.GetRecordAsync("job-1"));
         Assert.Equal(ModuleStorageErrors.MissingRecordKey, getFailure.Failure.Code);
@@ -864,7 +1274,7 @@ public sealed class SimpleKernelContractTests
             {
                 records = new[] { new { key = "job-1", value = "value" } },
             }));
-        var listStore = new ModuleDocumentStore<string>(missingListRevision, "module-a", "documents");
+        var listStore = new ModuleDocumentStore<string>(missingListRevision, "module-a", "documents", "module-a");
         var listFailure = await Assert.ThrowsAsync<ModuleStorageContractException>(() =>
             listStore.ListAsync());
         Assert.Equal(ModuleStorageErrors.MissingRevision, listFailure.Failure.Code);
@@ -874,7 +1284,7 @@ public sealed class SimpleKernelContractTests
             {
                 records = new[] { new { key = "job-1", value = "value", revision = -1 } },
             }));
-        var queryStore = new ModuleDocumentStore<string>(negativeQueryRevision, "module-a", "documents");
+        var queryStore = new ModuleDocumentStore<string>(negativeQueryRevision, "module-a", "documents", "module-a");
         var queryFailure = await Assert.ThrowsAsync<ModuleStorageContractException>(() =>
             queryStore.Query().ToRecordsAsync());
         Assert.Equal(ModuleStorageErrors.InvalidRevision, queryFailure.Failure.Code);
@@ -884,12 +1294,12 @@ public sealed class SimpleKernelContractTests
             {
                 records = Array.Empty<object>(),
             }));
-        var claimStore = new ModuleDocumentStore<string>(missingClaimAuthority, "module-a", "documents");
+        var claimStore = new ModuleDocumentStore<string>(missingClaimAuthority, "module-a", "documents", "module-a");
         var claimFailure = await Assert.ThrowsAsync<ModuleStorageContractException>(() =>
             claimStore.Claim()
                 .Patch(new { status = "claimed" })
-                .ToClaimRecordsAsync());
-        Assert.Equal(ModuleStorageErrors.MalformedResponse, claimFailure.Failure.Code);
+                .ToRecordsAsync());
+        Assert.Equal(ModuleStorageErrors.InvalidClaimAuthority, claimFailure.Failure.Code);
     }
 
     [Fact]
@@ -913,6 +1323,129 @@ public sealed class SimpleKernelContractTests
         Assert.Equal(21, roundTrip.Records[0].Revision);
         Assert.False(expired.IsActiveAt(DateTimeOffset.UtcNow));
         Assert.NotEqual(authority.HostToken, Guid.Empty);
+    }
+
+    [Fact]
+    public void StorageClaimValidationRejectsInvalidAndConflictingAuthority()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var request = new ModuleStorageClaimRequest(
+            "module-a",
+            [],
+            Patch: new { status = "claimed" });
+        var authority = new ModuleStorageClaimAuthority(
+            "module-a",
+            Guid.NewGuid(),
+            now.AddMinutes(1),
+            Generation: 2,
+            Revision: 7);
+        var record = new ModuleStorageClaimRecord<string>("job-1", "claimed", 7, authority);
+        var result = new ModuleStorageClaimResult<string>([record], authority);
+
+        Assert.Same(result, ModuleStorageClaimValidation.Validate(request, result, now));
+
+        var emptyOwner = result with
+        {
+            Authority = authority with { OwnerId = "" },
+        };
+        var emptyOwnerFailure = Assert.Throws<ModuleStorageContractException>(() =>
+            ModuleStorageClaimValidation.Validate(request, emptyOwner, now));
+        Assert.Equal(ModuleStorageErrors.InvalidClaimAuthority, emptyOwnerFailure.Failure.Code);
+
+        var emptyToken = result with
+        {
+            Authority = authority with { HostToken = Guid.Empty },
+        };
+        var emptyTokenFailure = Assert.Throws<ModuleStorageContractException>(() =>
+            ModuleStorageClaimValidation.Validate(request, emptyToken, now));
+        Assert.Equal(ModuleStorageErrors.InvalidClaimAuthority, emptyTokenFailure.Failure.Code);
+
+        var expired = result with
+        {
+            Authority = authority with { LeaseExpiresAt = now.AddSeconds(-1) },
+        };
+        var expiredFailure = Assert.Throws<ModuleStorageContractException>(() =>
+            ModuleStorageClaimValidation.Validate(request, expired, now));
+        Assert.Equal(ModuleStorageErrors.InvalidClaimAuthority, expiredFailure.Failure.Code);
+
+        var wrongOwner = result with
+        {
+            Authority = authority with { OwnerId = "module-b" },
+        };
+        var wrongOwnerFailure = Assert.Throws<ModuleStorageContractException>(() =>
+            ModuleStorageClaimValidation.Validate(request, wrongOwner, now));
+        Assert.Equal(ModuleStorageErrors.ClaimOwnerMismatch, wrongOwnerFailure.Failure.Code);
+
+        var wrongRecordAuthority = result with
+        {
+            Records = [record with { Authority = authority with { Generation = 3 } }],
+        };
+        var wrongRecordAuthorityFailure = Assert.Throws<ModuleStorageContractException>(() =>
+            ModuleStorageClaimValidation.Validate(request, wrongRecordAuthority, now));
+        Assert.Equal(ModuleStorageErrors.ClaimAuthorityMismatch, wrongRecordAuthorityFailure.Failure.Code);
+
+        var wrongRecordRevision = result with
+        {
+            Records = [record with { Revision = 8 }],
+        };
+        var wrongRecordRevisionFailure = Assert.Throws<ModuleStorageContractException>(() =>
+            ModuleStorageClaimValidation.Validate(request, wrongRecordRevision, now));
+        Assert.Equal(ModuleStorageErrors.ClaimAuthorityMismatch, wrongRecordRevisionFailure.Failure.Code);
+    }
+
+    [Fact]
+    public async Task StorageAtomicCommitRetryPreservesOneIdentityAndRejectsMismatch()
+    {
+        var commit = new ModuleStorageCommitIdentity(Guid.NewGuid(), "retry-1");
+        var eventEnvelope = new UntypedEventEnvelope(
+            new UntypedEventDescriptor(
+                new SharpClawEventKey("jobs.completed"),
+                1,
+                "jobs",
+                EventInterceptionCapabilities.Inspect,
+                new JsonSchemaReference("jobs.completed", 1, "event-hash"),
+                ContainsSensitiveData: false),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            DateTimeOffset.UtcNow,
+            "module-a",
+            CreateElement(new { id = "job-1" }));
+        var request = new ModuleStorageMutationAndOutboxRequest(
+            commit,
+            [new ModuleStorageMutation(
+                ModuleStorageOperations.Upsert,
+                "job-1",
+                CreateElement(new { status = "complete" }),
+                ExpectedRevision: 7)],
+            [new ModuleStorageOutboxMessage(eventEnvelope, EventDelivery.Durable)]);
+        var gateway = new StatefulCommitGateway();
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            gateway.CommitMutationAndOutboxAsync("module-a", "documents", request));
+
+        var retry = await gateway.CommitMutationAndOutboxAsync("module-a", "documents", request);
+        var validated = ModuleStorageCommitValidation.Validate(request, retry);
+        Assert.True(validated.AlreadyCommitted);
+        Assert.Equal(commit, validated.Commit);
+        Assert.Single(gateway.CommittedEventIds);
+
+        var mismatched = retry with
+        {
+            Commit = new ModuleStorageCommitIdentity(Guid.NewGuid(), "other"),
+        };
+        var mismatchFailure = Assert.Throws<ModuleStorageContractException>(() =>
+            ModuleStorageCommitValidation.Validate(request, mismatched));
+        Assert.Equal(ModuleStorageErrors.CommitIdentityConflict, mismatchFailure.Failure.Code);
+
+        await Assert.ThrowsAsync<ModuleStorageContractException>(() =>
+            gateway.CommitMutationAndOutboxAsync(
+                "module-a",
+                "documents",
+                request with
+                {
+                    Mutations = [request.Mutations[0] with { ExpectedRevision = 8 }],
+                }));
     }
 
     [Fact]
@@ -993,6 +1526,91 @@ public sealed class SimpleKernelContractTests
     private static SidecarMessageHeader Header(long sequence = 1) =>
         new(1, sequence, DateTimeOffset.UtcNow.AddMinutes(1), new SidecarMessageSizeAuthority(128, 1024));
 
+    private sealed class StatefulCommitGateway : IModuleStorageGateway
+    {
+        private ModuleStorageMutationAndOutboxRequest? _committedRequest;
+        private ModuleStorageMutationAndOutboxResult? _committedResult;
+
+        public HashSet<Guid> CommittedEventIds { get; } = [];
+
+        public IReadOnlyList<ModuleStorageContractDescriptor> ListContracts() => [];
+
+        public Task<JsonElement> InvokeAsync(
+            string moduleId,
+            string storageName,
+            string operation,
+            JsonElement parameters,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<ModuleStorageMutationAndOutboxResult> CommitMutationAndOutboxAsync(
+            string moduleId,
+            string storageName,
+            ModuleStorageMutationAndOutboxRequest request,
+            CancellationToken ct = default)
+        {
+            if (_committedResult is not null)
+            {
+                if (_committedRequest!.Commit != request.Commit)
+                    throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                        ModuleStorageErrors.CommitIdentityConflict,
+                        "The retry uses a different commit identity."));
+
+                if (!SameExpectedRevisions(_committedRequest, request))
+                    throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                        ModuleStorageErrors.RevisionConflict,
+                        "The retry uses a stale expected revision."));
+
+                return Task.FromResult(_committedResult with { AlreadyCommitted = true });
+            }
+
+            _committedRequest = request;
+            foreach (var item in request.Outbox)
+                CommittedEventIds.Add(item.Event.EventId);
+
+            _committedResult = new ModuleStorageMutationAndOutboxResult(
+                request.Commit,
+                request.Mutations
+                    .Select(item => new ModuleStorageRevision(item.Key, (item.ExpectedRevision ?? 0) + 1))
+                    .ToArray(),
+                request.Outbox
+                    .Select((_, index) => $"outbox-{index}")
+                    .ToArray(),
+                CommitRevision: request.Mutations.Select(item => item.ExpectedRevision ?? 0).DefaultIfEmpty().Max() + 1);
+
+            throw new TimeoutException("The response was lost after the atomic commit.");
+        }
+
+        public Task<ModuleStorageClaimResult<T>> ClaimAsync<T>(
+            string moduleId,
+            string storageName,
+            ModuleStorageClaimRequest request,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<ModuleStorageClaimRenewalResult> RenewClaimAsync(
+            string moduleId,
+            string storageName,
+            ModuleStorageClaimRenewalRequest request,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<ModuleStorageClaimRecoveryResult> RecoverClaimAsync(
+            string moduleId,
+            string storageName,
+            ModuleStorageClaimRecoveryRequest request,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        private static bool SameExpectedRevisions(
+            ModuleStorageMutationAndOutboxRequest left,
+            ModuleStorageMutationAndOutboxRequest right) =>
+            left.Mutations.Count == right.Mutations.Count &&
+            left.Mutations.Zip(right.Mutations).All(pair =>
+                string.Equals(pair.First.Key, pair.Second.Key, StringComparison.Ordinal) &&
+                pair.First.ExpectedRevision == pair.Second.ExpectedRevision);
+    }
+
     private sealed class StubStorageGateway(
         Func<string, JsonElement> responseFactory) : IModuleStorageGateway
     {
@@ -1016,9 +1634,14 @@ public sealed class SimpleKernelContractTests
         public Task<ModuleStorageClaimResult<T>> ClaimAsync<T>(
             string moduleId,
             string storageName,
-            ModuleDocumentClaimPayload request,
-            CancellationToken ct = default) =>
-            throw new NotSupportedException();
+            ModuleStorageClaimRequest request,
+            CancellationToken ct = default)
+        {
+            var response = responseFactory(ModuleStorageOperations.Claim);
+            var result = response.Deserialize<ModuleStorageClaimResult<T>>(
+                new JsonSerializerOptions(JsonSerializerDefaults.Web));
+            return Task.FromResult(result!);
+        }
 
         public Task<ModuleStorageClaimRenewalResult> RenewClaimAsync(
             string moduleId,

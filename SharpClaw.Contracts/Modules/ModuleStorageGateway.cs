@@ -22,7 +22,7 @@ public interface IModuleStorageGateway
     Task<ModuleStorageClaimResult<T>> ClaimAsync<T>(
         string moduleId,
         string storageName,
-        ModuleDocumentClaimPayload request,
+        ModuleStorageClaimRequest request,
         CancellationToken ct = default);
 
     Task<ModuleStorageClaimRenewalResult> RenewClaimAsync(
@@ -74,6 +74,10 @@ public static class ModuleStorageErrors
     public const string MissingRevision = "missing_revision";
     public const string InvalidRevision = "invalid_revision";
     public const string CommitIdentityConflict = "commit_identity_conflict";
+    public const string ClaimOwnerRequired = "claim_owner_required";
+    public const string ClaimOwnerMismatch = "claim_owner_mismatch";
+    public const string InvalidClaimAuthority = "invalid_claim_authority";
+    public const string ClaimAuthorityMismatch = "claim_authority_mismatch";
 }
 
 public static class ModuleStorageComparisonOperators
@@ -130,16 +134,6 @@ public sealed record ModuleDocumentQueryPayload(
     ModuleDocumentIndexOrder? OrderBy = null,
     int? Limit = null);
 
-public sealed record ModuleDocumentClaimPayload(
-    IReadOnlyList<ModuleDocumentIndexFilter> Filters,
-    ModuleDocumentIndexOrder? OrderBy,
-    int? Limit,
-    object Patch,
-    object? Indexes = null,
-    long? ExpectedRevision = null,
-    ModuleStorageClaimAuthority? Authority = null,
-    string? OwnerId = null);
-
 public sealed record ModuleDocumentWrite<T>(
     string Key,
     T Value,
@@ -165,8 +159,24 @@ public sealed record ModuleStorageClaimAuthority(
     public bool HasFiniteLease =>
         LeaseExpiresAt > DateTimeOffset.MinValue && LeaseExpiresAt < DateTimeOffset.MaxValue;
 
+    public bool IsValidAt(DateTimeOffset now) =>
+        !string.IsNullOrWhiteSpace(OwnerId) &&
+        HostToken != Guid.Empty &&
+        HasFiniteLease &&
+        LeaseExpiresAt > now &&
+        Generation >= 0 &&
+        Revision >= 0;
+
     public bool IsActiveAt(DateTimeOffset now) =>
-        HasFiniteLease && LeaseExpiresAt > now && Generation >= 0 && Revision >= 0;
+        IsValidAt(now);
+
+    public bool Matches(ModuleStorageClaimAuthority other) =>
+        other is not null &&
+        string.Equals(OwnerId, other.OwnerId, StringComparison.Ordinal) &&
+        HostToken == other.HostToken &&
+        LeaseExpiresAt == other.LeaseExpiresAt &&
+        Generation == other.Generation &&
+        Revision == other.Revision;
 }
 
 public sealed record ModuleStorageClaimRequest(
@@ -174,9 +184,10 @@ public sealed record ModuleStorageClaimRequest(
     IReadOnlyList<ModuleDocumentIndexFilter> Filters,
     ModuleDocumentIndexOrder? OrderBy = null,
     int? Limit = null,
-    object? Patch = null,
+    object Patch = null!,
     object? Indexes = null,
-    long? ExpectedRevision = null);
+    long? ExpectedRevision = null,
+    ModuleStorageClaimAuthority? Authority = null);
 
 public sealed record ModuleStorageClaimRenewalRequest(
     string OwnerId,
@@ -230,19 +241,9 @@ public sealed record ModuleStorageCommitIdentity(
     Guid OperationId,
     string IdempotencyKey);
 
-public sealed record ModuleStorageEventEnvelope(
-    Guid EventId,
-    SharpClawEventKey EventKey,
-    int Version,
-    JsonSchemaReference Schema,
-    EventDelivery Delivery,
-    string OwnerModuleId,
-    string Origin,
-    JsonElement Payload);
-
 public sealed record ModuleStorageOutboxMessage(
-    ModuleStorageCommitIdentity Commit,
-    ModuleStorageEventEnvelope Event,
+    UntypedEventEnvelope Event,
+    EventDelivery Delivery,
     DateTimeOffset? NotBefore = null);
 
 /// <summary>
@@ -261,6 +262,109 @@ public sealed record ModuleStorageMutationAndOutboxResult(
     IReadOnlyList<string> OutboxMessageIds,
     long CommitRevision,
     bool AlreadyCommitted = false);
+
+public static class ModuleStorageCommitValidation
+{
+    public static ModuleStorageMutationAndOutboxResult Validate(
+        ModuleStorageMutationAndOutboxRequest request,
+        ModuleStorageMutationAndOutboxResult result)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(result);
+
+        if (request.Commit.OperationId == Guid.Empty ||
+            string.IsNullOrWhiteSpace(request.Commit.IdempotencyKey))
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.CommitIdentityConflict,
+                "The atomic commit request has no stable commit identity."));
+        }
+
+        if (request.Commit != result.Commit)
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.CommitIdentityConflict,
+                "The atomic commit result does not match the requested commit identity."));
+        }
+
+        if (result.OutboxMessageIds is null)
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.MalformedResponse,
+                "The atomic commit result has no outbox message identity list."));
+        }
+
+        if (result.OutboxMessageIds.Count != request.Outbox.Count)
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.MalformedResponse,
+                "The atomic commit result does not identify every outbox message."));
+        }
+
+        if (request.Outbox.Select(item => item.Event.EventId).Distinct().Count() != request.Outbox.Count)
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.AtomicCommitRejected,
+                "The atomic commit request contains duplicate event identities."));
+        }
+
+        return result;
+    }
+}
+
+public static class ModuleStorageClaimValidation
+{
+    public static ModuleStorageClaimResult<T> Validate<T>(
+        ModuleStorageClaimRequest request,
+        ModuleStorageClaimResult<T> result,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(result);
+
+        if (string.IsNullOrWhiteSpace(request.OwnerId))
+            throw Failure(ModuleStorageErrors.ClaimOwnerRequired, "A claim requires a non-empty owner.");
+
+        if (result.Authority is null || !result.Authority.IsValidAt(now))
+            throw Failure(ModuleStorageErrors.InvalidClaimAuthority, "The claim result has invalid or expired host authority.");
+
+        if (!string.Equals(request.OwnerId, result.Authority.OwnerId, StringComparison.Ordinal))
+            throw Failure(ModuleStorageErrors.ClaimOwnerMismatch, "The claim result owner does not match the request owner.");
+
+        if (request.Authority is not null && !request.Authority.Matches(result.Authority))
+            throw Failure(ModuleStorageErrors.ClaimAuthorityMismatch, "The claim result authority does not match the requested authority.");
+
+        if (result.Records is null)
+            throw Failure(ModuleStorageErrors.MalformedResponse, "The claim result has no records.");
+
+        foreach (var record in result.Records)
+        {
+            if (record is null || string.IsNullOrWhiteSpace(record.Key))
+                throw Failure(ModuleStorageErrors.MissingRecordKey, "A claim record has no key.");
+
+            if (record.Value is null)
+                throw Failure(ModuleStorageErrors.MalformedResponse, "A claim record has no value.", record.Key);
+
+            if (record.Revision < 0)
+                throw Failure(ModuleStorageErrors.InvalidRevision, "A claim record has an invalid revision.", record.Key);
+
+            if (record.Authority is null || !record.Authority.IsValidAt(now) ||
+                !record.Authority.Matches(result.Authority) ||
+                record.Revision != result.Authority.Revision)
+            {
+                throw Failure(ModuleStorageErrors.ClaimAuthorityMismatch, "A claim record authority does not match the host authority.", record.Key);
+            }
+        }
+
+        return result;
+    }
+
+    private static ModuleStorageContractException Failure(
+        string code,
+        string message,
+        string? key = null) =>
+        new(new ModuleStorageContractFailure(code, message, key));
+}
 
 public sealed record ModuleStorageRevisionConflict(
     string Key,
@@ -284,12 +388,16 @@ public sealed class ModuleDocumentStore<T>(
     IModuleStorageGateway gateway,
     string moduleId,
     string storageName,
+    string ownerId,
     JsonSerializerOptions? jsonOptions = null)
 {
+    private readonly string _ownerId = ValidateOwner(ownerId);
     private readonly JsonSerializerOptions _jsonOptions = jsonOptions ?? new JsonSerializerOptions(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true,
     };
+
+    internal string OwnerId => _ownerId;
 
     public async Task<T?> GetAsync(string key, CancellationToken ct = default)
     {
@@ -521,91 +629,15 @@ public sealed class ModuleDocumentStore<T>(
         CancellationToken ct) =>
         InvokeDocumentRecordsAsync(ModuleStorageOperations.Query, payload, ct);
 
-    internal async Task<IReadOnlyList<T>> ClaimAsync(
-        ModuleDocumentClaimPayload payload,
+    internal async Task<ModuleStorageClaimResult<T>> ClaimAsync(
+        ModuleStorageClaimRequest request,
         CancellationToken ct)
     {
-        var result = await ClaimWithAuthorityAsync(payload, ct);
-        return result.Records
-            .Where(record => record.Value is not null)
-            .Select(record => record.Value!)
-            .ToArray();
-    }
+        if (!string.Equals(request.OwnerId, _ownerId, StringComparison.Ordinal))
+            throw ContractFailure(ModuleStorageErrors.ClaimOwnerMismatch, "The claim owner does not match the store owner.");
 
-    internal async Task<IReadOnlyList<ModuleDocumentRecord<T>>> ClaimRecordsAsync(
-        ModuleDocumentClaimPayload payload,
-        CancellationToken ct)
-    {
-        var result = await ClaimWithAuthorityAsync(payload, ct);
-        return result.Records
-            .Select(record => new ModuleDocumentRecord<T>(
-                record.Key,
-                record.Value,
-                record.Revision,
-                record.Indexes))
-            .ToArray();
-    }
-
-    internal async Task<ModuleStorageClaimResult<T>> ClaimWithAuthorityAsync(
-        ModuleDocumentClaimPayload payload,
-        CancellationToken ct)
-    {
-        using var parameters = JsonDocument.Parse(JsonSerializer.Serialize(payload, _jsonOptions));
-        var response = await gateway.InvokeAsync(
-            moduleId,
-            storageName,
-            ModuleStorageOperations.Claim,
-            parameters.RootElement,
-            ct);
-
-        if (!response.TryGetProperty("authority", out var authorityElement))
-            throw ContractFailure(ModuleStorageErrors.MalformedResponse, "The claim response has no host authority.");
-
-        var authority = authorityElement.Deserialize<ModuleStorageClaimAuthority>(_jsonOptions);
-        if (authority is null || !authority.HasFiniteLease || authority.Generation < 0 || authority.Revision < 0)
-            throw ContractFailure(ModuleStorageErrors.MalformedResponse, "The claim response has invalid host authority.");
-
-        if (!response.TryGetProperty("records", out var records) || records.ValueKind != JsonValueKind.Array)
-            throw ContractFailure(ModuleStorageErrors.MalformedResponse, "The claim response must contain a records array.");
-
-        var result = new List<ModuleStorageClaimRecord<T>>();
-        foreach (var record in records.EnumerateArray())
-        {
-            if (record.ValueKind != JsonValueKind.Object ||
-                !record.TryGetProperty("key", out var keyElement) ||
-                keyElement.ValueKind != JsonValueKind.String ||
-                string.IsNullOrWhiteSpace(keyElement.GetString()) ||
-                !record.TryGetProperty("revision", out var revisionElement) ||
-                !revisionElement.TryGetInt64(out var revision) ||
-                revision < 0 ||
-                !record.TryGetProperty("value", out var valueElement) ||
-                valueElement.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
-            {
-                throw ContractFailure(ModuleStorageErrors.MalformedResponse, "A claim record is missing key, revision, or value.");
-            }
-
-            var item = valueElement.Deserialize<T>(_jsonOptions);
-            if (item is null)
-                throw ContractFailure(ModuleStorageErrors.MalformedResponse, "A claim record value is not valid.");
-
-            var recordAuthority = record.TryGetProperty("authority", out var recordAuthorityElement)
-                ? recordAuthorityElement.Deserialize<ModuleStorageClaimAuthority>(_jsonOptions)
-                : authority;
-            if (recordAuthority is null || !recordAuthority.HasFiniteLease || recordAuthority.Generation < 0)
-                throw ContractFailure(ModuleStorageErrors.MalformedResponse, "A claim record has invalid authority.");
-
-            JsonElement? indexes = record.TryGetProperty("indexes", out var indexesElement)
-                ? indexesElement.Clone()
-                : null;
-            result.Add(new ModuleStorageClaimRecord<T>(
-                keyElement.GetString()!,
-                item,
-                revision,
-                recordAuthority,
-                indexes));
-        }
-
-        return new ModuleStorageClaimResult<T>(result, authority);
+        var result = await gateway.ClaimAsync<T>(moduleId, storageName, request, ct);
+        return ModuleStorageClaimValidation.Validate(request, result, DateTimeOffset.UtcNow);
     }
 
     private async Task<IReadOnlyList<T>> InvokeRecordsAsync(
@@ -691,6 +723,14 @@ public sealed class ModuleDocumentStore<T>(
         string message,
         string? key = null) =>
         new(new ModuleStorageContractFailure(code, message, key));
+
+    private static string ValidateOwner(string ownerId)
+    {
+        if (string.IsNullOrWhiteSpace(ownerId))
+            throw new ArgumentException("A module document store requires an owner.", nameof(ownerId));
+
+        return ownerId;
+    }
 }
 
 public sealed class ModuleDocumentQuery<T>
@@ -799,57 +839,15 @@ public sealed class ModuleDocumentClaim<T>
         return this;
     }
 
-    public Task<IReadOnlyList<T>> ToListAsync(CancellationToken ct = default)
+    public Task<ModuleStorageClaimResult<T>> ToListAsync(CancellationToken ct = default)
     {
-        if (_patch is null)
-            throw new InvalidOperationException("Module storage claim requires a patch before execution.");
-
-        return _store.ClaimAsync(
-            new ModuleDocumentClaimPayload(
-                _filters.ToArray(),
-                _orderBy,
-                _limit,
-                _patch,
-                _indexes,
-                _expectedRevision,
-                _authority),
-            ct);
+        return _store.ClaimAsync(BuildRequest(), ct);
     }
 
-    public Task<IReadOnlyList<ModuleDocumentRecord<T>>> ToRecordsAsync(
+    public Task<ModuleStorageClaimResult<T>> ToRecordsAsync(
         CancellationToken ct = default)
     {
-        if (_patch is null)
-            throw new InvalidOperationException("Module storage claim requires a patch before execution.");
-
-        return _store.ClaimRecordsAsync(
-            new ModuleDocumentClaimPayload(
-                _filters.ToArray(),
-                _orderBy,
-                _limit,
-                _patch,
-                _indexes,
-                _expectedRevision,
-                _authority),
-            ct);
-    }
-
-    public Task<ModuleStorageClaimResult<T>> ToClaimRecordsAsync(
-        CancellationToken ct = default)
-    {
-        if (_patch is null)
-            throw new InvalidOperationException("Module storage claim requires a patch before execution.");
-
-        return _store.ClaimWithAuthorityAsync(
-            new ModuleDocumentClaimPayload(
-                _filters.ToArray(),
-                _orderBy,
-                _limit,
-                _patch,
-                _indexes,
-                _expectedRevision,
-                _authority),
-            ct);
+        return _store.ClaimAsync(BuildRequest(), ct);
     }
 
     internal ModuleDocumentClaim<T> AddFilter(
@@ -865,6 +863,22 @@ public sealed class ModuleDocumentClaim<T>
     {
         _orderBy = new ModuleDocumentIndexOrder(indexName, direction);
         return this;
+    }
+
+    private ModuleStorageClaimRequest BuildRequest()
+    {
+        if (_patch is null)
+            throw new InvalidOperationException("Module storage claim requires a patch before execution.");
+
+        return new ModuleStorageClaimRequest(
+            _store.OwnerId,
+            _filters.ToArray(),
+            _orderBy,
+            _limit,
+            _patch,
+            _indexes,
+            _expectedRevision,
+            _authority);
     }
 }
 
