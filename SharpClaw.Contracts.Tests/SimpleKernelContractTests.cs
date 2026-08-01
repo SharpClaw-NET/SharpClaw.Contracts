@@ -568,7 +568,8 @@ public sealed class SimpleKernelContractTests
             ActionInterceptionCapabilities.Cancel |
             ActionInterceptionCapabilities.ReplaceResult |
             ActionInterceptionCapabilities.Defer |
-            ActionInterceptionCapabilities.Repeat);
+            ActionInterceptionCapabilities.Repeat |
+            ActionInterceptionCapabilities.Wrap);
         var state = new SidecarProtocolState(
             SidecarExchangeKind.ActionHook,
             invocationId,
@@ -580,7 +581,8 @@ public sealed class SimpleKernelContractTests
             HostLimits: new SidecarPayloadLimits(),
             ActionKey: actionKey,
             ActionGrant: actionGrant,
-            ActionVersion: 1);
+            ActionVersion: 1,
+            HostAuthorization: new SidecarHostAuthorization("module-a", [actionGrant], []));
         var effect = new SidecarEffectRequest(
             Header(2),
             handle,
@@ -654,7 +656,8 @@ public sealed class SimpleKernelContractTests
             HostLimits: new SidecarPayloadLimits(),
             ActionKey: actionKey,
             ActionGrant: actionGrant,
-            ActionVersion: 1);
+            ActionVersion: 1,
+            HostAuthorization: new SidecarHostAuthorization("module-a", [actionGrant], []));
         var replacementAccepted = SidecarProtocolStateMachine.Validate(
             replacementState,
             effect with { Header = Header(2) },
@@ -761,7 +764,14 @@ public sealed class SimpleKernelContractTests
             LastSequence: 0,
             now.AddMinutes(1),
             NegotiatedProtocolVersion: 1,
-            HostLimits: limits);
+            HostLimits: limits,
+            HostAuthorization: new SidecarHostAuthorization(
+                "module-a",
+                [new ActionCapabilityGrant(
+                    new SharpClawActionKey("demo.action"),
+                    1,
+                    ActionInterceptionCapabilities.Inspect)],
+                []));
         var started = SidecarProtocolStateMachine.Validate(
             startState,
             new HookInvokeStart(
@@ -1576,6 +1586,14 @@ public sealed class SimpleKernelContractTests
             ModuleStorageClaimValidation.Validate(request, wrongRecordFence, now));
         Assert.Equal(ModuleStorageErrors.ClaimAuthorityMismatch, wrongRecordFailure.Failure.Code);
 
+        var wrongBatchRevision = result with
+        {
+            Records = [result.Records[0] with { Authority = authority with { Revision = 19 } }, result.Records[1]],
+        };
+        var wrongBatchRevisionFailure = Assert.Throws<ModuleStorageContractException>(() =>
+            ModuleStorageClaimValidation.Validate(request, wrongBatchRevision, now));
+        Assert.Equal(ModuleStorageErrors.ClaimAuthorityMismatch, wrongBatchRevisionFailure.Failure.Code);
+
         var staleBatchFence = result with
         {
             Authority = authority with { Generation = 3 },
@@ -1721,7 +1739,8 @@ public sealed class SimpleKernelContractTests
             EventDescriptor: descriptor,
             EventGrant: grant,
             EventKey: descriptor.Key,
-            EventVersion: descriptor.Version);
+            EventVersion: descriptor.Version,
+            HostAuthorization: new SidecarHostAuthorization("module-a", [], [grant]));
         var start = new EventInterceptStart(
             Header(1),
             "event-hook",
@@ -1782,7 +1801,11 @@ public sealed class SimpleKernelContractTests
             HostLimits: new SidecarPayloadLimits(),
             ActionKey: actionKey,
             ActionVersion: 1,
-            ActionGrant: new ActionCapabilityGrant(actionKey, 1, ActionInterceptionCapabilities.Inspect));
+            ActionGrant: new ActionCapabilityGrant(actionKey, 1, ActionInterceptionCapabilities.Inspect),
+            HostAuthorization: new SidecarHostAuthorization(
+                "module-a",
+                [new ActionCapabilityGrant(actionKey, 1, ActionInterceptionCapabilities.Inspect)],
+                []));
 
         foreach (var command in new[]
         {
@@ -1813,6 +1836,560 @@ public sealed class SimpleKernelContractTests
             now);
         Assert.False(replacement.Accepted);
         Assert.Equal(SidecarProtocolErrors.UnsupportedCapability, replacement.ErrorCode);
+    }
+
+    [Fact]
+    public void SidecarMeasuresEachMessageAgainstItsSpecificHostPayloadLimit()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var limits = new SidecarPayloadLimits(
+            ActionInputBytes: 64,
+            ActionResultBytes: 64,
+            EventPayloadBytes: 64,
+            ProtocolMessageBytes: 4096,
+            StreamChunkBytes: 64);
+        var actionKey = new SharpClawActionKey("demo.action");
+        var actionGrant = new ActionCapabilityGrant(
+            actionKey,
+            1,
+            ActionInterceptionCapabilities.Inspect |
+            ActionInterceptionCapabilities.ReplaceInput |
+            ActionInterceptionCapabilities.Wrap |
+            ActionInterceptionCapabilities.ReplaceResult);
+        var actionDescriptor = new UntypedActionDescriptor(
+            actionKey,
+            1,
+            "demo",
+            actionGrant.Capabilities,
+            new JsonSchemaReference("demo.input", 1, "input-hash"),
+            new JsonSchemaReference("demo.result", 1, "result-hash"),
+            ContainsSensitiveData: false);
+        var authorization = new SidecarHostAuthorization("module-a", [actionGrant], []);
+        var invocationId = Guid.NewGuid();
+        var handle = new ContinuationHandle(Guid.NewGuid(), invocationId, "hook-a", now.AddMinutes(1), 1);
+        var smallHeader = Header(1) with
+        {
+            Size = new SidecarMessageSizeAuthority(1, 64),
+        };
+        var large = CreateElement(new { value = new string('x', 512) });
+        var startState = new SidecarProtocolState(
+            SidecarExchangeKind.ActionHook,
+            Guid.Empty,
+            Guid.Empty,
+            SidecarProtocolPhase.Negotiated,
+            LastSequence: 0,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: limits,
+            HostAuthorization: authorization);
+        var actionInput = SidecarProtocolStateMachine.Validate(
+            startState,
+            new HookInvokeStart(
+                smallHeader,
+                invocationId,
+                null,
+                Guid.NewGuid(),
+                "hook-a",
+                actionKey,
+                1,
+                SidecarPayloadMode.Untyped,
+                large,
+                actionDescriptor,
+                actionGrant,
+                new RequestPrincipal("user-1"),
+                ExtensionFeatureSet.Empty,
+                handle),
+            now);
+        Assert.False(actionInput.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, actionInput.ErrorCode);
+
+        var invokingState = new SidecarProtocolState(
+            SidecarExchangeKind.ActionHook,
+            invocationId,
+            handle.HandleId,
+            SidecarProtocolPhase.Invoking,
+            LastSequence: 1,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: limits,
+            ActionKey: actionKey,
+            ActionGrant: actionGrant,
+            ActionVersion: 1,
+            ActionDescriptor: actionDescriptor,
+            HostAuthorization: authorization);
+        var replacementInput = SidecarProtocolStateMachine.Validate(
+            invokingState,
+            new SidecarEffectRequest(
+                smallHeader with { Sequence = 2 },
+                handle.HandleId,
+                SidecarContinuationCommand.ContinueReplacement,
+                large),
+            now);
+        Assert.False(replacementInput.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, replacementInput.ErrorCode);
+
+        var actionResult = SidecarProtocolStateMachine.Validate(
+            invokingState with { Phase = SidecarProtocolPhase.SidecarOutcomeSent },
+            new SidecarResultReplacement(
+                smallHeader with { Sequence = 2 },
+                handle.HandleId,
+                large,
+                "large result"),
+            now);
+        Assert.False(actionResult.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, actionResult.ErrorCode);
+
+        var eventKey = new SharpClawEventKey("demo.event");
+        var eventDescriptor = new UntypedEventDescriptor(
+            eventKey,
+            1,
+            "demo",
+            EventInterceptionCapabilities.Inspect,
+            new JsonSchemaReference("demo.event", 1, "event-hash"),
+            ContainsSensitiveData: false);
+        var eventGrant = new EventCapabilityGrant(eventKey, 1, EventInterceptionCapabilities.Inspect);
+        var eventState = new SidecarProtocolState(
+            SidecarExchangeKind.EventIntercept,
+            Guid.Empty,
+            Guid.Empty,
+            SidecarProtocolPhase.Negotiated,
+            LastSequence: 0,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: limits,
+            EventDescriptor: eventDescriptor,
+            EventGrant: eventGrant,
+            HostAuthorization: new SidecarHostAuthorization("module-a", [], [eventGrant]));
+        var eventEnvelope = new UntypedEventEnvelope(
+            eventDescriptor,
+            Guid.NewGuid(),
+            null,
+            Guid.NewGuid(),
+            now,
+            "module-a",
+            large);
+        var eventPayload = SidecarProtocolStateMachine.Validate(
+            eventState,
+            new EventInterceptStart(
+                smallHeader with { Sequence = 1 },
+                "event-hook",
+                eventEnvelope,
+                eventGrant,
+                new ContinuationHandle(Guid.NewGuid(), Guid.NewGuid(), "event-hook", now.AddMinutes(1), 1)),
+            now);
+        Assert.False(eventPayload.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, eventPayload.ErrorCode);
+
+        var streamId = Guid.NewGuid();
+        var streamPayload = SidecarProtocolStateMachine.Validate(
+            new SidecarProtocolState(
+                SidecarExchangeKind.Stream,
+                Guid.Empty,
+                Guid.Empty,
+                SidecarProtocolPhase.Invoking,
+                LastSequence: 0,
+                now.AddMinutes(1),
+                NegotiatedProtocolVersion: 1,
+                HostLimits: limits,
+                StreamId: streamId),
+            new SidecarStreamChunk(
+                smallHeader with { Sequence = 1 },
+                streamId,
+                1,
+                large,
+                IsFinal: false),
+            now);
+        Assert.False(streamPayload.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, streamPayload.ErrorCode);
+    }
+
+    [Fact]
+    public void SidecarContinuationRequiresWrapAndValidCommandShapes()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var key = new SharpClawActionKey("demo.action");
+
+        static SidecarProtocolState State(
+            DateTimeOffset now,
+            SharpClawActionKey key,
+            ActionCapabilityGrant grant) =>
+            new(
+                SidecarExchangeKind.ActionHook,
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                SidecarProtocolPhase.Invoking,
+                LastSequence: 1,
+                now.AddMinutes(1),
+                NegotiatedProtocolVersion: 1,
+                HostLimits: new SidecarPayloadLimits(),
+                ActionKey: key,
+                ActionVersion: grant.ActionVersion,
+                ActionGrant: grant,
+                HostAuthorization: new SidecarHostAuthorization("module-a", [grant], []));
+
+        var inspectOnly = new ActionCapabilityGrant(key, 1, ActionInterceptionCapabilities.Inspect);
+        Assert.False(SidecarProtocolStateMachine.CanApply(
+            State(now, key, inspectOnly),
+            new SidecarEffectRequest(Header(2), Guid.Empty, SidecarContinuationCommand.ContinueOriginal)));
+
+        var observeOnly = new ActionCapabilityGrant(key, 1, ActionInterceptionCapabilities.Observe);
+        Assert.False(SidecarProtocolStateMachine.CanApply(
+            State(now, key, observeOnly),
+            new SidecarEffectRequest(Header(2), Guid.Empty, SidecarContinuationCommand.ContinueOriginal)));
+
+        var wrapping = new ActionCapabilityGrant(
+            key,
+            1,
+            ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap);
+        var wrappingState = State(now, key, wrapping);
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            wrappingState,
+            new SidecarEffectRequest(Header(2), wrappingState.ContinuationHandleId, SidecarContinuationCommand.ContinueOriginal)));
+
+        var wrappingReplacement = wrapping with
+        {
+            Capabilities = wrapping.Capabilities | ActionInterceptionCapabilities.ReplaceInput,
+        };
+        var replacementState = State(now, key, wrappingReplacement);
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            replacementState,
+            new SidecarEffectRequest(
+                Header(2),
+                replacementState.ContinuationHandleId,
+                SidecarContinuationCommand.ContinueReplacement,
+                CreateElement(new { value = 2 }),
+                Reason: "replace input")));
+
+        var malformedReplacement = SidecarProtocolStateMachine.Validate(
+            replacementState,
+            new SidecarEffectRequest(
+                Header(2),
+                replacementState.ContinuationHandleId,
+                SidecarContinuationCommand.ContinueReplacement),
+            now);
+        Assert.False(malformedReplacement.Accepted);
+        Assert.Equal(SidecarProtocolErrors.MalformedMessage, malformedReplacement.ErrorCode);
+
+        var malformedOriginal = SidecarProtocolStateMachine.Validate(
+            wrappingState,
+            new SidecarEffectRequest(
+                Header(2),
+                wrappingState.ContinuationHandleId,
+                SidecarContinuationCommand.ContinueOriginal,
+                CreateElement(new { value = 2 })),
+            now);
+        Assert.False(malformedOriginal.Accepted);
+        Assert.Equal(SidecarProtocolErrors.MalformedMessage, malformedOriginal.ErrorCode);
+    }
+
+    [Fact]
+    public void SidecarRuntimeGrantsMatchCompiledAuthorizationAndSchemaSecurity()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var actionKey = new SharpClawActionKey("demo.action");
+        var actionCapabilities = ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap;
+
+        static UntypedActionDescriptor ActionDescriptor(
+            SharpClawActionKey key,
+            bool sensitive,
+            bool acceptsUnknown) =>
+            new(
+                key,
+                1,
+                "demo",
+                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap,
+                new JsonSchemaReference("demo.input", 1, "input-hash"),
+                new JsonSchemaReference("demo.result", 1, "result-hash"),
+                sensitive)
+            {
+                AcceptsUnknownNonSensitiveSchemas = acceptsUnknown,
+            };
+
+        static SidecarProtocolState ActionState(
+            DateTimeOffset now,
+            ActionCapabilityGrant grant) =>
+            new(
+                SidecarExchangeKind.ActionHook,
+                Guid.Empty,
+                Guid.Empty,
+                SidecarProtocolPhase.Negotiated,
+                LastSequence: 0,
+                now.AddMinutes(1),
+                NegotiatedProtocolVersion: 1,
+                HostLimits: new SidecarPayloadLimits(),
+                HostAuthorization: new SidecarHostAuthorization("module-a", [grant], []));
+
+        HookInvokeStart ActionStart(
+            UntypedActionDescriptor descriptor,
+            ActionCapabilityGrant grant,
+            long sequence = 1)
+        {
+            var invocationId = Guid.NewGuid();
+            return new(
+                Header(sequence),
+                invocationId,
+                null,
+                Guid.NewGuid(),
+                "action-hook",
+                actionKey,
+                1,
+                SidecarPayloadMode.Untyped,
+                CreateElement(new { value = 1 }),
+                descriptor,
+                grant,
+                new RequestPrincipal("user-1"),
+                ExtensionFeatureSet.Empty,
+                new ContinuationHandle(Guid.NewGuid(), invocationId, "action-hook", now.AddMinutes(1), sequence));
+        }
+
+        var exactSensitiveDescriptor = ActionDescriptor(actionKey, sensitive: true, acceptsUnknown: false);
+        var exactSensitiveGrant = new ActionCapabilityGrant(
+            actionKey,
+            1,
+            actionCapabilities,
+            SensitiveApproved: true);
+        var exactStart = ActionStart(exactSensitiveDescriptor, exactSensitiveGrant);
+        var exactResult = SidecarProtocolStateMachine.Validate(ActionState(now, exactSensitiveGrant), exactStart, now);
+        Assert.True(exactResult.Accepted);
+
+        var changedAuthorization = SidecarProtocolStateMachine.Validate(
+            ActionState(now, exactSensitiveGrant),
+            exactStart with
+            {
+                Header = Header(1),
+                Grant = exactSensitiveGrant with { SensitiveApproved = false },
+            },
+            now);
+        Assert.False(changedAuthorization.Accepted);
+        Assert.Equal(SidecarProtocolErrors.UnsupportedCapability, changedAuthorization.ErrorCode);
+
+        var broadSensitiveDescriptor = ActionDescriptor(actionKey, sensitive: true, acceptsUnknown: true);
+        var broadSensitiveGrant = exactSensitiveGrant with { AcceptUnknownSchemas = true };
+        var broadSensitive = SidecarProtocolStateMachine.Validate(
+            ActionState(now, broadSensitiveGrant),
+            ActionStart(broadSensitiveDescriptor, broadSensitiveGrant),
+            now);
+        Assert.False(broadSensitive.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ForgedApproval, broadSensitive.ErrorCode);
+
+        var futureDescriptor = ActionDescriptor(actionKey, sensitive: false, acceptsUnknown: true);
+        var futureGrant = new ActionCapabilityGrant(actionKey, 1, actionCapabilities, AcceptUnknownSchemas: true);
+        var future = SidecarProtocolStateMachine.Validate(
+            ActionState(now, futureGrant),
+            ActionStart(futureDescriptor, futureGrant),
+            now);
+        Assert.True(future.Accepted);
+
+        var disabledFutureGrant = futureGrant with { AcceptUnknownSchemas = false };
+        var disabledFuture = SidecarProtocolStateMachine.Validate(
+            ActionState(now, disabledFutureGrant),
+            ActionStart(futureDescriptor, disabledFutureGrant),
+            now);
+        Assert.False(disabledFuture.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ForgedApproval, disabledFuture.ErrorCode);
+
+        var eventKey = new SharpClawEventKey("demo.event");
+        var eventCapabilities = EventInterceptionCapabilities.Inspect;
+
+        static UntypedEventDescriptor EventDescriptor(
+            SharpClawEventKey key,
+            bool sensitive,
+            bool acceptsUnknown) =>
+            new(
+                key,
+                1,
+                "demo",
+                EventInterceptionCapabilities.Inspect,
+                new JsonSchemaReference("demo.event", 1, "event-hash"),
+                sensitive)
+            {
+                AcceptsUnknownNonSensitiveSchemas = acceptsUnknown,
+            };
+
+        EventInterceptStart EventStart(
+            UntypedEventDescriptor descriptor,
+            EventCapabilityGrant grant,
+            long sequence = 1)
+        {
+            var envelope = new UntypedEventEnvelope(
+                descriptor,
+                Guid.NewGuid(),
+                null,
+                Guid.NewGuid(),
+                now,
+                "module-a",
+                CreateElement(new { value = 1 }));
+            return new(
+                Header(sequence),
+                "event-hook",
+                envelope,
+                grant,
+                new ContinuationHandle(Guid.NewGuid(), Guid.NewGuid(), "event-hook", now.AddMinutes(1), sequence));
+        }
+
+        SidecarProtocolState EventState(
+            EventCapabilityGrant grant) =>
+            new(
+                SidecarExchangeKind.EventIntercept,
+                Guid.Empty,
+                Guid.Empty,
+                SidecarProtocolPhase.Negotiated,
+                LastSequence: 0,
+                now.AddMinutes(1),
+                NegotiatedProtocolVersion: 1,
+                HostLimits: new SidecarPayloadLimits(),
+                HostAuthorization: new SidecarHostAuthorization("module-a", [], [grant]));
+
+        var exactEventDescriptor = EventDescriptor(eventKey, sensitive: true, acceptsUnknown: false);
+        var exactEventGrant = new EventCapabilityGrant(eventKey, 1, eventCapabilities, SensitiveApproved: true);
+        Assert.True(SidecarProtocolStateMachine.Validate(
+            EventState(exactEventGrant),
+            EventStart(exactEventDescriptor, exactEventGrant),
+            now).Accepted);
+
+        var forgedEvent = exactEventGrant with { SensitiveApproved = false };
+        var forgedEventResult = SidecarProtocolStateMachine.Validate(
+            EventState(forgedEvent),
+            EventStart(exactEventDescriptor, forgedEvent),
+            now);
+        Assert.False(forgedEventResult.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ForgedApproval, forgedEventResult.ErrorCode);
+
+        var broadEventDescriptor = EventDescriptor(eventKey, sensitive: true, acceptsUnknown: true);
+        var broadEventGrant = exactEventGrant with { AcceptUnknownSchemas = true };
+        var broadEvent = SidecarProtocolStateMachine.Validate(
+            EventState(broadEventGrant),
+            EventStart(broadEventDescriptor, broadEventGrant),
+            now);
+        Assert.False(broadEvent.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ForgedApproval, broadEvent.ErrorCode);
+
+        var futureEventDescriptor = EventDescriptor(eventKey, sensitive: false, acceptsUnknown: true);
+        var futureEventGrant = new EventCapabilityGrant(eventKey, 1, eventCapabilities, AcceptUnknownSchemas: true);
+        Assert.True(SidecarProtocolStateMachine.Validate(
+            EventState(futureEventGrant),
+            EventStart(futureEventDescriptor, futureEventGrant),
+            now).Accepted);
+
+        var disabledFutureEventGrant = futureEventGrant with { AcceptUnknownSchemas = false };
+        var disabledFutureEvent = SidecarProtocolStateMachine.Validate(
+            EventState(disabledFutureEventGrant),
+            EventStart(futureEventDescriptor, disabledFutureEventGrant),
+            now);
+        Assert.False(disabledFutureEvent.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ForgedApproval, disabledFutureEvent.ErrorCode);
+    }
+
+    [Fact]
+    public void SidecarEventOutcomesRejectContradictoryPayloadAndErrorShapes()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var descriptor = new UntypedEventDescriptor(
+            new SharpClawEventKey("demo.event"),
+            1,
+            "demo",
+            EventInterceptionCapabilities.Inspect | EventInterceptionCapabilities.Replace,
+            new JsonSchemaReference("demo.event", 1, "event-hash"),
+            ContainsSensitiveData: false);
+        var grant = new EventCapabilityGrant(
+            descriptor.Key,
+            descriptor.Version,
+            descriptor.Capabilities);
+        var state = new SidecarProtocolState(
+            SidecarExchangeKind.EventIntercept,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            SidecarProtocolPhase.Invoking,
+            LastSequence: 1,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: new SidecarPayloadLimits(),
+            EventDescriptor: descriptor,
+            EventGrant: grant,
+            EventKey: descriptor.Key,
+            EventVersion: descriptor.Version,
+            HostAuthorization: new SidecarHostAuthorization("module-a", [], [grant]));
+
+        var continuedWithPayload = SidecarProtocolStateMachine.Validate(
+            state,
+            new EventInterceptOutcome(
+                Header(2),
+                state.ContinuationHandleId,
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.PayloadSchema,
+                EventInterceptionKind.Continued,
+                Payload: CreateElement(new { invalid = true })),
+            now);
+        Assert.False(continuedWithPayload.Accepted);
+        Assert.Equal(SidecarProtocolErrors.MalformedMessage, continuedWithPayload.ErrorCode);
+
+        var replacedWithoutPayload = SidecarProtocolStateMachine.Validate(
+            state,
+            new EventInterceptOutcome(
+                Header(2),
+                state.ContinuationHandleId,
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.PayloadSchema,
+                EventInterceptionKind.Replaced),
+            now);
+        Assert.False(replacedWithoutPayload.Accepted);
+        Assert.Equal(SidecarProtocolErrors.MalformedMessage, replacedWithoutPayload.ErrorCode);
+
+        var failedWithoutError = SidecarProtocolStateMachine.Validate(
+            state,
+            new EventInterceptOutcome(
+                Header(2),
+                state.ContinuationHandleId,
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.PayloadSchema,
+                EventInterceptionKind.Failed),
+            now);
+        Assert.False(failedWithoutError.Accepted);
+        Assert.Equal(SidecarProtocolErrors.MalformedMessage, failedWithoutError.ErrorCode);
+    }
+
+    [Fact]
+    public void StorageAtomicCommitRejectsIncompleteImmutableEventIdentity()
+    {
+        var commit = new ModuleStorageCommitIdentity(Guid.NewGuid(), "event-identity");
+        var eventEnvelope = CreateStorageEvent("job-1");
+        var request = new ModuleStorageMutationAndOutboxRequest(
+            commit,
+            [new ModuleStorageMutation(ModuleStorageOperations.Upsert, "job-1", CreateElement(new { value = 1 }))],
+            [new ModuleStorageOutboxMessage(eventEnvelope, EventDelivery.Durable)]);
+        var valid = new ModuleStorageMutationAndOutboxResult(
+            commit,
+            [new ModuleStorageRevision("job-1", 1)],
+            ["outbox-1"],
+            CommitRevision: 1);
+
+        foreach (var candidate in new[]
+        {
+            eventEnvelope with { EventId = Guid.Empty },
+            eventEnvelope with { TraceId = Guid.Empty },
+            eventEnvelope with { OwnerModuleId = "" },
+            eventEnvelope with { Payload = default },
+            eventEnvelope with
+            {
+                Descriptor = eventEnvelope.Descriptor with
+                {
+                    PayloadSchema = eventEnvelope.Descriptor.PayloadSchema with { ContentHash = null },
+                },
+            },
+        })
+        {
+            var failure = Assert.Throws<ModuleStorageContractException>(() =>
+                ModuleStorageCommitValidation.Validate(
+                    request with
+                    {
+                        Outbox = [new ModuleStorageOutboxMessage(candidate, EventDelivery.Durable)],
+                    },
+                    valid));
+            Assert.Equal(ModuleStorageErrors.InvalidEventIdentity, failure.Failure.Code);
+        }
     }
 
     [Fact]

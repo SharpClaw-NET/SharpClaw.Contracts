@@ -98,6 +98,9 @@ public sealed record UntypedEventDescriptor(
 {
     public ContractVersionRange ProtocolVersionRange { get; init; } =
         ContractVersionRange.Exact(1);
+
+    /// <summary>Allows a compiled non-sensitive category or wildcard grant to accept a future schema.</summary>
+    public bool AcceptsUnknownNonSensitiveSchemas { get; init; }
 }
 
 public sealed record UntypedEventEnvelope(

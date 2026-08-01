@@ -80,6 +80,7 @@ public static class ModuleStorageErrors
     public const string ClaimAuthorityMismatch = "claim_authority_mismatch";
     public const string InvalidCommitRevision = "invalid_commit_revision";
     public const string InvalidOutboxIdentity = "invalid_outbox_identity";
+    public const string InvalidEventIdentity = "invalid_event_identity";
     public const string MissingMutationRevision = "missing_mutation_revision";
     public const string DuplicateMutationRevision = "duplicate_mutation_revision";
     public const string MutationRevisionMismatch = "mutation_revision_mismatch";
@@ -191,7 +192,8 @@ public sealed record ModuleStorageClaimAuthority(
         string.Equals(OwnerId, other.OwnerId, StringComparison.Ordinal) &&
         HostToken == other.HostToken &&
         LeaseExpiresAt == other.LeaseExpiresAt &&
-        Generation == other.Generation;
+        Generation == other.Generation &&
+        Revision == other.Revision;
 }
 
 public sealed record ModuleStorageClaimRequest(
@@ -335,6 +337,16 @@ public static class ModuleStorageCommitValidation
                 "The atomic commit result has an empty or duplicate outbox identity."));
         }
 
+        foreach (var outbox in request.Outbox)
+        {
+            if (!IsValidEventIdentity(outbox?.Event))
+            {
+                throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                    ModuleStorageErrors.InvalidEventIdentity,
+                    "The atomic commit request contains an incomplete immutable event identity."));
+            }
+        }
+
         if (request.Outbox.Select(item => item.Event.EventId).Distinct().Count() != request.Outbox.Count)
         {
             throw new ModuleStorageContractException(new ModuleStorageContractFailure(
@@ -385,6 +397,22 @@ public static class ModuleStorageCommitValidation
 
         return result;
     }
+
+    private static bool IsValidEventIdentity(UntypedEventEnvelope? envelope) =>
+        envelope is not null &&
+        envelope.EventId != Guid.Empty &&
+        envelope.TraceId != Guid.Empty &&
+        envelope.Timestamp != default &&
+        !string.IsNullOrWhiteSpace(envelope.OwnerModuleId) &&
+        envelope.Payload.ValueKind != JsonValueKind.Undefined &&
+        envelope.Descriptor is not null &&
+        !string.IsNullOrWhiteSpace(envelope.Descriptor.Key.Value) &&
+        envelope.Descriptor.Version >= 1 &&
+        !string.IsNullOrWhiteSpace(envelope.Descriptor.Category) &&
+        !string.IsNullOrWhiteSpace(envelope.Descriptor.PayloadSchema.ContractName) &&
+        envelope.Descriptor.PayloadSchema.Version >= 1 &&
+        !string.IsNullOrWhiteSpace(envelope.Descriptor.PayloadSchema.ContentHash) &&
+        envelope.Descriptor.ProtocolVersionRange is not null;
 }
 
 public static class ModuleStorageClaimValidation
