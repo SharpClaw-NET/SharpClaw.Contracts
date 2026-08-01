@@ -78,6 +78,11 @@ public static class ModuleStorageErrors
     public const string ClaimOwnerMismatch = "claim_owner_mismatch";
     public const string InvalidClaimAuthority = "invalid_claim_authority";
     public const string ClaimAuthorityMismatch = "claim_authority_mismatch";
+    public const string InvalidCommitRevision = "invalid_commit_revision";
+    public const string InvalidOutboxIdentity = "invalid_outbox_identity";
+    public const string MissingMutationRevision = "missing_mutation_revision";
+    public const string DuplicateMutationRevision = "duplicate_mutation_revision";
+    public const string MutationRevisionMismatch = "mutation_revision_mismatch";
 }
 
 public static class ModuleStorageComparisonOperators
@@ -148,7 +153,10 @@ public sealed record ModuleDocumentDelete(
 
 public sealed record ModuleStorageRevision(string Key, long Revision);
 
-/// <summary>Host-issued authority for one claimed mutation or continuation.</summary>
+/// <summary>
+/// Host-issued fence for one claim batch. The revision in this record is the batch fence.
+/// Each claimed record carries its own document revision.
+/// </summary>
 public sealed record ModuleStorageClaimAuthority(
     string OwnerId,
     Guid HostToken,
@@ -177,6 +185,13 @@ public sealed record ModuleStorageClaimAuthority(
         LeaseExpiresAt == other.LeaseExpiresAt &&
         Generation == other.Generation &&
         Revision == other.Revision;
+
+    public bool MatchesFence(ModuleStorageClaimAuthority other) =>
+        other is not null &&
+        string.Equals(OwnerId, other.OwnerId, StringComparison.Ordinal) &&
+        HostToken == other.HostToken &&
+        LeaseExpiresAt == other.LeaseExpiresAt &&
+        Generation == other.Generation;
 }
 
 public sealed record ModuleStorageClaimRequest(
@@ -201,6 +216,7 @@ public sealed record ModuleStorageClaimRecoveryRequest(
     long Generation,
     DateTimeOffset ObservedAt);
 
+/// <summary>One claimed document with its own revision and the batch fence.</summary>
 public sealed record ModuleStorageClaimRecord<T>(
     string Key,
     T? Value,
@@ -256,6 +272,9 @@ public sealed record ModuleStorageMutationAndOutboxRequest(
     IReadOnlyList<ModuleStorageOutboxMessage> Outbox,
     ModuleStorageClaimAuthority? Authority = null);
 
+/// <summary>
+/// Atomic commit evidence. Revision rows and outbox IDs use request order.
+/// </summary>
 public sealed record ModuleStorageMutationAndOutboxResult(
     ModuleStorageCommitIdentity Commit,
     IReadOnlyList<ModuleStorageRevision> Revisions,
@@ -287,11 +306,11 @@ public static class ModuleStorageCommitValidation
                 "The atomic commit result does not match the requested commit identity."));
         }
 
-        if (result.OutboxMessageIds is null)
+        if (request.Mutations is null || request.Outbox is null || result.Revisions is null || result.OutboxMessageIds is null)
         {
             throw new ModuleStorageContractException(new ModuleStorageContractFailure(
                 ModuleStorageErrors.MalformedResponse,
-                "The atomic commit result has no outbox message identity list."));
+                "The atomic commit request or result has a missing collection."));
         }
 
         if (result.OutboxMessageIds.Count != request.Outbox.Count)
@@ -301,11 +320,67 @@ public static class ModuleStorageCommitValidation
                 "The atomic commit result does not identify every outbox message."));
         }
 
+        if (result.CommitRevision < 0)
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.InvalidCommitRevision,
+                "The atomic commit result has a negative commit revision."));
+        }
+
+        if (result.OutboxMessageIds.Any(string.IsNullOrWhiteSpace) ||
+            result.OutboxMessageIds.Distinct(StringComparer.Ordinal).Count() != result.OutboxMessageIds.Count)
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.InvalidOutboxIdentity,
+                "The atomic commit result has an empty or duplicate outbox identity."));
+        }
+
         if (request.Outbox.Select(item => item.Event.EventId).Distinct().Count() != request.Outbox.Count)
         {
             throw new ModuleStorageContractException(new ModuleStorageContractFailure(
                 ModuleStorageErrors.AtomicCommitRejected,
                 "The atomic commit request contains duplicate event identities."));
+        }
+
+        var mutationKeys = request.Mutations.Select(item => item.Key).ToArray();
+        if (mutationKeys.Any(string.IsNullOrWhiteSpace) ||
+            mutationKeys.Distinct(StringComparer.Ordinal).Count() != mutationKeys.Length)
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.AtomicCommitRejected,
+                "The atomic commit request has missing or duplicate mutation keys."));
+        }
+
+        if (result.Revisions.Count != mutationKeys.Length)
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.MissingMutationRevision,
+                "The atomic commit result does not return one revision for every mutation."));
+        }
+
+        if (result.Revisions.Any(item => item is null || item.Revision < 0))
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.InvalidRevision,
+                "The atomic commit result has a missing or negative mutation revision."));
+        }
+
+        if (result.Revisions.Select(item => item.Key).Distinct(StringComparer.Ordinal).Count() != result.Revisions.Count)
+        {
+            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                ModuleStorageErrors.DuplicateMutationRevision,
+                "The atomic commit result has duplicate mutation revision keys."));
+        }
+
+        for (var index = 0; index < mutationKeys.Length; index++)
+        {
+            if (!string.Equals(result.Revisions[index].Key, mutationKeys[index], StringComparison.Ordinal))
+            {
+                throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                    ModuleStorageErrors.MutationRevisionMismatch,
+                    "The atomic commit result revision order does not match mutation order.",
+                    mutationKeys[index]));
+            }
         }
 
         return result;
@@ -349,8 +424,7 @@ public static class ModuleStorageClaimValidation
                 throw Failure(ModuleStorageErrors.InvalidRevision, "A claim record has an invalid revision.", record.Key);
 
             if (record.Authority is null || !record.Authority.IsValidAt(now) ||
-                !record.Authority.Matches(result.Authority) ||
-                record.Revision != result.Authority.Revision)
+                !record.Authority.MatchesFence(result.Authority))
             {
                 throw Failure(ModuleStorageErrors.ClaimAuthorityMismatch, "A claim record authority does not match the host authority.", record.Key);
             }

@@ -328,6 +328,7 @@ public sealed record SidecarEventListenerAcknowledgement(
     SidecarMessageHeader Header,
     Guid DeliveryId,
     string ListenerId,
+    UntypedEventDescriptor Descriptor,
     EventDelivery Delivery,
     bool Accepted,
     ExecutionError? Error = null) : ISidecarProtocolMessage
@@ -581,15 +582,20 @@ public static class SidecarDiscoveryValidator
                     !string.Equals(subscription.Category, descriptor.Category, StringComparison.Ordinal))
                     return Reject(SidecarProtocolErrors.CategoryMismatch, "The action subscription category does not match the host descriptor.");
 
-                if (!SameSchema(descriptor.InputSchema, subscription.InputSchema) ||
-                    !SameSchema(descriptor.ResultSchema, subscription.ResultSchema))
+                var acceptsUnknownNonSensitiveSchema =
+                    (subscription.TargetKind is SidecarHookTargetKind.Category or SidecarHookTargetKind.Wildcard) &&
+                    subscription.PayloadMode == SidecarPayloadMode.Untyped &&
+                    subscription.AcceptUnknownNonSensitiveSchemas;
+                if ((!acceptsUnknownNonSensitiveSchema || descriptor.ContainsSensitiveData) &&
+                    (!SameSchema(descriptor.InputSchema, subscription.InputSchema) ||
+                     !SameSchema(descriptor.ResultSchema, subscription.ResultSchema)))
                     return Reject(SidecarProtocolErrors.SchemaMismatch, "The action subscription schema does not match every host descriptor.");
 
                 if ((subscription.Capabilities & ~descriptor.Capabilities) != 0)
                     return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action subscription requests an ungranted host capability.");
 
-                if (subscription.TargetKind == SidecarHookTargetKind.Wildcard &&
-                    descriptor.ContainsSensitiveData &&
+                if ((subscription.TargetKind is SidecarHookTargetKind.Category or SidecarHookTargetKind.Wildcard) &&
+                    (descriptor.ContainsSensitiveData || subscription.SensitiveWildcardApprovalRequired) &&
                     (hostCatalog.SensitiveWildcardApproval is null ||
                      !string.Equals(hostCatalog.SensitiveWildcardApproval.ModuleId, discovery.ModuleId, StringComparison.Ordinal) ||
                      !hostCatalog.SensitiveWildcardApproval.CoversAction(descriptor.ActionKey, descriptor.Version)))
@@ -637,14 +643,19 @@ public static class SidecarDiscoveryValidator
                     !string.Equals(subscription.Category, descriptor.Category, StringComparison.Ordinal))
                     return Reject(SidecarProtocolErrors.CategoryMismatch, "The event subscription category does not match the host descriptor.");
 
-                if (!SameSchema(descriptor.PayloadSchema, subscription.PayloadSchema))
+                var acceptsUnknownNonSensitiveSchema =
+                    (subscription.TargetKind is SidecarHookTargetKind.Category or SidecarHookTargetKind.Wildcard) &&
+                    subscription.PayloadMode == SidecarPayloadMode.Untyped &&
+                    subscription.AcceptUnknownNonSensitiveSchemas;
+                if ((!acceptsUnknownNonSensitiveSchema || descriptor.ContainsSensitiveData) &&
+                    !SameSchema(descriptor.PayloadSchema, subscription.PayloadSchema))
                     return Reject(SidecarProtocolErrors.SchemaMismatch, "The event subscription schema does not match every host descriptor.");
 
                 if ((subscription.Capabilities & ~descriptor.Capabilities) != 0)
                     return Reject(SidecarProtocolErrors.UnsupportedCapability, "The event subscription requests an ungranted host capability.");
 
-                if (subscription.TargetKind == SidecarHookTargetKind.Wildcard &&
-                    descriptor.ContainsSensitiveData &&
+                if ((subscription.TargetKind is SidecarHookTargetKind.Category or SidecarHookTargetKind.Wildcard) &&
+                    (descriptor.ContainsSensitiveData || subscription.SensitiveWildcardApprovalRequired) &&
                     (hostCatalog.SensitiveWildcardApproval is null ||
                      !string.Equals(hostCatalog.SensitiveWildcardApproval.ModuleId, discovery.ModuleId, StringComparison.Ordinal) ||
                      !hostCatalog.SensitiveWildcardApproval.CoversEvent(descriptor.EventKey, descriptor.Version)))
@@ -771,6 +782,8 @@ public sealed record EventInterceptOutcome(
     SidecarMessageHeader Header,
     Guid ContinuationHandleId,
     SharpClawEventKey EventKey,
+    int EventVersion,
+    JsonSchemaReference EventSchema,
     EventInterceptionKind Kind,
     JsonElement? Payload = null,
     ExecutionError? Error = null,
@@ -886,7 +899,14 @@ public sealed record SidecarProtocolState(
     string? HookId = null,
     Guid? TraceId = null,
     bool DeliveryAcknowledgementPending = false,
-    bool ResultReplacementAccepted = false);
+    bool ResultReplacementAccepted = false,
+    UntypedActionDescriptor? ActionDescriptor = null,
+    ActionCapabilityGrant? ActionGrant = null,
+    int? ActionVersion = null,
+    UntypedEventDescriptor? EventDescriptor = null,
+    EventCapabilityGrant? EventGrant = null,
+    int? EventVersion = null,
+    SidecarContinuationCommand? RequestedCommand = null);
 
 public sealed record SidecarProtocolTransitionResult(
     bool Accepted,
@@ -896,6 +916,21 @@ public sealed record SidecarProtocolTransitionResult(
 
 public static class SidecarProtocolStateMachine
 {
+    /// <summary>Checks the phase and the host grant for one protocol message.</summary>
+    public static bool CanApply(
+        SidecarProtocolState state,
+        ISidecarProtocolMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+
+        return CanApply(
+                   state.Phase,
+                   message.MessageKind,
+                   message is SidecarEffectRequest effect ? effect.Command : null) &&
+               ValidateCapabilities(state, message) is null;
+    }
+
+    /// <summary>Checks only the phase transition shape.</summary>
     public static bool CanApply(
         SidecarProtocolPhase phase,
         SidecarProtocolMessageKind message,
@@ -1018,6 +1053,10 @@ public static class SidecarProtocolStateMachine
         if (identityFailure is not null)
             return identityFailure;
 
+        var capabilityFailure = ValidateCapabilities(state, message);
+        if (capabilityFailure is not null)
+            return capabilityFailure;
+
         var handleId = GetContinuationHandleId(message);
         if (handleId is not null &&
             message is not HookInvokeStart and not EventInterceptStart &&
@@ -1072,6 +1111,9 @@ public static class SidecarProtocolStateMachine
                 HookId = item.HookId,
                 ActionKey = item.ActionKey,
                 TraceId = item.TraceId,
+                ActionVersion = item.ActionVersion,
+                ActionDescriptor = item.UntypedDescriptor,
+                ActionGrant = item.Grant,
             },
             EventInterceptStart item => nextState with
             {
@@ -1080,6 +1122,9 @@ public static class SidecarProtocolStateMachine
                 HookId = item.HookId,
                 EventKey = item.Envelope.Descriptor.Key,
                 TraceId = item.Envelope.TraceId,
+                EventVersion = item.Envelope.Descriptor.Version,
+                EventDescriptor = item.Envelope.Descriptor,
+                EventGrant = item.Grant,
             },
             SidecarToolHandlerInvokeStart item => nextState with
             {
@@ -1098,6 +1143,8 @@ public static class SidecarProtocolStateMachine
                 DeliveryId = item.DeliveryId,
                 ListenerId = item.ListenerId,
                 Delivery = item.Delivery,
+                EventKey = item.Envelope.Descriptor.Key,
+                EventVersion = item.Envelope.Descriptor.Version,
                 DeliveryAcknowledgementPending = item.RequiresAcknowledgement,
             },
             SidecarEventListenerAcknowledgement => nextState with
@@ -1108,11 +1155,99 @@ public static class SidecarProtocolStateMachine
             {
                 ResultReplacementAccepted = true,
             },
+            SidecarEffectRequest item => nextState with
+            {
+                RequestedCommand = item.Command,
+            },
             _ => nextState,
         };
 
         return new(true, nextState);
     }
+
+    private static SidecarProtocolTransitionResult? ValidateCapabilities(
+        SidecarProtocolState state,
+        ISidecarProtocolMessage message)
+    {
+        switch (message)
+        {
+            case HookInvokeStart item:
+                if (item.Grant.ActionKey != item.ActionKey || item.Grant.ActionVersion != item.ActionVersion)
+                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action grant does not match the invoked descriptor.");
+                if (item.UntypedDescriptor is not null &&
+                    (item.UntypedDescriptor.Key != item.ActionKey || item.UntypedDescriptor.Version != item.ActionVersion))
+                    return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The action descriptor does not match the invocation.");
+                if (item.UntypedDescriptor is not null &&
+                    (item.Grant.Capabilities & ~item.UntypedDescriptor.Capabilities) != 0)
+                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action grant exceeds the descriptor capability set.");
+                break;
+            case EventInterceptStart item:
+                if (item.Grant.EventKey != item.Envelope.Descriptor.Key ||
+                    item.Grant.EventVersion != item.Envelope.Descriptor.Version)
+                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The event grant does not match the intercepted descriptor.");
+                if ((item.Grant.Capabilities & ~item.Envelope.Descriptor.Capabilities) != 0)
+                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The event grant exceeds the descriptor capability set.");
+                break;
+            case SidecarEffectRequest item:
+                if (state.ActionGrant is null || state.ActionKey is not { } actionKey)
+                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action exchange has no host capability grant.");
+
+                var actionVersion = state.ActionVersion ?? state.ActionGrant.ActionVersion;
+                if (state.ActionGrant.ActionKey != actionKey || state.ActionGrant.ActionVersion != actionVersion)
+                    return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The action grant does not match the exchange descriptor.");
+                if (state.RequestedCommand is not null)
+                    return Reject(SidecarProtocolErrors.ContinuationAlreadyUsed, "The action exchange already has a requested continuation command.");
+                if (!AllowsActionCommand(state.ActionGrant.Capabilities, item.Command))
+                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action grant does not allow the requested continuation command.");
+                break;
+            case ContinuationAccepted item:
+                if (state.RequestedCommand is null || state.RequestedCommand != item.Command)
+                    return Reject(SidecarProtocolErrors.ContinuationCommandMismatch, "The accepted command does not match the requested command.");
+                break;
+            case SidecarResultReplacement:
+                if (state.ActionGrant is null ||
+                    !state.ActionGrant.Capabilities.HasFlag(ActionInterceptionCapabilities.ReplaceResult))
+                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action grant does not allow result replacement.");
+                break;
+            case EventInterceptOutcome item:
+                if (state.EventGrant is null || state.EventDescriptor is null)
+                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The event exchange has no host capability grant.");
+                if (state.EventGrant.EventKey != state.EventDescriptor.Key ||
+                    state.EventGrant.EventVersion != state.EventDescriptor.Version)
+                    return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The event grant does not match the exchange descriptor.");
+                if (!AllowsEventOutcome(state.EventGrant.Capabilities, item.Kind))
+                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The event grant does not allow the requested event outcome.");
+                break;
+        }
+
+        return null;
+    }
+
+    private static bool AllowsActionCommand(
+        ActionInterceptionCapabilities capabilities,
+        SidecarContinuationCommand command) =>
+        command switch
+        {
+            SidecarContinuationCommand.ContinueOriginal => capabilities.HasFlag(ActionInterceptionCapabilities.Inspect),
+            SidecarContinuationCommand.ContinueReplacement => capabilities.HasFlag(ActionInterceptionCapabilities.ReplaceInput),
+            SidecarContinuationCommand.Cancel => capabilities.HasFlag(ActionInterceptionCapabilities.Cancel),
+            SidecarContinuationCommand.Defer => capabilities.HasFlag(ActionInterceptionCapabilities.Defer),
+            SidecarContinuationCommand.Repeat => capabilities.HasFlag(ActionInterceptionCapabilities.Repeat),
+            _ => false,
+        };
+
+    private static bool AllowsEventOutcome(
+        EventInterceptionCapabilities capabilities,
+        EventInterceptionKind kind) =>
+        kind switch
+        {
+            EventInterceptionKind.Continued or EventInterceptionKind.Failed =>
+                capabilities.HasFlag(EventInterceptionCapabilities.Inspect),
+            EventInterceptionKind.Replaced => capabilities.HasFlag(EventInterceptionCapabilities.Replace),
+            EventInterceptionKind.Cancelled => capabilities.HasFlag(EventInterceptionCapabilities.Cancel),
+            EventInterceptionKind.PropagationStopped => capabilities.HasFlag(EventInterceptionCapabilities.StopPropagation),
+            _ => false,
+        };
 
     private static SidecarProtocolTransitionResult? ValidateIdentity(
         SidecarProtocolState state,
@@ -1126,6 +1261,10 @@ public static class SidecarProtocolStateMachine
                 if (state.InvocationId != Guid.Empty && state.InvocationId != item.InvocationId ||
                     state.ContinuationHandleId != Guid.Empty && state.ContinuationHandleId != item.Continuation.HandleId ||
                     state.ActionKey is not null && state.ActionKey != item.ActionKey ||
+                    state.ActionVersion is not null && state.ActionVersion != item.ActionVersion ||
+                    state.ActionDescriptor is not null &&
+                        (item.UntypedDescriptor is null || !SameActionDescriptor(state.ActionDescriptor, item.UntypedDescriptor)) ||
+                    state.ActionGrant is not null && !Equals(state.ActionGrant, item.Grant) ||
                     state.HookId is not null && !string.Equals(state.HookId, item.HookId, StringComparison.Ordinal) ||
                     item.Continuation.InvocationId != item.InvocationId)
                     return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The action hook identity does not match the exchange.");
@@ -1136,6 +1275,9 @@ public static class SidecarProtocolStateMachine
                 if (state.InvocationId != Guid.Empty && state.InvocationId != item.Continuation.InvocationId ||
                     state.ContinuationHandleId != Guid.Empty && state.ContinuationHandleId != item.Continuation.HandleId ||
                     state.EventKey is not null && state.EventKey != item.Envelope.Descriptor.Key ||
+                    state.EventVersion is not null && state.EventVersion != item.Envelope.Descriptor.Version ||
+                    state.EventDescriptor is not null && !SameEventDescriptor(state.EventDescriptor, item.Envelope.Descriptor) ||
+                    state.EventGrant is not null && !Equals(state.EventGrant, item.Grant) ||
                     state.HookId is not null && !string.Equals(state.HookId, item.HookId, StringComparison.Ordinal))
                     return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The event interception identity does not match the exchange.");
                 break;
@@ -1196,12 +1338,17 @@ public static class SidecarProtocolStateMachine
                 break;
             case EventInterceptOutcome item:
                 if (state.ExchangeKind != SidecarExchangeKind.EventIntercept ||
-                    !Matches(state.ContinuationHandleId, item.ContinuationHandleId) ||
-                    state.EventKey != item.EventKey)
+                     !Matches(state.ContinuationHandleId, item.ContinuationHandleId) ||
+                     state.EventKey != item.EventKey ||
+                     state.EventVersion != item.EventVersion ||
+                     state.EventDescriptor is null ||
+                     !SameSchema(state.EventDescriptor.PayloadSchema, item.EventSchema))
                     return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The event interception outcome identity does not match the exchange.");
                 break;
             case SidecarEventListenerDelivery item:
                 if (state.ExchangeKind != SidecarExchangeKind.EventListener ||
+                    state.EventDescriptor is null ||
+                    !SameEventDescriptor(state.EventDescriptor, item.Envelope.Descriptor) ||
                     state.DeliveryAcknowledgementPending ||
                     state.DeliveryId is not null && state.DeliveryId != item.DeliveryId ||
                     state.ListenerId is not null && !string.Equals(state.ListenerId, item.ListenerId, StringComparison.Ordinal))
@@ -1210,9 +1357,11 @@ public static class SidecarProtocolStateMachine
             case SidecarEventListenerAcknowledgement item:
                 if (state.ExchangeKind != SidecarExchangeKind.EventListener ||
                     !state.DeliveryAcknowledgementPending ||
-                    state.DeliveryId != item.DeliveryId ||
-                    !string.Equals(state.ListenerId, item.ListenerId, StringComparison.Ordinal) ||
-                    state.Delivery != item.Delivery)
+                     state.DeliveryId != item.DeliveryId ||
+                     !string.Equals(state.ListenerId, item.ListenerId, StringComparison.Ordinal) ||
+                     state.Delivery != item.Delivery ||
+                     state.EventDescriptor is null ||
+                     !SameEventDescriptor(state.EventDescriptor, item.Descriptor))
                     return Reject(SidecarProtocolErrors.DeliveryNotPending, "The event acknowledgement has no matching pending delivery.");
                 break;
             case SidecarStreamChunk:
@@ -1238,6 +1387,35 @@ public static class SidecarProtocolStateMachine
 
         return null;
     }
+
+    private static bool SameActionDescriptor(
+        UntypedActionDescriptor left,
+        UntypedActionDescriptor right) =>
+        left.Key == right.Key &&
+        left.Version == right.Version &&
+        string.Equals(left.Category, right.Category, StringComparison.Ordinal) &&
+        left.Capabilities == right.Capabilities &&
+        SameSchema(left.InputSchema, right.InputSchema) &&
+        SameSchema(left.ResultSchema, right.ResultSchema) &&
+        left.ContainsSensitiveData == right.ContainsSensitiveData &&
+        Equals(left.ProtocolVersionRange, right.ProtocolVersionRange) &&
+        left.AcceptsUnknownNonSensitiveSchemas == right.AcceptsUnknownNonSensitiveSchemas;
+
+    private static bool SameEventDescriptor(
+        UntypedEventDescriptor left,
+        UntypedEventDescriptor right) =>
+        left.Key == right.Key &&
+        left.Version == right.Version &&
+        string.Equals(left.Category, right.Category, StringComparison.Ordinal) &&
+        left.Capabilities == right.Capabilities &&
+        SameSchema(left.PayloadSchema, right.PayloadSchema) &&
+        left.ContainsSensitiveData == right.ContainsSensitiveData &&
+        Equals(left.ProtocolVersionRange, right.ProtocolVersionRange);
+
+    private static bool SameSchema(JsonSchemaReference left, JsonSchemaReference right) =>
+        string.Equals(left.ContractName, right.ContractName, StringComparison.Ordinal) &&
+        left.Version == right.Version &&
+        string.Equals(left.ContentHash, right.ContentHash, StringComparison.Ordinal);
 
     private static bool Matches(Guid expected, Guid actual) =>
         expected == Guid.Empty || expected == actual;
@@ -1295,6 +1473,7 @@ public static class SidecarProtocolErrors
     public const string InvalidLifecyclePhase = "invalid_lifecycle_phase";
     public const string ExchangeIdentityMismatch = "exchange_identity_mismatch";
     public const string DeliveryNotPending = "delivery_not_pending";
+    public const string ContinuationCommandMismatch = "continuation_command_mismatch";
     public const string MalformedMessage = "malformed_message";
     public const string Disconnected = "sidecar_disconnected";
 }
