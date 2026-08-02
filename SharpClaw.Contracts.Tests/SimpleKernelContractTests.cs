@@ -745,6 +745,477 @@ public sealed class SimpleKernelContractTests
     }
 
     [Fact]
+    public void SidecarDirectTerminalOutcomesAcceptCompiledTypedAndUntypedAuthorities()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var authorities = new[]
+        {
+            ("typed", SidecarPayloadMode.Typed, SidecarHookTargetKind.Exact, false, false),
+            ("exact", SidecarPayloadMode.Untyped, SidecarHookTargetKind.Exact, false, false),
+            ("category", SidecarPayloadMode.Untyped, SidecarHookTargetKind.Category, true, false),
+            ("wildcard", SidecarPayloadMode.Untyped, SidecarHookTargetKind.Wildcard, false, true),
+        };
+
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            SidecarProtocolPhase.Invoking,
+            SidecarProtocolMessageKind.ResultReplacement));
+        Assert.True(SidecarProtocolStateMachine.CanApply(
+            SidecarProtocolPhase.Invoking,
+            SidecarProtocolMessageKind.HookOutcome,
+            command: null,
+            SidecarHookOutcomeKind.Failed));
+
+        foreach (var authority in authorities)
+        {
+            var replacementFixture = CreateDirectActionFixture(
+                now,
+                authority.Item1 + "-replacement",
+                authority.Item2,
+                authority.Item3,
+                authority.Item4,
+                authority.Item5);
+            var replacementStart = SidecarProtocolStateMachine.Validate(
+                replacementFixture.State,
+                replacementFixture.Start,
+                now);
+            Assert.True(replacementStart.Accepted);
+
+            var replacement = new SidecarResultReplacement(
+                Header(2),
+                replacementFixture.Start.Continuation.HandleId,
+                CreateElement(new { authority = authority.Item1 }),
+                "Direct result replacement");
+            Assert.True(SidecarProtocolStateMachine.CanApply(replacementStart.State!, replacement));
+            var replacementResult = SidecarProtocolStateMachine.Validate(
+                replacementStart.State!,
+                replacement,
+                now);
+            Assert.True(replacementResult.Accepted);
+            Assert.Equal(SidecarProtocolPhase.SidecarOutcomeSent, replacementResult.State!.Phase);
+            Assert.True(replacementResult.State.ResultReplacementAccepted);
+            Assert.True(replacementResult.State.DirectTerminalOutcomeAccepted);
+
+            var replacementCompleted = SidecarProtocolStateMachine.Validate(
+                replacementResult.State,
+                new HookCompleted(
+                    Header(3),
+                    replacementFixture.Start.Continuation.HandleId,
+                    ActionOutcomeKind.Completed,
+                    ActionOutcomeCertainty.Certain,
+                    CreateElement(new { authority = authority.Item1 })),
+                now);
+            Assert.True(replacementCompleted.Accepted);
+            Assert.Equal(SidecarProtocolPhase.Completed, replacementCompleted.State!.Phase);
+
+            var failureFixture = CreateDirectActionFixture(
+                now,
+                authority.Item1 + "-failure",
+                authority.Item2,
+                authority.Item3,
+                authority.Item4,
+                authority.Item5);
+            var failureStart = SidecarProtocolStateMachine.Validate(
+                failureFixture.State,
+                failureFixture.Start,
+                now);
+            Assert.True(failureStart.Accepted);
+
+            var error = new ExecutionError("direct_failure", "The action hook failed before continuation.");
+            var failure = new HookOutcome(
+                Header(2),
+                failureFixture.Start.Continuation.HandleId,
+                SidecarHookOutcomeKind.Failed,
+                error);
+            Assert.True(SidecarProtocolStateMachine.CanApply(failureStart.State!, failure));
+            var failureResult = SidecarProtocolStateMachine.Validate(
+                failureStart.State!,
+                failure,
+                now);
+            Assert.True(failureResult.Accepted);
+            Assert.Equal(SidecarProtocolPhase.SidecarOutcomeSent, failureResult.State!.Phase);
+            Assert.True(failureResult.State.DirectTerminalOutcomeAccepted);
+
+            var failureCompleted = SidecarProtocolStateMachine.Validate(
+                failureResult.State,
+                new HookCompleted(
+                    Header(3),
+                    failureFixture.Start.Continuation.HandleId,
+                    ActionOutcomeKind.Failed,
+                    ActionOutcomeCertainty.Certain,
+                    Error: error),
+                now);
+            Assert.True(failureCompleted.Accepted);
+            Assert.Equal(SidecarProtocolPhase.Completed, failureCompleted.State!.Phase);
+        }
+    }
+
+    [Fact]
+    public void SidecarDirectTerminalOutcomesRejectInvalidMessagesAndAuthority()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var fixture = CreateDirectActionFixture(
+            now,
+            "negative",
+            SidecarPayloadMode.Untyped,
+            SidecarHookTargetKind.Exact);
+        var started = SidecarProtocolStateMachine.Validate(fixture.State, fixture.Start, now);
+        Assert.True(started.Accepted);
+
+        foreach (var kind in new[] { SidecarHookOutcomeKind.Completed, SidecarHookOutcomeKind.Cancelled })
+        {
+            Assert.False(SidecarProtocolStateMachine.CanApply(
+                SidecarProtocolPhase.Invoking,
+                SidecarProtocolMessageKind.HookOutcome,
+                command: null,
+                kind));
+            var invalid = SidecarProtocolStateMachine.Validate(
+                started.State!,
+                new HookOutcome(Header(2), fixture.Start.Continuation.HandleId, kind),
+                now);
+            Assert.False(invalid.Accepted);
+            Assert.Equal(SidecarProtocolErrors.InvalidLifecyclePhase, invalid.ErrorCode);
+        }
+
+        var malformedFailure = SidecarProtocolStateMachine.Validate(
+            started.State!,
+            new HookOutcome(
+                Header(2),
+                fixture.Start.Continuation.HandleId,
+                SidecarHookOutcomeKind.Failed),
+            now);
+        Assert.False(malformedFailure.Accepted);
+        Assert.Equal(SidecarProtocolErrors.MalformedMessage, malformedFailure.ErrorCode);
+
+        var malformedReplacement = SidecarProtocolStateMachine.Validate(
+            started.State!,
+            new SidecarResultReplacement(
+                Header(2),
+                fixture.Start.Continuation.HandleId,
+                CreateElement(new { value = 1 }),
+                " "),
+            now);
+        Assert.False(malformedReplacement.Accepted);
+        Assert.Equal(SidecarProtocolErrors.MalformedMessage, malformedReplacement.ErrorCode);
+
+        var unauthorizedReplacementFixture = CreateDirectActionFixture(
+            now,
+            "unauthorized-replacement",
+            SidecarPayloadMode.Typed,
+            SidecarHookTargetKind.Exact,
+            capabilities: ActionInterceptionCapabilities.Inspect);
+        var unauthorizedReplacementStart = SidecarProtocolStateMachine.Validate(
+            unauthorizedReplacementFixture.State,
+            unauthorizedReplacementFixture.Start,
+            now);
+        var unauthorizedReplacement = SidecarProtocolStateMachine.Validate(
+            unauthorizedReplacementStart.State!,
+            new SidecarResultReplacement(
+                Header(2),
+                unauthorizedReplacementFixture.Start.Continuation.HandleId,
+                CreateElement(new { value = 1 }),
+                "Unauthorized replacement"),
+            now);
+        Assert.False(unauthorizedReplacement.Accepted);
+        Assert.Equal(SidecarProtocolErrors.UnsupportedCapability, unauthorizedReplacement.ErrorCode);
+
+        var unauthorizedFailureFixture = CreateDirectActionFixture(
+            now,
+            "unauthorized-failure",
+            SidecarPayloadMode.Typed,
+            SidecarHookTargetKind.Exact,
+            capabilities: ActionInterceptionCapabilities.Observe | ActionInterceptionCapabilities.ReplaceResult);
+        var unauthorizedFailureStart = SidecarProtocolStateMachine.Validate(
+            unauthorizedFailureFixture.State,
+            unauthorizedFailureFixture.Start,
+            now);
+        var unauthorizedFailure = SidecarProtocolStateMachine.Validate(
+            unauthorizedFailureStart.State!,
+            new HookOutcome(
+                Header(2),
+                unauthorizedFailureFixture.Start.Continuation.HandleId,
+                SidecarHookOutcomeKind.Failed,
+                new ExecutionError("failure", "The action hook failed.")),
+            now);
+        Assert.False(unauthorizedFailure.Accepted);
+        Assert.Equal(SidecarProtocolErrors.UnsupportedCapability, unauthorizedFailure.ErrorCode);
+
+        var forgedState = started.State! with
+        {
+            HostAuthorization = new SidecarHostAuthorization(
+                "module-a",
+                [fixture.Grant with { Capabilities = ActionInterceptionCapabilities.Inspect }],
+                []),
+        };
+        var forged = SidecarProtocolStateMachine.Validate(
+            forgedState,
+            new SidecarResultReplacement(
+                Header(2),
+                fixture.Start.Continuation.HandleId,
+                CreateElement(new { value = 1 }),
+                "Forged grant"),
+            now);
+        Assert.False(forged.Accepted);
+        Assert.Equal(SidecarProtocolErrors.UnsupportedCapability, forged.ErrorCode);
+
+        var wrongExchange = SidecarProtocolStateMachine.Validate(
+            started.State! with { ExchangeKind = SidecarExchangeKind.ToolHandler },
+            new SidecarResultReplacement(
+                Header(2),
+                fixture.Start.Continuation.HandleId,
+                CreateElement(new { value = 1 }),
+                "Wrong exchange"),
+            now);
+        Assert.False(wrongExchange.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ExchangeIdentityMismatch, wrongExchange.ErrorCode);
+
+        var wrongHandle = SidecarProtocolStateMachine.Validate(
+            started.State!,
+            new SidecarResultReplacement(
+                Header(2),
+                Guid.NewGuid(),
+                CreateElement(new { value = 1 }),
+                "Wrong handle"),
+            now);
+        Assert.False(wrongHandle.Accepted);
+        Assert.Equal(SidecarProtocolErrors.InvalidContinuationHandle, wrongHandle.ErrorCode);
+
+        var wrongActionVersion = SidecarProtocolStateMachine.Validate(
+            started.State! with { ActionVersion = 2 },
+            new SidecarResultReplacement(
+                Header(2),
+                fixture.Start.Continuation.HandleId,
+                CreateElement(new { value = 1 }),
+                "Wrong action version"),
+            now);
+        Assert.False(wrongActionVersion.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ExchangeIdentityMismatch, wrongActionVersion.ErrorCode);
+
+        var wrongProtocolVersion = SidecarProtocolStateMachine.Validate(
+            started.State!,
+            new SidecarResultReplacement(
+                Header(2) with { ProtocolVersion = 2 },
+                fixture.Start.Continuation.HandleId,
+                CreateElement(new { value = 1 }),
+                "Wrong protocol version"),
+            now);
+        Assert.False(wrongProtocolVersion.Accepted);
+        Assert.Equal(SidecarProtocolErrors.UnsupportedVersion, wrongProtocolVersion.ErrorCode);
+
+        var expired = SidecarProtocolStateMachine.Validate(
+            started.State! with { Deadline = now.AddTicks(-1) },
+            new SidecarResultReplacement(
+                Header(2),
+                fixture.Start.Continuation.HandleId,
+                CreateElement(new { value = 1 }),
+                "Expired exchange"),
+            now);
+        Assert.False(expired.Accepted);
+        Assert.Equal(SidecarProtocolErrors.DeadlineExceeded, expired.ErrorCode);
+
+        var invalidSequence = SidecarProtocolStateMachine.Validate(
+            started.State!,
+            new SidecarResultReplacement(
+                Header(1),
+                fixture.Start.Continuation.HandleId,
+                CreateElement(new { value = 1 }),
+                "Repeated sequence"),
+            now);
+        Assert.False(invalidSequence.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ContinuationAlreadyUsed, invalidSequence.ErrorCode);
+
+        var sizeFixture = CreateDirectActionFixture(
+            now,
+            "size",
+            SidecarPayloadMode.Untyped,
+            SidecarHookTargetKind.Exact,
+            limits: new SidecarPayloadLimits(
+                ActionInputBytes: 4096,
+                ActionResultBytes: 128,
+                EventPayloadBytes: 4096,
+                ProtocolMessageBytes: 4096,
+                StreamChunkBytes: 4096));
+        var sizeStart = SidecarProtocolStateMachine.Validate(sizeFixture.State, sizeFixture.Start, now);
+        Assert.True(sizeStart.Accepted);
+        var oversized = SidecarProtocolStateMachine.Validate(
+            sizeStart.State!,
+            new SidecarResultReplacement(
+                new SidecarMessageHeader(
+                    1,
+                    2,
+                    now.AddMinutes(1),
+                    new SidecarMessageSizeAuthority(1, 128)),
+                sizeFixture.Start.Continuation.HandleId,
+                CreateElement(new { value = new string('x', 1024) }),
+                "Oversized result"),
+            now);
+        Assert.False(oversized.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, oversized.ErrorCode);
+
+        var directReplacement = new SidecarResultReplacement(
+            Header(2),
+            fixture.Start.Continuation.HandleId,
+            CreateElement(new { value = 1 }),
+            "First result");
+        var replacementAccepted = SidecarProtocolStateMachine.Validate(started.State!, directReplacement, now);
+        Assert.True(replacementAccepted.Accepted);
+        var duplicateReplacement = SidecarProtocolStateMachine.Validate(
+            replacementAccepted.State!,
+            directReplacement with { Header = Header(3) },
+            now);
+        Assert.False(duplicateReplacement.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ContinuationAlreadyUsed, duplicateReplacement.ErrorCode);
+
+        var completed = SidecarProtocolStateMachine.Validate(
+            replacementAccepted.State!,
+            new HookCompleted(
+                Header(3),
+                fixture.Start.Continuation.HandleId,
+                ActionOutcomeKind.Completed,
+                ActionOutcomeCertainty.Certain,
+                CreateElement(new { value = 1 })),
+            now);
+        var late = SidecarProtocolStateMachine.Validate(
+            completed.State!,
+            directReplacement with { Header = Header(4) },
+            now);
+        Assert.False(late.Accepted);
+        Assert.Equal(SidecarProtocolErrors.LateMessage, late.ErrorCode);
+
+        var failureFixture = CreateDirectActionFixture(
+            now,
+            "duplicate-failure",
+            SidecarPayloadMode.Typed,
+            SidecarHookTargetKind.Exact);
+        var failureStart = SidecarProtocolStateMachine.Validate(failureFixture.State, failureFixture.Start, now);
+        var directFailure = new HookOutcome(
+            Header(2),
+            failureFixture.Start.Continuation.HandleId,
+            SidecarHookOutcomeKind.Failed,
+            new ExecutionError("failure", "The action hook failed."));
+        var failureAccepted = SidecarProtocolStateMachine.Validate(failureStart.State!, directFailure, now);
+        Assert.True(failureAccepted.Accepted);
+
+        var duplicateFailure = SidecarProtocolStateMachine.Validate(
+            failureAccepted.State!,
+            directFailure with { Header = Header(3) },
+            now);
+        Assert.False(duplicateFailure.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ContinuationAlreadyUsed, duplicateFailure.ErrorCode);
+
+        var replacementAfterFailure = SidecarProtocolStateMachine.Validate(
+            failureAccepted.State!,
+            new SidecarResultReplacement(
+                Header(3),
+                failureFixture.Start.Continuation.HandleId,
+                CreateElement(new { value = 1 }),
+                "Result after failure"),
+            now);
+        Assert.False(replacementAfterFailure.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ContinuationAlreadyUsed, replacementAfterFailure.ErrorCode);
+
+        var crossPhase = SidecarProtocolStateMachine.Validate(
+            started.State! with { Phase = SidecarProtocolPhase.EffectRequested },
+            directReplacement,
+            now);
+        Assert.False(crossPhase.Accepted);
+        Assert.Equal(SidecarProtocolErrors.InvalidLifecyclePhase, crossPhase.ErrorCode);
+    }
+
+    [Fact]
+    public void SidecarDirectTerminalOutcomesPreserveIdentitySchemaAndSecurityAuthority()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var exact = CreateDirectActionFixture(
+            now,
+            "identity",
+            SidecarPayloadMode.Untyped,
+            SidecarHookTargetKind.Exact);
+
+        AssertIdentityFailure(exact.Start with { InvocationId = Guid.NewGuid() });
+        AssertIdentityFailure(exact.Start with { TraceId = Guid.NewGuid() });
+        AssertIdentityFailure(exact.Start with { HookId = "other-hook" });
+        AssertIdentityFailure(exact.Start with
+        {
+            Continuation = exact.Start.Continuation with { HookId = "other-hook" },
+        });
+        AssertIdentityFailure(exact.Start with
+        {
+            UntypedDescriptor = exact.Descriptor! with
+            {
+                ResultSchema = new JsonSchemaReference("other.result", 1, "other-hash"),
+            },
+        });
+
+        var wrongProtocolDescriptor = exact.Descriptor! with
+        {
+            ProtocolVersionRange = ContractVersionRange.Exact(2),
+        };
+        var wrongProtocol = SidecarProtocolStateMachine.Validate(
+            exact.State with { ActionDescriptor = wrongProtocolDescriptor },
+            exact.Start with { UntypedDescriptor = wrongProtocolDescriptor },
+            now);
+        Assert.False(wrongProtocol.Accepted);
+        Assert.Equal(SidecarProtocolErrors.UnsupportedVersion, wrongProtocol.ErrorCode);
+
+        var category = CreateDirectActionFixture(
+            now,
+            "category-security",
+            SidecarPayloadMode.Untyped,
+            SidecarHookTargetKind.Category,
+            acceptsUnknownSchemas: true);
+        var categoryStart = SidecarProtocolStateMachine.Validate(category.State, category.Start, now);
+        Assert.True(categoryStart.Accepted);
+        var changedCategoryGrant = category.Grant with { AcceptUnknownSchemas = false };
+        var changedCategoryState = categoryStart.State! with
+        {
+            ActionGrant = changedCategoryGrant,
+            HostAuthorization = new SidecarHostAuthorization("module-a", [changedCategoryGrant], []),
+        };
+        var categoryFailure = SidecarProtocolStateMachine.Validate(
+            changedCategoryState,
+            new SidecarResultReplacement(
+                Header(2),
+                category.Start.Continuation.HandleId,
+                CreateElement(new { value = 1 }),
+                "Changed category authority"),
+            now);
+        Assert.False(categoryFailure.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ForgedApproval, categoryFailure.ErrorCode);
+
+        var wildcard = CreateDirectActionFixture(
+            now,
+            "wildcard-security",
+            SidecarPayloadMode.Untyped,
+            SidecarHookTargetKind.Wildcard,
+            containsSensitiveData: true);
+        var wildcardStart = SidecarProtocolStateMachine.Validate(wildcard.State, wildcard.Start, now);
+        Assert.True(wildcardStart.Accepted);
+        var changedWildcardGrant = wildcard.Grant with { SensitiveApproved = false };
+        var changedWildcardState = wildcardStart.State! with
+        {
+            ActionGrant = changedWildcardGrant,
+            HostAuthorization = new SidecarHostAuthorization("module-a", [changedWildcardGrant], []),
+        };
+        var wildcardFailure = SidecarProtocolStateMachine.Validate(
+            changedWildcardState,
+            new HookOutcome(
+                Header(2),
+                wildcard.Start.Continuation.HandleId,
+                SidecarHookOutcomeKind.Failed,
+                new ExecutionError("failure", "The action hook failed.")),
+            now);
+        Assert.False(wildcardFailure.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ForgedApproval, wildcardFailure.ErrorCode);
+
+        void AssertIdentityFailure(HookInvokeStart candidate)
+        {
+            var result = SidecarProtocolStateMachine.Validate(exact.State, candidate, now);
+            Assert.False(result.Accepted);
+            Assert.Equal(SidecarProtocolErrors.ExchangeIdentityMismatch, result.ErrorCode);
+        }
+    }
+
+    [Fact]
     public void SidecarStateRejectsCrossExchangeIdentitiesAndPrematureAcknowledgements()
     {
         var now = DateTimeOffset.UtcNow;
@@ -2486,6 +2957,96 @@ public sealed class SimpleKernelContractTests
     private static SidecarMessageHeader Header(long sequence = 1) =>
         new(1, sequence, DateTimeOffset.UtcNow.AddMinutes(1), new SidecarMessageSizeAuthority(128, 1024));
 
+    private static DirectActionFixture CreateDirectActionFixture(
+        DateTimeOffset now,
+        string authorityName,
+        SidecarPayloadMode payloadMode,
+        SidecarHookTargetKind targetKind,
+        bool acceptsUnknownSchemas = false,
+        bool containsSensitiveData = false,
+        ActionInterceptionCapabilities capabilities =
+            ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.ReplaceResult,
+        SidecarPayloadLimits? limits = null)
+    {
+        var actionKey = new SharpClawActionKey($"direct.{authorityName}");
+        var category = targetKind == SidecarHookTargetKind.Category
+            ? "direct.category"
+            : "direct";
+        var grant = new ActionCapabilityGrant(
+            actionKey,
+            1,
+            capabilities,
+            SensitiveApproved: containsSensitiveData,
+            AcceptUnknownSchemas: acceptsUnknownSchemas);
+        var descriptor = payloadMode == SidecarPayloadMode.Untyped
+            ? new UntypedActionDescriptor(
+                actionKey,
+                1,
+                category,
+                capabilities,
+                new JsonSchemaReference($"direct.{authorityName}.input", 1, "input-hash"),
+                new JsonSchemaReference($"direct.{authorityName}.result", 1, "result-hash"),
+                containsSensitiveData)
+            {
+                AcceptsUnknownNonSensitiveSchemas = acceptsUnknownSchemas,
+                ProtocolVersionRange = ContractVersionRange.Exact(1),
+            }
+            : null;
+        var invocationId = Guid.NewGuid();
+        var traceId = Guid.NewGuid();
+        var hookId = $"hook-{authorityName}";
+        var continuation = new ContinuationHandle(
+            Guid.NewGuid(),
+            invocationId,
+            hookId,
+            now.AddMinutes(1),
+            Sequence: 1);
+        var wildcardApproval = targetKind == SidecarHookTargetKind.Wildcard && containsSensitiveData
+            ? new SensitiveWildcardApproval(
+                "module-a",
+                new Dictionary<string, int>(StringComparer.Ordinal) { [actionKey.Value] = 1 },
+                new Dictionary<string, int>(StringComparer.Ordinal))
+            : null;
+        var authorization = new SidecarHostAuthorization(
+            "module-a",
+            [grant],
+            [],
+            wildcardApproval);
+        var state = new SidecarProtocolState(
+            SidecarExchangeKind.ActionHook,
+            invocationId,
+            continuation.HandleId,
+            SidecarProtocolPhase.Negotiated,
+            LastSequence: 0,
+            now.AddMinutes(1),
+            NegotiatedProtocolVersion: 1,
+            HostLimits: limits ?? new SidecarPayloadLimits(),
+            ActionKey: actionKey,
+            HookId: hookId,
+            TraceId: traceId,
+            ActionDescriptor: descriptor,
+            ActionGrant: grant,
+            ActionVersion: 1,
+            HostAuthorization: authorization);
+        var start = new HookInvokeStart(
+            Header(1),
+            invocationId,
+            null,
+            traceId,
+            hookId,
+            actionKey,
+            1,
+            payloadMode,
+            CreateElement(new { value = 1 }),
+            descriptor,
+            grant,
+            new RequestPrincipal("user-1"),
+            ExtensionFeatureSet.Empty,
+            continuation);
+
+        return new DirectActionFixture(targetKind, state, start, grant, descriptor);
+    }
+
     private sealed class StatefulCommitGateway : IModuleStorageGateway
     {
         private ModuleStorageMutationAndOutboxRequest? _committedRequest;
@@ -2622,4 +3183,11 @@ public sealed class SimpleKernelContractTests
         HookInvokeStart Start,
         SidecarEffectRequest Replacement,
         ContinuationOutcome Outcome);
+
+    private sealed record DirectActionFixture(
+        SidecarHookTargetKind TargetKind,
+        SidecarProtocolState State,
+        HookInvokeStart Start,
+        ActionCapabilityGrant Grant,
+        UntypedActionDescriptor? Descriptor);
 }

@@ -804,7 +804,8 @@ public sealed record SidecarHostTerminalCancellation(
 }
 
 /// <summary>
-/// A sidecar can replace a result only after the host has accepted a continuation outcome.
+/// A sidecar can replace a result before continuation when the compiled host grant allows it.
+/// The existing post-continuation replacement path remains available.
 /// </summary>
 public sealed record SidecarResultReplacement(
     SidecarMessageHeader Header,
@@ -908,7 +909,11 @@ public sealed record SidecarProtocolState(
     EventCapabilityGrant? EventGrant = null,
     int? EventVersion = null,
     SidecarContinuationCommand? RequestedCommand = null,
-    SidecarHostAuthorization? HostAuthorization = null);
+    SidecarHostAuthorization? HostAuthorization = null)
+{
+    /// <summary>Gets whether the sidecar supplied a terminal outcome before continuation.</summary>
+    public bool DirectTerminalOutcomeAccepted { get; init; }
+}
 
 public sealed record SidecarProtocolTransitionResult(
     bool Accepted,
@@ -928,9 +933,10 @@ public static class SidecarProtocolStateMachine
         return CanApply(
                    state.Phase,
                    message.MessageKind,
-                   message is SidecarEffectRequest effect ? effect.Command : null) &&
+                   message is SidecarEffectRequest effect ? effect.Command : null,
+                   message is HookOutcome outcome ? outcome.Kind : null) &&
                ValidateCapabilities(state, message) is null &&
-               ValidateMessageShape(message) is null;
+               ValidateMessageShape(state, message) is null;
     }
 
     /// <summary>Checks only the phase transition shape.</summary>
@@ -951,6 +957,7 @@ public static class SidecarProtocolStateMachine
             (SidecarProtocolPhase.Negotiated, SidecarProtocolMessageKind.EventListenerDelivery, _) => true,
             (SidecarProtocolPhase.Negotiated, SidecarProtocolMessageKind.EventListenerAcknowledgement, _) => true,
             (SidecarProtocolPhase.Invoking, SidecarProtocolMessageKind.EffectRequest, not null) => true,
+            (SidecarProtocolPhase.Invoking, SidecarProtocolMessageKind.ResultReplacement, _) => true,
             (SidecarProtocolPhase.EffectRequested, SidecarProtocolMessageKind.EffectAccepted, _) => true,
             (SidecarProtocolPhase.EffectAccepted, SidecarProtocolMessageKind.ContinuationOutcome, _) => true,
             (SidecarProtocolPhase.OutcomeSent, SidecarProtocolMessageKind.HookOutcome, _) => true,
@@ -980,6 +987,17 @@ public static class SidecarProtocolStateMachine
             (SidecarProtocolPhase.EffectAccepted, SidecarProtocolMessageKind.Error, _) => true,
             (_, _, _) => false,
         };
+
+    /// <summary>Checks a phase transition that includes a direct hook outcome kind.</summary>
+    public static bool CanApply(
+        SidecarProtocolPhase phase,
+        SidecarProtocolMessageKind message,
+        SidecarContinuationCommand? command,
+        SidecarHookOutcomeKind? hookOutcomeKind) =>
+        (phase == SidecarProtocolPhase.Invoking &&
+         message == SidecarProtocolMessageKind.HookOutcome &&
+         hookOutcomeKind == SidecarHookOutcomeKind.Failed) ||
+        CanApply(phase, message, command);
 
     public static SidecarProtocolTransitionResult Validate(
         SidecarProtocolState state,
@@ -1024,7 +1042,7 @@ public static class SidecarProtocolStateMachine
                 measuredBytes > state.HostLimits.ProtocolMessageBytes)
                 return Reject(SidecarProtocolErrors.ModulePayloadTooLarge, "The measured protocol message exceeds the host limit.");
         }
-        catch (JsonException)
+        catch (Exception exception) when (exception is JsonException or InvalidOperationException or NotSupportedException)
         {
             return Reject(SidecarProtocolErrors.MalformedMessage, "The protocol message cannot be measured.");
         }
@@ -1037,10 +1055,11 @@ public static class SidecarProtocolStateMachine
         }
 
         if (state.Phase == SidecarProtocolPhase.SidecarOutcomeSent &&
-            message is SidecarResultReplacement &&
-            state.ResultReplacementAccepted)
+            (message is HookOutcome ||
+             message is SidecarResultReplacement &&
+             (state.ResultReplacementAccepted || state.DirectTerminalOutcomeAccepted)))
         {
-            return Reject(SidecarProtocolErrors.ContinuationAlreadyUsed, "The sidecar result replacement was already accepted.");
+            return Reject(SidecarProtocolErrors.ContinuationAlreadyUsed, "The sidecar terminal outcome was already accepted.");
         }
 
         if (now > state.Deadline || now > message.Header.Deadline)
@@ -1049,7 +1068,8 @@ public static class SidecarProtocolStateMachine
         if (!CanApply(
                 state.Phase,
                 message.MessageKind,
-                message is SidecarEffectRequest effect ? effect.Command : null))
+                message is SidecarEffectRequest effect ? effect.Command : null,
+                message is HookOutcome outcome ? outcome.Kind : null))
         {
             return Reject(SidecarProtocolErrors.InvalidLifecyclePhase, "The message is not valid in the current protocol phase.");
         }
@@ -1062,7 +1082,7 @@ public static class SidecarProtocolStateMachine
         if (capabilityFailure is not null)
             return capabilityFailure;
 
-        var shapeFailure = ValidateMessageShape(message);
+        var shapeFailure = ValidateMessageShape(state, message);
         if (shapeFailure is not null)
             return shapeFailure;
 
@@ -1081,6 +1101,9 @@ public static class SidecarProtocolStateMachine
             return Reject(SidecarProtocolErrors.InvalidContinuationHandle, "The message references a different continuation handle.");
         }
 
+        var isDirectTerminalOutcome =
+            state.Phase == SidecarProtocolPhase.Invoking &&
+            message is HookOutcome or SidecarResultReplacement;
         var nextPhase = message.MessageKind switch
         {
             SidecarProtocolMessageKind.HookInvokeStart or
@@ -1163,6 +1186,11 @@ public static class SidecarProtocolStateMachine
             SidecarResultReplacement => nextState with
             {
                 ResultReplacementAccepted = true,
+                DirectTerminalOutcomeAccepted = isDirectTerminalOutcome,
+            },
+            HookOutcome when isDirectTerminalOutcome => nextState with
+            {
+                DirectTerminalOutcomeAccepted = true,
             },
             SidecarEffectRequest item => nextState with
             {
@@ -1191,6 +1219,9 @@ public static class SidecarProtocolStateMachine
                 if (item.UntypedDescriptor is not null &&
                     (item.Grant.Capabilities & ~item.UntypedDescriptor.Capabilities) != 0)
                     return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action grant exceeds the descriptor capability set.");
+                if (item.UntypedDescriptor is not null &&
+                    !item.UntypedDescriptor.ProtocolVersionRange.Contains(state.NegotiatedProtocolVersion))
+                    return Reject(SidecarProtocolErrors.UnsupportedVersion, "The action descriptor does not support the negotiated protocol version.");
                 var actionAuthorizationFailure = ValidateActionAuthorization(item.Grant, item.UntypedDescriptor);
                 if (actionAuthorizationFailure is not null)
                     return actionAuthorizationFailure;
@@ -1229,12 +1260,15 @@ public static class SidecarProtocolStateMachine
                     return Reject(SidecarProtocolErrors.ContinuationCommandMismatch, "The accepted command does not match the requested command.");
                 break;
             case SidecarResultReplacement:
-                if (state.ActionGrant is null ||
-                    !state.ActionGrant.Capabilities.HasFlag(ActionInterceptionCapabilities.ReplaceResult))
-                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action grant does not allow result replacement.");
-                if (!IsCompiledActionGrant(state, state.ActionGrant))
-                    return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action grant was not issued by the compiled host authorization.");
-                break;
+                return ValidateCurrentActionAuthority(
+                    state,
+                    ActionInterceptionCapabilities.ReplaceResult,
+                    "The action grant does not allow result replacement.");
+            case HookOutcome when state.Phase == SidecarProtocolPhase.Invoking:
+                return ValidateCurrentActionAuthority(
+                    state,
+                    ActionInterceptionCapabilities.Inspect,
+                    "The action grant does not allow direct failure.");
             case EventInterceptOutcome item:
                 if (state.EventGrant is null || state.EventDescriptor is null)
                     return Reject(SidecarProtocolErrors.UnsupportedCapability, "The event exchange has no host capability grant.");
@@ -1252,6 +1286,43 @@ public static class SidecarProtocolStateMachine
         }
 
         return null;
+    }
+
+    private static SidecarProtocolTransitionResult? ValidateCurrentActionAuthority(
+        SidecarProtocolState state,
+        ActionInterceptionCapabilities requiredCapability,
+        string capabilityMessage)
+    {
+        if (state.ActionGrant is not { } grant ||
+            state.ActionKey is not { } actionKey ||
+            state.ActionVersion is not { } actionVersion)
+        {
+            return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action exchange has no host capability grant.");
+        }
+
+        if (grant.ActionKey != actionKey || grant.ActionVersion != actionVersion)
+            return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The action grant does not match the exchange descriptor.");
+
+        if (state.ActionDescriptor is { } descriptor)
+        {
+            if (descriptor.Key != actionKey || descriptor.Version != actionVersion)
+                return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The action descriptor does not match the exchange identity.");
+            if ((grant.Capabilities & ~descriptor.Capabilities) != 0)
+                return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action grant exceeds the descriptor capability set.");
+            if (!descriptor.ProtocolVersionRange.Contains(state.NegotiatedProtocolVersion))
+                return Reject(SidecarProtocolErrors.UnsupportedVersion, "The action descriptor does not support the negotiated protocol version.");
+        }
+
+        if (!IsCompiledActionGrant(state, grant))
+            return Reject(SidecarProtocolErrors.UnsupportedCapability, "The action grant was not issued by the compiled host authorization.");
+
+        var authorizationFailure = ValidateActionAuthorization(grant, state.ActionDescriptor);
+        if (authorizationFailure is not null)
+            return authorizationFailure;
+
+        return grant.Capabilities.HasFlag(requiredCapability)
+            ? null
+            : Reject(SidecarProtocolErrors.UnsupportedCapability, capabilityMessage);
     }
 
     private static bool AllowsActionCommand(
@@ -1317,13 +1388,33 @@ public static class SidecarProtocolStateMachine
         state.HostAuthorization?.EventGrants?.Any(item => Equals(item, grant)) == true;
 
     private static SidecarProtocolTransitionResult? ValidateMessageShape(
+        SidecarProtocolState state,
         ISidecarProtocolMessage message) =>
         message switch
         {
             SidecarEffectRequest item => ValidateEffectShape(item),
             EventInterceptOutcome item => ValidateEventOutcomeShape(item),
+            SidecarResultReplacement item => ValidateResultReplacementShape(item),
+            HookOutcome item when state.Phase == SidecarProtocolPhase.Invoking =>
+                ValidateDirectHookOutcomeShape(item),
             _ => null,
         };
+
+    private static SidecarProtocolTransitionResult? ValidateResultReplacementShape(
+        SidecarResultReplacement item) =>
+        item.Result.ValueKind != JsonValueKind.Undefined &&
+        !string.IsNullOrWhiteSpace(item.Reason)
+            ? null
+            : Reject(SidecarProtocolErrors.MalformedMessage, "The result replacement requires a result and a reason.");
+
+    private static SidecarProtocolTransitionResult? ValidateDirectHookOutcomeShape(
+        HookOutcome item) =>
+        item.Kind == SidecarHookOutcomeKind.Failed &&
+        item.Error is { } error &&
+        !string.IsNullOrWhiteSpace(error.Code) &&
+        !string.IsNullOrWhiteSpace(error.Message)
+            ? null
+            : Reject(SidecarProtocolErrors.MalformedMessage, "A direct hook failure requires a complete error.");
 
     private static SidecarProtocolTransitionResult? ValidateEffectShape(
         SidecarEffectRequest item)
@@ -1417,13 +1508,15 @@ public static class SidecarProtocolStateMachine
             case HookInvokeStart item:
                 if (state.InvocationId != Guid.Empty && state.InvocationId != item.InvocationId ||
                     state.ContinuationHandleId != Guid.Empty && state.ContinuationHandleId != item.Continuation.HandleId ||
+                    state.TraceId is not null && state.TraceId != item.TraceId ||
                     state.ActionKey is not null && state.ActionKey != item.ActionKey ||
                     state.ActionVersion is not null && state.ActionVersion != item.ActionVersion ||
                     state.ActionDescriptor is not null &&
                         (item.UntypedDescriptor is null || !SameActionDescriptor(state.ActionDescriptor, item.UntypedDescriptor)) ||
                     state.ActionGrant is not null && !Equals(state.ActionGrant, item.Grant) ||
                     state.HookId is not null && !string.Equals(state.HookId, item.HookId, StringComparison.Ordinal) ||
-                    item.Continuation.InvocationId != item.InvocationId)
+                    item.Continuation.InvocationId != item.InvocationId ||
+                    !string.Equals(item.Continuation.HookId, item.HookId, StringComparison.Ordinal))
                     return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The action hook identity does not match the exchange.");
                 break;
             case EventInterceptStart item when state.ExchangeKind != SidecarExchangeKind.EventIntercept:
@@ -1534,6 +1627,19 @@ public static class SidecarProtocolStateMachine
                 if (state.ExchangeKind != SidecarExchangeKind.Stream ||
                     state.StreamId != streamId)
                     return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The stream identity does not match the exchange.");
+                break;
+            case HookOutcome or SidecarResultReplacement when state.Phase == SidecarProtocolPhase.Invoking:
+                if (state.ExchangeKind != SidecarExchangeKind.ActionHook ||
+                    state.InvocationId == Guid.Empty ||
+                    state.ContinuationHandleId == Guid.Empty ||
+                    string.IsNullOrWhiteSpace(state.HookId) ||
+                    state.ActionKey is null ||
+                    state.ActionVersion is null ||
+                    state.TraceId is not { } traceId ||
+                    traceId == Guid.Empty)
+                {
+                    return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The direct action outcome has no established action hook identity.");
+                }
                 break;
             case HookOutcome or SidecarResultReplacement or HookCompleted or SidecarHostTerminalCancellation:
             case SidecarEffectRequest or ContinuationAccepted or ContinuationOutcome:
