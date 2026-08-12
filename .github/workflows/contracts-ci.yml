@@ -1,0 +1,38 @@
+name: Contracts CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: Restore, build, and test Contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore SharpClaw.Contracts.slnx
+
+      - name: Build
+        run: dotnet build SharpClaw.Contracts.slnx --configuration Release --no-restore
+
+      - name: Run maintained Contracts tests
+        run: dotnet test SharpClaw.Contracts.slnx --configuration Release --no-build

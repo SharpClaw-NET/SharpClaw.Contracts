@@ -160,11 +160,72 @@ public sealed class SimpleKernelContractTests
     }
 
     [Fact]
-    public void JobsCatalogHas46FamiliesAnd138UniqueKeys()
+    public void JobsCatalogMatchesTheAccepted46FamilyAuthority()
     {
+        var expectedFamilies = new[]
+        {
+            "jobs.submit",
+            "jobs.validate",
+            "jobs.identity.create",
+            "jobs.queue.persist",
+            "jobs.hold.evaluate",
+            "jobs.hold.resolve",
+            "jobs.dispatch",
+            "jobs.start",
+            "jobs.handler.invoke",
+            "jobs.progress.report",
+            "jobs.artifact.seal",
+            "jobs.complete",
+            "jobs.fail",
+            "jobs.cancel",
+            "jobs.cancel.request",
+            "jobs.cancel.apply",
+            "jobs.pause",
+            "jobs.stop",
+            "jobs.recovery",
+            "jobs.recovery.scan",
+            "jobs.recovery.classify",
+            "jobs.retry",
+            "jobs.retry.evaluate",
+            "jobs.retry.schedule",
+            "jobs.resume",
+            "jobs.delete",
+            "jobs.read",
+            "jobs.list",
+            "jobs.logs.read",
+            "jobs.audit.read",
+            "jobs.artifact.read",
+            "jobs.event.deliver",
+            "jobs.state.transition",
+            "jobs.state.transition.prepare",
+            "jobs.state.transition.commit",
+            "jobs.state.transition.rollback",
+            "jobs.persistence",
+            "jobs.persistence.prepare",
+            "jobs.persistence.commit",
+            "jobs.persistence.rollback",
+            "jobs.interruption.check",
+            "jobs.external_call",
+            "jobs.irreversible_effect",
+            "jobs.external_effect.prepare",
+            "jobs.external_effect.receipt",
+            "jobs.external_effect.uncertain"
+        };
+
+        var expectedKeys = expectedFamilies.SelectMany(family => new[]
+        {
+            family,
+            $"{family}.before",
+            $"{family}.after"
+        }).ToArray();
+
+        Assert.Equal(172, SharpClawActionCatalog.Kernel.Count);
+        Assert.Equal(expectedFamilies, SharpClawActionCatalog.JobsFamilies);
+        Assert.Equal(expectedKeys, SharpClawActionCatalog.Jobs.Select(key => key.Value));
         Assert.Equal(46, SharpClawActionCatalog.JobsFamilies.Count);
         Assert.Equal(138, SharpClawActionCatalog.Jobs.Count);
-        Assert.Equal(138, SharpClawActionCatalog.Jobs.Select(key => key.Value).Distinct().Count());
+        Assert.Equal(310, SharpClawActionCatalog.All.Count);
+        Assert.Equal(310, SharpClawActionCatalog.All.Select(key => key.Value).Distinct().Count());
 
         foreach (var family in SharpClawActionCatalog.JobsFamilies)
         {
