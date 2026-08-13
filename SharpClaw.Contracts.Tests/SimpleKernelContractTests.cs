@@ -2935,13 +2935,71 @@ public sealed class SimpleKernelContractTests
         Assert.DoesNotContain(names, name => name.EndsWith("ModuleCliCommand", StringComparison.Ordinal));
         Assert.DoesNotContain(names, name => name.EndsWith("ModuleCliScope", StringComparison.Ordinal));
         Assert.DoesNotContain(names, name => name.EndsWith("JobsContracts", StringComparison.Ordinal));
-        Assert.DoesNotContain(names, name => name.EndsWith("JobStatus", StringComparison.Ordinal));
         Assert.DoesNotContain(names, name => name.EndsWith("JobDocument", StringComparison.Ordinal));
         Assert.DoesNotContain(names, name => name.EndsWith("JobHandlerResult", StringComparison.Ordinal));
         Assert.DoesNotContain(typeof(IModuleLifecycleManager).GetMethods(), method =>
             method.Name is "FindToolByName" or "IsToolPrefixRegistered");
         Assert.Contains(typeof(ICliContributionBuilder).GetMethods(), method =>
             method.GetParameters().Any(parameter => parameter.ParameterType == typeof(ModuleCliCommandDescriptor)));
+    }
+
+    [Fact]
+    public void Jobs_contracts_preserve_typed_checkpoint_authority()
+    {
+        var invocationId = Guid.NewGuid();
+        var checkpoint = new JobCheckpoint<int>(
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            invocationId,
+            Guid.NewGuid(),
+            JobStatus.Queued,
+            JobStatus.Running,
+            JobSafePoint.BeforeTerminal,
+            7,
+            11);
+
+        Assert.Equal(invocationId, checkpoint.InvocationId);
+        Assert.Equal(JobStatus.Queued, checkpoint.CurrentStatus);
+        Assert.Equal(JobSafePoint.BeforeTerminal, checkpoint.SafePoint);
+        Assert.Equal(7, checkpoint.Value);
+
+        var key = new SharpClawActionKey("jobs.sample");
+        var repeat = new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "jobs.sample");
+        var before = new ActionDescriptor<JobCheckpoint<int>, JobCheckpoint<int>>(
+            key,
+            1,
+            "jobs",
+            ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap,
+            true,
+            false,
+            repeat,
+            null,
+            TimeSpan.FromSeconds(1));
+        var action = new ActionDescriptor<int, string>(
+            key,
+            1,
+            "jobs",
+            ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap,
+            true,
+            false,
+            repeat,
+            null,
+            TimeSpan.FromSeconds(1));
+        var after = new ActionDescriptor<JobCheckpoint<string>, JobCheckpoint<string>>(
+            key,
+            1,
+            "jobs",
+            ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap,
+            true,
+            false,
+            repeat,
+            null,
+            TimeSpan.FromSeconds(1));
+        var contract = new JobActionContract<int, string>(before, action, after);
+
+        Assert.Same(before, contract.Before);
+        Assert.Same(action, contract.Action);
+        Assert.Same(after, contract.After);
     }
 
     [Fact]
