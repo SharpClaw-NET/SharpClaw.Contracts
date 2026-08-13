@@ -2925,7 +2925,7 @@ public sealed class SimpleKernelContractTests
     }
 
     [Fact]
-    public void RetiredLookupCliAndJobsFeatureTypesAreAbsent()
+    public void RetiredLookupCliTypesAreAbsent_and_canonical_jobs_types_are_present()
     {
         var names = typeof(ISharpClawModule).Assembly
             .GetTypes()
@@ -2935,8 +2935,8 @@ public sealed class SimpleKernelContractTests
         Assert.DoesNotContain(names, name => name.EndsWith("ModuleCliCommand", StringComparison.Ordinal));
         Assert.DoesNotContain(names, name => name.EndsWith("ModuleCliScope", StringComparison.Ordinal));
         Assert.DoesNotContain(names, name => name.EndsWith("JobsContracts", StringComparison.Ordinal));
-        Assert.DoesNotContain(names, name => name.EndsWith("JobDocument", StringComparison.Ordinal));
         Assert.DoesNotContain(names, name => name.EndsWith("JobHandlerResult", StringComparison.Ordinal));
+        Assert.Contains("SharpClaw.Contracts.Modules.JobDocument", names);
         Assert.DoesNotContain(typeof(IModuleLifecycleManager).GetMethods(), method =>
             method.Name is "FindToolByName" or "IsToolPrefixRegistered");
         Assert.Contains(typeof(ICliContributionBuilder).GetMethods(), method =>
