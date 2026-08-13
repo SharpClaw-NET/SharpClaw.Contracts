@@ -1,5 +1,3 @@
-using System.Text.Json;
-
 namespace SharpClaw.Contracts.Modules;
 
 /// <summary>Neutral lifecycle states used by typed Jobs checkpoints.</summary>
@@ -54,15 +52,3 @@ public sealed record JobActionContract<TInput, TResult>(
     ActionDescriptor<JobCheckpoint<TInput>, JobCheckpoint<TInput>> Before,
     ActionDescriptor<TInput, TResult> Action,
     ActionDescriptor<JobCheckpoint<TResult>, JobCheckpoint<TResult>> After);
-
-/// <summary>Neutral JSON value used by Core standard Jobs descriptors.</summary>
-public static class JobActionPayload
-{
-    public static JobActionInput<JsonElement> Input(
-        SharpClawActionKey actionKey,
-        JsonElement value) => new(actionKey, value);
-
-    public static JobActionResult<JsonElement> Result(
-        SharpClawActionKey actionKey,
-        JsonElement value) => new(actionKey, value);
-}
