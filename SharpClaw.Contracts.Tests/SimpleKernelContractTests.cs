@@ -2963,6 +2963,11 @@ public sealed class SimpleKernelContractTests
         Assert.Equal(JobSafePoint.BeforeTerminal, checkpoint.SafePoint);
         Assert.Equal(7, checkpoint.Value);
 
+        var input = new JobActionInput<int>(7);
+        var result = new JobActionResult<string>("complete");
+        Assert.Equal(7, input.Value);
+        Assert.Equal("complete", result.Value);
+
         var key = new SharpClawActionKey("jobs.sample");
         var repeat = new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "jobs.sample");
         var before = new ActionDescriptor<JobCheckpoint<int>, JobCheckpoint<int>>(

@@ -26,14 +26,10 @@ public enum JobSafePoint
 }
 
 /// <summary>Neutral typed input envelope for a Jobs operation.</summary>
-public sealed record JobActionInput<TValue>(
-    SharpClawActionKey ActionKey,
-    TValue Value);
+public sealed record JobActionInput<TValue>(TValue Value);
 
 /// <summary>Neutral typed result envelope for a Jobs operation.</summary>
-public sealed record JobActionResult<TValue>(
-    SharpClawActionKey ActionKey,
-    TValue Value);
+public sealed record JobActionResult<TValue>(TValue Value);
 
 /// <summary>Typed before and after state carried through a Jobs action boundary.</summary>
 public sealed record JobCheckpoint<TValue>(
