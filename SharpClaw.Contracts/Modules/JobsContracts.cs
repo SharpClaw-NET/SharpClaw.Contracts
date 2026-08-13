@@ -30,6 +30,7 @@ public sealed record JobResultReference(
 public sealed record JobDocument(
     Guid Id,
     Guid InvocationId,
+    Guid IdempotencyKey,
     Guid? ConversationId,
     SharpClawActionKey ActionKey,
     RequestPrincipal Caller,
@@ -102,6 +103,80 @@ public interface IJobPayloadCodec<T>
     JobPayloadEnvelope Encode(T value);
 
     T Decode(JobPayloadEnvelope payload);
+}
+
+/// <summary>Non-generic view of one typed Jobs handler.</summary>
+public interface IJobHandler
+{
+    SharpClawActionKey ActionKey { get; }
+
+    JobExecutionSafety Safety { get; }
+
+    Type InputType { get; }
+
+    Type ResultType { get; }
+
+    string InputContractName { get; }
+
+    int InputSchemaVersion { get; }
+
+    string ResultContractName { get; }
+
+    int ResultSchemaVersion { get; }
+
+    ValueTask<JobPayloadEnvelope> ExecuteAsync(
+        JobExecutionContext context,
+        JobPayloadEnvelope input,
+        CancellationToken cancellationToken);
+
+    JobPayloadEnvelope EncodeResult(object result);
+
+    object DecodeResult(JobPayloadEnvelope result);
+}
+
+/// <summary>Typed handler contract used by the Core Jobs coordinator.</summary>
+public interface IJobHandler<TInput, TResult> : IJobHandler
+{
+    IJobPayloadCodec<TInput> InputCodec { get; }
+
+    IJobPayloadCodec<TResult> ResultCodec { get; }
+
+    ValueTask<TResult> ExecuteAsync(
+        JobExecutionContext context,
+        TInput input,
+        CancellationToken cancellationToken);
+
+    Type IJobHandler.InputType => typeof(TInput);
+
+    Type IJobHandler.ResultType => typeof(TResult);
+
+    string IJobHandler.InputContractName => InputCodec.ContractName;
+
+    int IJobHandler.InputSchemaVersion => InputCodec.SchemaVersion;
+
+    string IJobHandler.ResultContractName => ResultCodec.ContractName;
+
+    int IJobHandler.ResultSchemaVersion => ResultCodec.SchemaVersion;
+
+    async ValueTask<JobPayloadEnvelope> IJobHandler.ExecuteAsync(
+        JobExecutionContext context,
+        JobPayloadEnvelope input,
+        CancellationToken cancellationToken) =>
+        ResultCodec.Encode(
+            await ExecuteAsync(
+                context,
+                InputCodec.Decode(input),
+                cancellationToken));
+
+    JobPayloadEnvelope IJobHandler.EncodeResult(object result) =>
+        result is TResult typed
+            ? ResultCodec.Encode(typed)
+            : throw new ArgumentException(
+                $"The Jobs result must be '{typeof(TResult).FullName}'.",
+                nameof(result));
+
+    object IJobHandler.DecodeResult(JobPayloadEnvelope result) =>
+        ResultCodec.Decode(result)!;
 }
 
 /// <summary>Default bounded JSON codec for a Jobs payload contract.</summary>
