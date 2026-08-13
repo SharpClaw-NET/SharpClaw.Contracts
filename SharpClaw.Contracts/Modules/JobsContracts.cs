@@ -129,6 +129,10 @@ public interface IJobHandler
         JobPayloadEnvelope input,
         CancellationToken cancellationToken);
 
+    JobPayloadEnvelope EncodeInput(object input);
+
+    object DecodeInput(JobPayloadEnvelope input);
+
     JobPayloadEnvelope EncodeResult(object result);
 
     object DecodeResult(JobPayloadEnvelope result);
@@ -167,6 +171,16 @@ public interface IJobHandler<TInput, TResult> : IJobHandler
                 context,
                 InputCodec.Decode(input),
                 cancellationToken));
+
+    JobPayloadEnvelope IJobHandler.EncodeInput(object input) =>
+        input is TInput typed
+            ? InputCodec.Encode(typed)
+            : throw new ArgumentException(
+                $"The Jobs input must be '{typeof(TInput).FullName}'.",
+                nameof(input));
+
+    object IJobHandler.DecodeInput(JobPayloadEnvelope input) =>
+        InputCodec.Decode(input)!;
 
     JobPayloadEnvelope IJobHandler.EncodeResult(object result) =>
         result is TResult typed

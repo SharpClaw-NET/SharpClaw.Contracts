@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace SharpClaw.Contracts.Modules;
 
@@ -494,10 +495,21 @@ public sealed class ModuleDocumentStore<T>(
     JsonSerializerOptions? jsonOptions = null)
 {
     private readonly string _ownerId = ValidateOwner(ownerId);
-    private readonly JsonSerializerOptions _jsonOptions = jsonOptions ?? new JsonSerializerOptions(JsonSerializerDefaults.Web)
+    private readonly JsonSerializerOptions _jsonOptions = CreateOptions(jsonOptions);
+
+    private static JsonSerializerOptions CreateOptions(JsonSerializerOptions? jsonOptions)
     {
-        PropertyNameCaseInsensitive = true,
-    };
+        var options = jsonOptions is null
+            ? new JsonSerializerOptions(JsonSerializerDefaults.Web)
+            : new JsonSerializerOptions(jsonOptions);
+        if (jsonOptions is null)
+        {
+            options.PropertyNameCaseInsensitive = true;
+        }
+        if (!options.Converters.Any(converter => converter is ModuleReadOnlySetJsonConverterFactory))
+            options.Converters.Add(new ModuleReadOnlySetJsonConverterFactory());
+        return options;
+    }
 
     internal string OwnerId => _ownerId;
 
@@ -833,6 +845,42 @@ public sealed class ModuleDocumentStore<T>(
 
         return ownerId;
     }
+}
+
+internal sealed class ModuleReadOnlySetJsonConverterFactory : JsonConverterFactory
+{
+    public override bool CanConvert(Type typeToConvert) =>
+        typeToConvert.IsGenericType &&
+        typeToConvert.GetGenericTypeDefinition() == typeof(IReadOnlySet<>);
+
+    public override JsonConverter CreateConverter(Type typeToConvert, JsonSerializerOptions options)
+    {
+        var itemType = typeToConvert.GetGenericArguments()[0];
+        return (JsonConverter)(Activator.CreateInstance(
+            typeof(ModuleReadOnlySetJsonConverter<>).MakeGenericType(itemType),
+            options) ?? throw new InvalidOperationException(
+                $"The read-only set converter for '{itemType.FullName}' cannot be created."));
+    }
+}
+
+internal sealed class ModuleReadOnlySetJsonConverter<T> : JsonConverter<IReadOnlySet<T>>
+    where T : notnull
+{
+    public ModuleReadOnlySetJsonConverter(JsonSerializerOptions options)
+    {
+    }
+
+    public override IReadOnlySet<T> Read(
+        ref Utf8JsonReader reader,
+        Type typeToConvert,
+        JsonSerializerOptions options) =>
+        new HashSet<T>(JsonSerializer.Deserialize<T[]>(ref reader, options) ?? []);
+
+    public override void Write(
+        Utf8JsonWriter writer,
+        IReadOnlySet<T> value,
+        JsonSerializerOptions options) =>
+        JsonSerializer.Serialize(writer, value.ToArray(), options);
 }
 
 public sealed class ModuleDocumentQuery<T>
