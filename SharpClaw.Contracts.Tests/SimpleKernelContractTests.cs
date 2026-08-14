@@ -123,7 +123,9 @@ public sealed class SimpleKernelContractTests
             features,
             traceId,
             idempotencyKey,
-            deadline,
+            deadline);
+        var transport = new HostActionEntryTransportRequest<string, string>(
+            request,
             CreateHostActionAuthority(
                 descriptor,
                 "input",
@@ -139,7 +141,7 @@ public sealed class SimpleKernelContractTests
         var outcome = await entry.InvokeAsync(request, cancellation);
         var json = JsonSerializer.Serialize(request, JsonOptions);
 
-        Assert.True(request.Validate(now, authority =>
+        Assert.True(transport.Validate(now, authority =>
             authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
         Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
         Assert.Same(request, entry.Request);
@@ -180,8 +182,8 @@ public sealed class SimpleKernelContractTests
             features,
             traceId,
             idempotencyKey,
-            deadline,
-            CreateHostActionAuthority(
+            deadline);
+        var authority = CreateHostActionAuthority(
                 descriptor,
                 "input",
                 caller,
@@ -189,48 +191,49 @@ public sealed class SimpleKernelContractTests
                 traceId,
                 idempotencyKey,
                 deadline,
-                now));
-        var expectedProof = request.Authority.Proof;
+                now);
+        var transport = new HostActionEntryTransportRequest<string, string>(request, authority);
+        var expectedProof = authority.Proof;
         bool HostProof(HostActionEntryAuthority authority) =>
             authority.Proof == expectedProof &&
             authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority);
 
-        Assert.True(request.Validate(now, HostProof).Accepted);
-        Assert.False((request with
+        Assert.True(transport.Validate(now, HostProof).Accepted);
+        Assert.False((transport with { Request = request with
         {
             Caller = new RequestPrincipal("attacker", Roles: new HashSet<string>(["administrator"]))
-        }).Validate(now, HostProof).Accepted);
-        Assert.False((request with
+        }}).Validate(now, HostProof).Accepted);
+        Assert.False((transport with { Request = request with
         {
             Features = new ExtensionFeatureSet([new ExtensionFeature("forged", 1, "attacker", 64, CreateElement(new { enabled = true }))])
-        }).Validate(now, HostProof).Accepted);
-        Assert.False((request with { TraceId = Guid.NewGuid() }).Validate(now, HostProof).Accepted);
-        Assert.False((request with { IdempotencyKey = Guid.NewGuid() }).Validate(now, HostProof).Accepted);
-        Assert.False((request with { Action = "changed" }).Validate(now, HostProof).Accepted);
-        Assert.False((request with
+        }}).Validate(now, HostProof).Accepted);
+        Assert.False((transport with { Request = request with { TraceId = Guid.NewGuid() } }).Validate(now, HostProof).Accepted);
+        Assert.False((transport with { Request = request with { IdempotencyKey = Guid.NewGuid() } }).Validate(now, HostProof).Accepted);
+        Assert.False((transport with { Request = request with { Action = "changed" } }).Validate(now, HostProof).Accepted);
+        Assert.False((transport with
         {
-            Authority = request.Authority with
+            Authority = authority with
             {
                 Caller = new RequestPrincipal("attacker", Roles: new HashSet<string>(["administrator"])),
             },
         }).Validate(now, HostProof).Accepted);
-        Assert.False((request with
+        Assert.False((transport with
         {
-            Authority = request.Authority with { RequestId = Guid.NewGuid() },
+            Authority = authority with { RequestId = Guid.NewGuid() },
         }).Validate(now, HostProof).Accepted);
-        Assert.False((request with
+        Assert.False((transport with
         {
-            Authority = request.Authority with { Proof = "forged-proof" },
+            Authority = authority with { Proof = "forged-proof" },
         }).Validate(now, HostProof).Accepted);
-        var changedSchemaAuthority = request.Authority with
+        var changedSchemaAuthority = authority with
         {
-            InputSchemaVersion = request.Authority.InputSchemaVersion + 1,
+            InputSchemaVersion = authority.InputSchemaVersion + 1,
         };
         changedSchemaAuthority = changedSchemaAuthority with
         {
             Proof = HostActionEntryAuthorityValidator.ComputeAuthorityHash(changedSchemaAuthority),
         };
-        Assert.False((request with { Authority = changedSchemaAuthority }).Validate(
+        Assert.False((transport with { Authority = changedSchemaAuthority }).Validate(
             now,
             authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
     }
@@ -266,8 +269,8 @@ public sealed class SimpleKernelContractTests
             features,
             traceId,
             idempotencyKey,
-            deadline,
-            CreateHostActionAuthority(
+            deadline);
+        var authority = CreateHostActionAuthority(
                 descriptor,
                 action,
                 caller,
@@ -275,14 +278,15 @@ public sealed class SimpleKernelContractTests
                 traceId,
                 idempotencyKey,
                 deadline,
-                now));
+                now);
+        var transport = new HostActionEntryTransportRequest<EntryRecordAction, string>(request, authority);
         var defaultBytes = JsonSerializer.SerializeToUtf8Bytes(action);
         var transportBytes = SidecarCapabilityTransportCodec.Serialize(action);
 
         Assert.NotEqual(defaultBytes, transportBytes);
-        Assert.Equal(2, request.Authority.InputSchemaVersion);
-        Assert.Equal(3, request.Authority.ResultSchemaVersion);
-        Assert.True(request.Validate(
+        Assert.Equal(2, transport.Authority.InputSchemaVersion);
+        Assert.Equal(3, transport.Authority.ResultSchemaVersion);
+        Assert.True(transport.Validate(
             now,
             authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
     }

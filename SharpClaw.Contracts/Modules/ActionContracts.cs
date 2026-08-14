@@ -269,6 +269,25 @@ public sealed record HostActionEntryAuthority(
 }
 
 /// <summary>Typed input supplied to the host action entry.</summary>
+public sealed record HostActionEntryRequestContext(
+    Guid RequestId,
+    RequestPrincipal Caller,
+    ExtensionFeatureSet Features,
+    Guid TraceId,
+    Guid IdempotencyKey,
+    DateTimeOffset ExpiresAt)
+{
+    public bool IsWellFormed(DateTimeOffset now) =>
+        RequestId != Guid.Empty &&
+        Caller is not null &&
+        !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
+        Features is not null &&
+        Features.Items is not null &&
+        TraceId != Guid.Empty &&
+        IdempotencyKey != Guid.Empty &&
+        ExpiresAt > now;
+}
+
 public sealed record HostActionEntryRequest<TAction, TResult>(
     ActionDescriptor<TAction, TResult> Descriptor,
     TAction Action,
@@ -276,26 +295,43 @@ public sealed record HostActionEntryRequest<TAction, TResult>(
     ExtensionFeatureSet Features,
     Guid TraceId,
     Guid IdempotencyKey,
-    DateTimeOffset Deadline,
+    DateTimeOffset Deadline)
+{
+    public bool IsWellFormed(DateTimeOffset now) =>
+        Descriptor is not null &&
+        Descriptor.Version >= 1 &&
+        !string.IsNullOrWhiteSpace(Descriptor.Key.Value) &&
+        Caller is not null &&
+        !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
+        Features is not null &&
+        Features.Items is not null &&
+        TraceId != Guid.Empty &&
+        IdempotencyKey != Guid.Empty &&
+        Deadline > now;
+}
+
+/// <summary>Host-only transport envelope after authority issuance.</summary>
+public sealed record HostActionEntryTransportRequest<TAction, TResult>(
+    HostActionEntryRequest<TAction, TResult> Request,
     HostActionEntryAuthority Authority)
 {
     public HostActionEntryValidationResult Validate(
         DateTimeOffset now,
         Func<HostActionEntryAuthority, bool> authenticateAuthority) =>
-        HostActionEntryAuthorityValidator.Validate(this, now, authenticateAuthority);
+        HostActionEntryAuthorityValidator.Validate(Request, Authority, now, authenticateAuthority);
 }
 
 public static class HostActionEntryAuthorityValidator
 {
     public static HostActionEntryValidationResult Validate<TAction, TResult>(
         HostActionEntryRequest<TAction, TResult> request,
+        HostActionEntryAuthority authority,
         DateTimeOffset now,
         Func<HostActionEntryAuthority, bool> authenticateAuthority)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(authenticateAuthority);
 
-        var authority = request.Authority;
         if (authority is null || !authority.IsValid)
             return HostActionEntryValidationResult.Reject(
                 "host_action_invalid_authority",
@@ -366,6 +402,29 @@ public static class HostActionEntryAuthorityValidator
 
         return HostActionEntryValidationResult.Accept();
     }
+
+    public static bool MatchesRequestContext<TAction, TResult>(
+        HostActionEntryRequest<TAction, TResult> request,
+        HostActionEntryRequestContext context) =>
+        request is not null &&
+        context is not null &&
+        request.Deadline <= context.ExpiresAt &&
+        SamePrincipal(request.Caller, context.Caller) &&
+        SameFeatures(request.Features, context.Features) &&
+        request.TraceId == context.TraceId &&
+        request.IdempotencyKey == context.IdempotencyKey;
+
+    public static bool MatchesAuthorityContext(
+        HostActionEntryAuthority authority,
+        HostActionEntryRequestContext context) =>
+        authority is not null &&
+        context is not null &&
+        authority.RequestId == context.RequestId &&
+        authority.Deadline <= context.ExpiresAt &&
+        SamePrincipal(authority.Caller, context.Caller) &&
+        SameFeatures(authority.Features, context.Features) &&
+        authority.TraceId == context.TraceId &&
+        authority.IdempotencyKey == context.IdempotencyKey;
 
     public static string ComputeDescriptorHash<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor)

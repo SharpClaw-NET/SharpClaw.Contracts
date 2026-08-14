@@ -131,7 +131,17 @@ public sealed class SidecarCapabilityTransportTests
     [Fact]
     public void Session_binds_host_action_entry_to_authenticated_call_and_payload()
     {
-        var fixture = CreateFixture();
+        var caller = new RequestPrincipal("user-1", Roles: new HashSet<string>(["reader"]));
+        var traceId = Guid.NewGuid();
+        var idempotencyKey = Guid.NewGuid();
+        var fixture = CreateFixture(
+            hostActionContext: new HostActionEntryRequestContext(
+                Guid.Empty,
+                caller,
+                ExtensionFeatureSet.Empty,
+                traceId,
+                idempotencyKey,
+                new DateTimeOffset(2026, 8, 14, 12, 5, 0, TimeSpan.Zero)));
         var now = fixture.Now;
         var descriptor = new ActionDescriptor<string, string>(
             new SharpClawActionKey("sample.action"),
@@ -162,9 +172,6 @@ public sealed class SidecarCapabilityTransportTests
             payload.ByteLength,
             now).Accepted);
 
-        var caller = new RequestPrincipal("user-1", Roles: new HashSet<string>(["reader"]));
-        var traceId = Guid.NewGuid();
-        var idempotencyKey = Guid.NewGuid();
         var deadline = actionCall.Deadline;
         var authority = new HostActionEntryAuthority(
             fixture.Binding.ModuleId,
@@ -206,11 +213,11 @@ public sealed class SidecarCapabilityTransportTests
             ExtensionFeatureSet.Empty,
             traceId,
             idempotencyKey,
-            deadline,
-            authority);
+            deadline);
+        var transport = new HostActionEntryTransportRequest<string, string>(request, authority);
 
         Assert.True(fixture.Session.ValidateHostActionEntry(
-            request,
+            transport,
             now,
             candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Accepted);
         var changedCallAuthority = authority with { ReplayNonce = "wrong-nonce" };
@@ -221,11 +228,11 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             fixture.Session.ValidateHostActionEntry(
-                request with { Authority = changedCallAuthority },
+                transport with { Authority = changedCallAuthority },
                 now,
                 candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Code);
         Assert.False(fixture.Session.ValidateHostActionEntry(
-            request with { Caller = new RequestPrincipal("attacker") },
+                transport with { Request = request with { Caller = new RequestPrincipal("attacker") } },
             now,
             candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Accepted);
 
@@ -233,9 +240,63 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             fixture.Session.ValidateHostActionEntry(
-                request,
+                transport,
                 now,
                 candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Code);
+    }
+
+    [Fact]
+    public async Task Module_host_entry_request_uses_session_issued_authority_without_module_proof_access()
+    {
+        var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
+        var caller = new RequestPrincipal("endpoint-user", Roles: new HashSet<string>(["reader"]));
+        var fixture = CreateFixture(
+            hostActionContext: new HostActionEntryRequestContext(
+                Guid.Empty,
+                caller,
+                ExtensionFeatureSet.Empty,
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                now.AddMinutes(5)));
+        var descriptor = new ActionDescriptor<string, string>(
+            new SharpClawActionKey("sample.nested"),
+            1,
+            "sample",
+            ActionInterceptionCapabilities.Inspect,
+            ContainsSensitiveData: false,
+            HasIrreversibleEffects: false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "sample.nested"),
+            ContinuationPolicy: null,
+            TimeSpan.FromSeconds(5))
+        {
+            InputSchema = new JsonSchemaReference("sample.nested.input", 1, "sample-nested-input"),
+            ResultSchema = new JsonSchemaReference("sample.nested.result", 1, "sample-nested-result"),
+        };
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "nested-entry-nonce",
+            Sequence = 1,
+        };
+        var payload = Payload(typeof(string).AssemblyQualifiedName!, "input");
+        Assert.True(fixture.Session.BeginCall(call, SidecarCapabilityKind.Action, payload, payload.ByteLength, now).Accepted);
+
+        var request = new HostActionEntryRequest<string, string>(
+            descriptor,
+            "input",
+            caller,
+            ExtensionFeatureSet.Empty,
+            fixture.Binding.HostActionContext!.TraceId,
+            fixture.Binding.HostActionContext.IdempotencyKey,
+            call.Deadline);
+        var proxy = new SessionHostActionEntryProxy(fixture.Session, call.CallId, now);
+
+        var outcome = await proxy.InvokeAsync(request);
+
+        Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
+        Assert.True(proxy.AuthorityIssued);
+        Assert.True(proxy.TransportValidated);
     }
 
     [Fact]
@@ -871,7 +932,8 @@ public sealed class SidecarCapabilityTransportTests
     private static Fixture CreateFixture(
         int maxInFlight = 2,
         int maxCalls = 4,
-        IReadOnlyList<SidecarCapabilityKind>? capabilities = null)
+        IReadOnlyList<SidecarCapabilityKind>? capabilities = null,
+        HostActionEntryRequestContext? hostActionContext = null)
     {
         var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var expires = now.AddMinutes(5);
@@ -898,6 +960,17 @@ public sealed class SidecarCapabilityTransportTests
             safeFailure,
             "host-a",
             proof);
+        if (hostActionContext is not null)
+        {
+            binding = binding with
+            {
+                HostActionContext = hostActionContext with
+                {
+                    RequestId = binding.RequestId,
+                    ExpiresAt = expires,
+                },
+            };
+        }
         binding = binding with
         {
             Authentication = proof with
@@ -950,4 +1023,45 @@ public sealed class SidecarCapabilityTransportTests
         SidecarCapabilityCallIdentity Call,
         SidecarSafeFailureIdentity SafeFailure,
         HashSet<string> Nonces);
+
+    private sealed class SessionHostActionEntryProxy(
+        SidecarCapabilitySession session,
+        Guid callId,
+        DateTimeOffset now)
+    {
+        public bool AuthorityIssued { get; private set; }
+        public bool TransportValidated { get; private set; }
+
+        public ValueTask<IActionOutcome<string>> InvokeAsync(
+            HostActionEntryRequest<string, string> request)
+        {
+            var issued = session.IssueHostActionEntry(
+                request,
+                callId,
+                now,
+                authority => HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority),
+                out var transport);
+            if (!issued.Accepted || transport is null)
+                throw new InvalidOperationException(issued.Message);
+
+            AuthorityIssued = true;
+            var validated = session.ValidateHostActionEntry(
+                transport,
+                now,
+                authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority));
+            if (!validated.Accepted)
+                throw new InvalidOperationException(validated.Message);
+
+            TransportValidated = true;
+            return ValueTask.FromResult<IActionOutcome<string>>(new RecordedOutcome<string>(ActionOutcomeKind.Completed));
+        }
+    }
+
+    private sealed record RecordedOutcome<TResult>(ActionOutcomeKind Kind) : IActionOutcome<TResult>
+    {
+        public TResult? Result => default;
+        public ContinuationToken? Continuation => null;
+        public ExecutionError? Error => null;
+        public ActionUncertainty? Uncertainty => null;
+    }
 }

@@ -80,7 +80,10 @@ public sealed record SidecarCapabilitySessionBinding(
     SidecarConcurrencyLimits ConcurrencyLimits,
     SidecarSafeFailureIdentity SafeFailure,
     string AuthenticationKeyId,
-    SidecarAuthenticationProof Authentication);
+    SidecarAuthenticationProof Authentication)
+{
+    public HostActionEntryRequestContext? HostActionContext { get; init; }
+}
 
 public sealed record SidecarCapabilityAuthenticationAuthority(
     SidecarCapabilitySessionBinding Binding,
@@ -214,7 +217,7 @@ public sealed class SidecarCapabilitySession
     public SidecarCapabilitySessionBinding Binding { get; }
 
     public SidecarCapabilityValidationResult ValidateHostActionEntry<TAction, TResult>(
-        HostActionEntryRequest<TAction, TResult> request,
+        HostActionEntryTransportRequest<TAction, TResult> request,
         DateTimeOffset now,
         Func<HostActionEntryAuthority, bool> authenticateAuthority)
     {
@@ -246,6 +249,16 @@ public sealed class SidecarCapabilitySession
                 return bindingResult;
 
             var authority = request.Authority;
+            if (Binding.HostActionContext is null ||
+                !HostActionEntryAuthorityValidator.MatchesAuthorityContext(
+                    authority,
+                    Binding.HostActionContext))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The host action entry authority does not match the host request context.");
+            }
+
             if (authority.SessionId != Binding.SessionId ||
                 authority.RequestId != Binding.RequestId ||
                 authority.CancellationId != Binding.CancellationId ||
@@ -274,6 +287,118 @@ public sealed class SidecarCapabilitySession
                     "The host action entry authority does not match the active sidecar call.");
             }
 
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult IssueHostActionEntry<TAction, TResult>(
+        HostActionEntryRequest<TAction, TResult> request,
+        Guid callId,
+        DateTimeOffset now,
+        Func<HostActionEntryAuthority, string> issueProof,
+        out HostActionEntryTransportRequest<TAction, TResult>? transport)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(issueProof);
+        transport = null;
+
+        lock (_sync)
+        {
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            if (Binding.HostActionContext is null ||
+                !Binding.HostActionContext.IsWellFormed(now) ||
+                !request.IsWellFormed(now) ||
+                !HostActionEntryAuthorityValidator.MatchesRequestContext(
+                    request,
+                    Binding.HostActionContext) ||
+                callId == Guid.Empty ||
+                !_calls.TryGetValue(callId, out var capability) ||
+                capability != SidecarCapabilityKind.Action ||
+                !_callIdentities.TryGetValue(callId, out var activeCall) ||
+                !_callPayloads.TryGetValue(callId, out var callPayload) ||
+                callPayload is null)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The host action entry request does not match the active host request context.");
+            }
+
+            if (activeCall.Deadline != request.Deadline ||
+                activeCall.SessionId != Binding.SessionId ||
+                activeCall.RequestId != Binding.RequestId ||
+                activeCall.CancellationId != Binding.CancellationId)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The host action entry request does not match the active call identity.");
+            }
+
+            var actionBytes = SidecarCapabilityTransportCodec.Serialize(request.Action);
+            var actionHash = SidecarCapabilityTransportCodec.ComputeSha256(actionBytes);
+            var inputSchema = request.Descriptor.InputSchema;
+            var resultSchema = request.Descriptor.ResultSchema;
+            if (inputSchema is null || resultSchema is null ||
+                !string.Equals(callPayload.TypeIdentity, typeof(TAction).AssemblyQualifiedName ?? typeof(TAction).FullName, StringComparison.Ordinal) ||
+                callPayload.SchemaVersion != inputSchema.Version ||
+                !string.Equals(callPayload.ContentHash, actionHash, StringComparison.OrdinalIgnoreCase) ||
+                callPayload.ByteLength != actionBytes.Length)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidPayload,
+                    "The active sidecar payload does not match the typed host action.");
+            }
+
+            var authority = new HostActionEntryAuthority(
+                Binding.ModuleId,
+                Binding.GraphId,
+                Binding.SessionId,
+                Binding.RequestId,
+                Binding.CancellationId,
+                activeCall.CallId,
+                activeCall.ReplayNonce,
+                activeCall.Sequence,
+                Binding.HostActionContext.Caller,
+                Binding.HostActionContext.Features,
+                Binding.HostActionContext.TraceId,
+                Binding.HostActionContext.IdempotencyKey,
+                request.Descriptor.Key,
+                request.Descriptor.Version,
+                request.Descriptor.Category,
+                typeof(TAction).AssemblyQualifiedName ?? typeof(TAction).FullName ?? typeof(TAction).Name,
+                typeof(TResult).AssemblyQualifiedName ?? typeof(TResult).FullName ?? typeof(TResult).Name,
+                HostActionEntryAuthorityValidator.ComputeDescriptorHash(request.Descriptor),
+                inputSchema.ContentHash!,
+                inputSchema.Version,
+                resultSchema.ContentHash!,
+                resultSchema.Version,
+                actionHash,
+                actionBytes.Length,
+                activeCall.Deadline,
+                now,
+                activeCall.Deadline,
+                string.Empty);
+            var proof = issueProof(authority);
+            if (string.IsNullOrWhiteSpace(proof))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The host did not issue a host action entry proof.");
+
+            transport = new HostActionEntryTransportRequest<TAction, TResult>(
+                request,
+                authority with { Proof = proof });
             return SidecarCapabilityValidationResult.Accept();
         }
     }
@@ -491,7 +616,8 @@ public static class SidecarCapabilitySessionValidator
             binding.PayloadLimits,
             binding.ConcurrencyLimits,
             binding.SafeFailure,
-            binding.AuthenticationKeyId);
+            binding.AuthenticationKeyId,
+            binding.HostActionContext);
         return SidecarCapabilityTransportCodec.ComputeSha256(
             SidecarCapabilityTransportCodec.Serialize(authority));
     }
@@ -526,6 +652,16 @@ public static class SidecarCapabilitySessionValidator
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidBinding,
                 "The sidecar capability binding is incomplete.");
+        }
+
+        if (binding.HostActionContext is not null &&
+            (!binding.HostActionContext.IsWellFormed(now) ||
+             binding.HostActionContext.RequestId != binding.RequestId ||
+             binding.HostActionContext.ExpiresAt != binding.ExpiresAt))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidBinding,
+                "The host action request context does not bind to the session.");
         }
 
         if (binding.ExpiresAt <= now)
@@ -586,7 +722,8 @@ public static class SidecarCapabilitySessionValidator
         SidecarPayloadLimits PayloadLimits,
         SidecarConcurrencyLimits ConcurrencyLimits,
         SidecarSafeFailureIdentity SafeFailure,
-        string AuthenticationKeyId);
+        string AuthenticationKeyId,
+        HostActionEntryRequestContext? HostActionContext);
 }
 
 public sealed record SidecarStorageCapabilityRequest(
