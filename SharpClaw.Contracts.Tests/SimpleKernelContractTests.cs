@@ -94,8 +94,9 @@ public sealed class SimpleKernelContractTests
     }
 
     [Fact]
-    public async Task HostActionEntryCarriesTypedCallerInputAndDeadlineWithoutSnapshotAuthority()
+    public async Task HostActionEntryRequiresHostIssuedAuthorityWithoutSnapshotAuthority()
     {
+        var now = DateTimeOffset.UtcNow;
         var descriptor = new ActionDescriptor<string, string>(
             new SharpClawActionKey("demo.entry"),
             1,
@@ -106,20 +107,36 @@ public sealed class SimpleKernelContractTests
             new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "demo.entry"),
             ContinuationPolicy: null,
             TimeSpan.FromSeconds(5));
+        var caller = new RequestPrincipal("caller-1", Roles: new HashSet<string>(["reader"]));
+        var features = new ExtensionFeatureSet([]);
+        var traceId = Guid.NewGuid();
+        var idempotencyKey = Guid.NewGuid();
+        var deadline = now.AddMinutes(1);
         var request = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
-            new RequestPrincipal("caller-1"),
-            Guid.NewGuid(),
-            Guid.NewGuid(),
-            DateTimeOffset.UtcNow.AddMinutes(1));
+            caller,
+            features,
+            traceId,
+            idempotencyKey,
+            deadline,
+            CreateHostActionAuthority(
+                descriptor,
+                "input",
+                caller,
+                features,
+                traceId,
+                idempotencyKey,
+                deadline,
+                now));
         var cancellation = new CancellationTokenSource().Token;
         var entry = new RecordingHostActionEntry();
 
         var outcome = await entry.InvokeAsync(request, cancellation);
         var json = JsonSerializer.Serialize(request, JsonOptions);
 
-        Assert.True(request.IsValid(DateTimeOffset.UtcNow));
+        Assert.True(request.Validate(now, authority =>
+            authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
         Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
         Assert.Same(request, entry.Request);
         Assert.Equal(cancellation, entry.CancellationToken);
@@ -127,6 +144,118 @@ public sealed class SimpleKernelContractTests
         Assert.DoesNotContain("ActionGrants", json, StringComparison.Ordinal);
         Assert.DoesNotContain("EventGrants", json, StringComparison.Ordinal);
         Assert.NotNull(typeof(IHostActionEntry).GetMethod(nameof(IHostActionEntry.InvokeAsync)));
+    }
+
+    [Fact]
+    public void HostActionEntryRejectsForgedCallerFeaturesRequestAndPayloadAuthority()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var descriptor = new ActionDescriptor<string, string>(
+            new SharpClawActionKey("demo.entry"),
+            1,
+            "demo",
+            ActionInterceptionCapabilities.Inspect,
+            ContainsSensitiveData: false,
+            HasIrreversibleEffects: false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "demo.entry"),
+            ContinuationPolicy: null,
+            TimeSpan.FromSeconds(5));
+        var caller = new RequestPrincipal("caller-1", Roles: new HashSet<string>(["reader"]));
+        var features = new ExtensionFeatureSet([]);
+        var traceId = Guid.NewGuid();
+        var idempotencyKey = Guid.NewGuid();
+        var deadline = now.AddMinutes(1);
+        var request = new HostActionEntryRequest<string, string>(
+            descriptor,
+            "input",
+            caller,
+            features,
+            traceId,
+            idempotencyKey,
+            deadline,
+            CreateHostActionAuthority(
+                descriptor,
+                "input",
+                caller,
+                features,
+                traceId,
+                idempotencyKey,
+                deadline,
+                now));
+        var expectedProof = request.Authority.Proof;
+        bool HostProof(HostActionEntryAuthority authority) =>
+            authority.Proof == expectedProof &&
+            authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority);
+
+        Assert.True(request.Validate(now, HostProof).Accepted);
+        Assert.False((request with
+        {
+            Caller = new RequestPrincipal("attacker", Roles: new HashSet<string>(["administrator"]))
+        }).Validate(now, HostProof).Accepted);
+        Assert.False((request with
+        {
+            Features = new ExtensionFeatureSet([new ExtensionFeature("forged", 1, "attacker", 64, CreateElement(new { enabled = true }))])
+        }).Validate(now, HostProof).Accepted);
+        Assert.False((request with { TraceId = Guid.NewGuid() }).Validate(now, HostProof).Accepted);
+        Assert.False((request with { IdempotencyKey = Guid.NewGuid() }).Validate(now, HostProof).Accepted);
+        Assert.False((request with { Action = "changed" }).Validate(now, HostProof).Accepted);
+        Assert.False((request with
+        {
+            Authority = request.Authority with
+            {
+                Caller = new RequestPrincipal("attacker", Roles: new HashSet<string>(["administrator"])),
+            },
+        }).Validate(now, HostProof).Accepted);
+        Assert.False((request with
+        {
+            Authority = request.Authority with { RequestId = Guid.NewGuid() },
+        }).Validate(now, HostProof).Accepted);
+        Assert.False((request with
+        {
+            Authority = request.Authority with { Proof = "forged-proof" },
+        }).Validate(now, HostProof).Accepted);
+    }
+
+    private static HostActionEntryAuthority CreateHostActionAuthority<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action,
+        RequestPrincipal caller,
+        ExtensionFeatureSet features,
+        Guid traceId,
+        Guid idempotencyKey,
+        DateTimeOffset deadline,
+        DateTimeOffset now)
+    {
+        var actionBytes = JsonSerializer.SerializeToUtf8Bytes(action, JsonOptions);
+        var authority = new HostActionEntryAuthority(
+            "module-a",
+            "graph-a",
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            "entry-nonce",
+            1,
+            caller,
+            features,
+            traceId,
+            idempotencyKey,
+            descriptor.Key,
+            descriptor.Version,
+            descriptor.Category,
+            typeof(TAction).AssemblyQualifiedName!,
+            typeof(TResult).AssemblyQualifiedName!,
+            HostActionEntryAuthorityValidator.ComputeDescriptorHash(descriptor),
+            Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(actionBytes)),
+            actionBytes.Length,
+            deadline,
+            now.AddSeconds(-1),
+            now.AddMinutes(2),
+            "");
+        return authority with
+        {
+            Proof = HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority),
+        };
     }
 
     private sealed class RecordingHostActionEntry : IHostActionEntry

@@ -1,3 +1,6 @@
+using System.Security.Cryptography;
+using System.Text.Json;
+
 namespace SharpClaw.Contracts.Modules;
 
 [Flags]
@@ -188,29 +191,265 @@ public sealed record ActionContext<TAction>(
     ExtensionFeatureSet Features,
     ActionPipelineSnapshot Snapshot);
 
+public sealed record HostActionEntryValidationResult(
+    bool Accepted,
+    string Code,
+    string Message)
+{
+    public static HostActionEntryValidationResult Accept() =>
+        new(true, "accepted", "Accepted.");
+
+    public static HostActionEntryValidationResult Reject(string code, string message) =>
+        new(false, code, message);
+}
+
+/// <summary>Host-issued authority for one typed module action entry.</summary>
+public sealed record HostActionEntryAuthority(
+    string ModuleId,
+    string GraphId,
+    Guid SessionId,
+    Guid RequestId,
+    Guid CancellationId,
+    Guid CallId,
+    string ReplayNonce,
+    long Sequence,
+    RequestPrincipal Caller,
+    ExtensionFeatureSet Features,
+    Guid TraceId,
+    Guid IdempotencyKey,
+    SharpClawActionKey ActionKey,
+    int ActionVersion,
+    string Category,
+    string InputTypeIdentity,
+    string ResultTypeIdentity,
+    string DescriptorHash,
+    string ActionContentHash,
+    int ActionByteLength,
+    DateTimeOffset Deadline,
+    DateTimeOffset IssuedAt,
+    DateTimeOffset ExpiresAt,
+    string Proof)
+{
+    public bool IsValid =>
+        !string.IsNullOrWhiteSpace(ModuleId) &&
+        !string.IsNullOrWhiteSpace(GraphId) &&
+        SessionId != Guid.Empty &&
+        RequestId != Guid.Empty &&
+        CancellationId != Guid.Empty &&
+        CallId != Guid.Empty &&
+        !string.IsNullOrWhiteSpace(ReplayNonce) &&
+        Sequence > 0 &&
+        Caller is not null &&
+        !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
+        Features is not null &&
+        Features.Items is not null &&
+        TraceId != Guid.Empty &&
+        IdempotencyKey != Guid.Empty &&
+        !string.IsNullOrWhiteSpace(ActionKey.Value) &&
+        ActionVersion >= 1 &&
+        !string.IsNullOrWhiteSpace(Category) &&
+        !string.IsNullOrWhiteSpace(InputTypeIdentity) &&
+        !string.IsNullOrWhiteSpace(ResultTypeIdentity) &&
+        !string.IsNullOrWhiteSpace(DescriptorHash) &&
+        !string.IsNullOrWhiteSpace(ActionContentHash) &&
+        ActionByteLength > 0 &&
+        !string.IsNullOrWhiteSpace(Proof);
+}
+
 /// <summary>Typed input supplied to the host action entry.</summary>
 public sealed record HostActionEntryRequest<TAction, TResult>(
     ActionDescriptor<TAction, TResult> Descriptor,
     TAction Action,
     RequestPrincipal Caller,
+    ExtensionFeatureSet Features,
     Guid TraceId,
     Guid IdempotencyKey,
-    DateTimeOffset Deadline)
+    DateTimeOffset Deadline,
+    HostActionEntryAuthority Authority)
 {
-    public bool IsValid(DateTimeOffset now) =>
-        Descriptor is not null &&
-        Descriptor.Version >= 1 &&
-        Caller is not null &&
-        !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
-        TraceId != Guid.Empty &&
-        IdempotencyKey != Guid.Empty &&
-        Deadline > now;
+    public HostActionEntryValidationResult Validate(
+        DateTimeOffset now,
+        Func<HostActionEntryAuthority, bool> authenticateAuthority) =>
+        HostActionEntryAuthorityValidator.Validate(this, now, authenticateAuthority);
+}
+
+public static class HostActionEntryAuthorityValidator
+{
+    public static HostActionEntryValidationResult Validate<TAction, TResult>(
+        HostActionEntryRequest<TAction, TResult> request,
+        DateTimeOffset now,
+        Func<HostActionEntryAuthority, bool> authenticateAuthority)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(authenticateAuthority);
+
+        var authority = request.Authority;
+        if (authority is null || !authority.IsValid)
+            return HostActionEntryValidationResult.Reject(
+                "host_action_invalid_authority",
+                "The host action entry authority is incomplete.");
+
+        if (authority.IssuedAt > now || authority.ExpiresAt <= now ||
+            authority.Deadline <= now || authority.Deadline > authority.ExpiresAt)
+        {
+            return HostActionEntryValidationResult.Reject(
+                "host_action_expired",
+                "The host action entry authority is expired or outside its deadline.");
+        }
+
+        if (!authenticateAuthority(authority))
+            return HostActionEntryValidationResult.Reject(
+                "host_action_unauthenticated",
+                "The host action entry authority proof was not accepted.");
+
+        if (request.Descriptor is null || request.Descriptor.Version < 1 ||
+            string.IsNullOrWhiteSpace(request.Descriptor.Key.Value) ||
+            request.Caller is null || string.IsNullOrWhiteSpace(request.Caller.SubjectId) ||
+            request.Features is null || request.Features.Items is null || request.TraceId == Guid.Empty ||
+            request.IdempotencyKey == Guid.Empty || request.Deadline <= now)
+        {
+            return HostActionEntryValidationResult.Reject(
+                "host_action_invalid_request",
+                "The host action entry request is incomplete.");
+        }
+
+        var inputTypeIdentity = TypeIdentity<TAction>();
+        var resultTypeIdentity = TypeIdentity<TResult>();
+        var descriptorHash = ComputeDescriptorHash(request.Descriptor);
+        var actionBytes = JsonSerializer.SerializeToUtf8Bytes(request.Action);
+        var actionContentHash = Convert.ToHexString(SHA256.HashData(actionBytes));
+        if (!string.Equals(authority.ActionKey.Value, request.Descriptor.Key.Value, StringComparison.Ordinal) ||
+            authority.ActionVersion != request.Descriptor.Version ||
+            !string.Equals(authority.Category, request.Descriptor.Category, StringComparison.Ordinal) ||
+            !string.Equals(authority.InputTypeIdentity, inputTypeIdentity, StringComparison.Ordinal) ||
+            !string.Equals(authority.ResultTypeIdentity, resultTypeIdentity, StringComparison.Ordinal) ||
+            !string.Equals(authority.DescriptorHash, descriptorHash, StringComparison.Ordinal) ||
+            !string.Equals(authority.ActionContentHash, actionContentHash, StringComparison.Ordinal) ||
+            authority.ActionByteLength != actionBytes.Length ||
+            !SamePrincipal(authority.Caller, request.Caller) ||
+            !SameFeatures(authority.Features, request.Features) ||
+            authority.TraceId != request.TraceId ||
+            authority.IdempotencyKey != request.IdempotencyKey ||
+            authority.Deadline != request.Deadline)
+        {
+            return HostActionEntryValidationResult.Reject(
+                "host_action_spoofed_authority",
+                "The host action entry request does not match its host-issued authority.");
+        }
+
+        return HostActionEntryValidationResult.Accept();
+    }
+
+    public static string ComputeDescriptorHash<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor)
+    {
+        ArgumentNullException.ThrowIfNull(descriptor);
+        var canonical = new
+        {
+            Key = descriptor.Key.Value,
+            descriptor.Version,
+            descriptor.Category,
+            Capabilities = (int)descriptor.Capabilities,
+            descriptor.ContainsSensitiveData,
+            descriptor.HasIrreversibleEffects,
+            Repeat = new
+            {
+                Kind = descriptor.RepeatPolicy.Kind.ToString(),
+                descriptor.RepeatPolicy.MaximumAttempts,
+                MinimumBackoffTicks = descriptor.RepeatPolicy.MinimumBackoff.Ticks,
+                descriptor.RepeatPolicy.IdempotencyScope,
+            },
+            Continuation = descriptor.ContinuationPolicy is null
+                ? null
+                : new
+                {
+                    MaximumLifetimeTicks = descriptor.ContinuationPolicy.MaximumLifetime.Ticks,
+                    descriptor.ContinuationPolicy.Durable,
+                    descriptor.ContinuationPolicy.SingleClaim,
+                },
+            DefaultTimeoutTicks = descriptor.DefaultTimeout.Ticks,
+            ProtocolMinimum = descriptor.ProtocolVersionRange.Minimum,
+            ProtocolMaximum = descriptor.ProtocolVersionRange.Maximum,
+            SafePoints = descriptor.SafePoints.Select(point => point.ToString()).ToArray(),
+            InputTypeIdentity = TypeIdentity<TAction>(),
+            ResultTypeIdentity = TypeIdentity<TResult>(),
+        };
+        return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(canonical)));
+    }
+
+    public static string ComputeAuthorityHash(HostActionEntryAuthority authority)
+    {
+        ArgumentNullException.ThrowIfNull(authority);
+        var canonical = new
+        {
+            authority.ModuleId,
+            authority.GraphId,
+            authority.SessionId,
+            authority.RequestId,
+            authority.CancellationId,
+            authority.CallId,
+            authority.ReplayNonce,
+            authority.Sequence,
+            Caller = new
+            {
+                authority.Caller.SubjectId,
+                authority.Caller.DisplayName,
+                Roles = authority.Caller.Roles?.Order(StringComparer.Ordinal).ToArray(),
+                authority.Caller.IsAuthenticated,
+            },
+            Features = authority.Features.Items.Select(feature => new
+            {
+                feature.ContractName,
+                feature.SchemaVersion,
+                feature.OwnerModuleId,
+                feature.MaxBytes,
+                Value = feature.Value.GetRawText(),
+            }).ToArray(),
+            authority.TraceId,
+            authority.IdempotencyKey,
+            ActionKey = authority.ActionKey.Value,
+            authority.ActionVersion,
+            authority.Category,
+            authority.InputTypeIdentity,
+            authority.ResultTypeIdentity,
+            authority.DescriptorHash,
+            authority.ActionContentHash,
+            authority.ActionByteLength,
+            authority.Deadline,
+            authority.IssuedAt,
+            authority.ExpiresAt,
+        };
+        return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(canonical)));
+    }
+
+    private static string TypeIdentity<T>() =>
+        typeof(T).AssemblyQualifiedName ?? typeof(T).FullName ?? typeof(T).Name;
+
+    private static bool SamePrincipal(RequestPrincipal left, RequestPrincipal right) =>
+        string.Equals(left.SubjectId, right.SubjectId, StringComparison.Ordinal) &&
+        string.Equals(left.DisplayName, right.DisplayName, StringComparison.Ordinal) &&
+        left.IsAuthenticated == right.IsAuthenticated &&
+        SameSets(left.Roles, right.Roles);
+
+    private static bool SameSets(IReadOnlySet<string>? left, IReadOnlySet<string>? right) =>
+        left is null && right is null ||
+        left is not null && right is not null && left.SetEquals(right);
+
+    private static bool SameFeatures(ExtensionFeatureSet left, ExtensionFeatureSet right) =>
+        left.Items.Count == right.Items.Count &&
+        left.Items.Zip(right.Items).All(pair =>
+            string.Equals(pair.First.ContractName, pair.Second.ContractName, StringComparison.Ordinal) &&
+            pair.First.SchemaVersion == pair.Second.SchemaVersion &&
+            string.Equals(pair.First.OwnerModuleId, pair.Second.OwnerModuleId, StringComparison.Ordinal) &&
+            pair.First.MaxBytes == pair.Second.MaxBytes &&
+            string.Equals(pair.First.Value.GetRawText(), pair.Second.Value.GetRawText(), StringComparison.Ordinal));
 }
 
 /// <summary>Host-owned entry for typed module action calls.</summary>
 /// <remarks>
 /// Implementations resolve the authorized descriptor and pipeline snapshot from host state.
 /// They must not use caller-supplied descriptor capabilities as authorization.
+/// They must validate the request authority before resolving the descriptor or snapshot.
 /// </remarks>
 public interface IHostActionEntry
 {

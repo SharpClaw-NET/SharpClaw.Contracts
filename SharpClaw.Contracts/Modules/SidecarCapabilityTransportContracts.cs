@@ -177,6 +177,7 @@ public sealed class SidecarCapabilitySession
     private readonly Func<SidecarCapabilityAuthenticationAuthority, bool> _authenticate;
     private readonly Func<string, bool> _registerAuthenticationNonce;
     private readonly Dictionary<Guid, SidecarCapabilityKind> _calls = [];
+    private readonly Dictionary<Guid, SidecarSerializedPayload?> _callPayloads = [];
     private readonly HashSet<Guid> _completedCalls = [];
     private readonly HashSet<string> _nonces = new(StringComparer.Ordinal);
     private readonly Dictionary<Guid, Guid> _terminalCalls = [];
@@ -210,6 +211,62 @@ public sealed class SidecarCapabilitySession
     }
 
     public SidecarCapabilitySessionBinding Binding { get; }
+
+    public SidecarCapabilityValidationResult ValidateHostActionEntry<TAction, TResult>(
+        HostActionEntryRequest<TAction, TResult> request,
+        DateTimeOffset now,
+        Func<HostActionEntryAuthority, bool> authenticateAuthority)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(authenticateAuthority);
+
+        var requestResult = request.Validate(now, authenticateAuthority);
+        if (!requestResult.Accepted)
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                requestResult.Code,
+                requestResult.Message);
+        }
+
+        lock (_sync)
+        {
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            var authority = request.Authority;
+            if (authority.SessionId != Binding.SessionId ||
+                authority.RequestId != Binding.RequestId ||
+                authority.CancellationId != Binding.CancellationId ||
+                !string.Equals(authority.ModuleId, Binding.ModuleId, StringComparison.Ordinal) ||
+                !string.Equals(authority.GraphId, Binding.GraphId, StringComparison.Ordinal) ||
+                authority.Deadline > Binding.ExpiresAt ||
+                !_calls.TryGetValue(authority.CallId, out var capability) ||
+                capability != SidecarCapabilityKind.Action ||
+                !_callPayloads.TryGetValue(authority.CallId, out var callPayload) ||
+                callPayload is null ||
+                !string.Equals(callPayload.TypeIdentity, authority.InputTypeIdentity, StringComparison.Ordinal) ||
+                !string.Equals(callPayload.ContentHash, authority.ActionContentHash, StringComparison.OrdinalIgnoreCase) ||
+                callPayload.ByteLength != authority.ActionByteLength)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The host action entry authority does not match the active sidecar call.");
+            }
+
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
 
     public SidecarCapabilityValidationResult BeginCall(
         SidecarCapabilityCallIdentity identity,
@@ -299,6 +356,7 @@ public sealed class SidecarCapabilitySession
                     "The session request call limit was reached.");
 
             _calls.Add(identity.CallId, capability);
+            _callPayloads.Add(identity.CallId, payload);
             _lastSequence = identity.Sequence;
             _totalCalls++;
             _inFlight++;
@@ -383,6 +441,7 @@ public sealed class SidecarCapabilitySession
             _completedCalls.Add(callId);
             _terminalCalls.Remove(callId);
             _terminalReceipts.Remove(callId);
+            _callPayloads.Remove(callId);
             _inFlight--;
             return SidecarCapabilityValidationResult.Accept();
         }
@@ -394,6 +453,7 @@ public sealed class SidecarCapabilitySession
         {
             _disconnected = true;
             _calls.Clear();
+            _callPayloads.Clear();
             _terminalCalls.Clear();
             _terminalReceipts.Clear();
             _inFlight = 0;

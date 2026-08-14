@@ -129,6 +129,97 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void Session_binds_host_action_entry_to_authenticated_call_and_payload()
+    {
+        var fixture = CreateFixture();
+        var now = fixture.Now;
+        var descriptor = new ActionDescriptor<string, string>(
+            new SharpClawActionKey("sample.action"),
+            1,
+            "sample",
+            ActionInterceptionCapabilities.Inspect,
+            ContainsSensitiveData: false,
+            HasIrreversibleEffects: false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "sample.action"),
+            ContinuationPolicy: null,
+            TimeSpan.FromSeconds(5));
+        var payload = Payload(typeof(string).AssemblyQualifiedName!, "input");
+        var actionCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "entry-nonce",
+            Sequence = 1,
+        };
+        Assert.True(fixture.Session.BeginCall(
+            actionCall,
+            SidecarCapabilityKind.Action,
+            payload,
+            payload.ByteLength,
+            now).Accepted);
+
+        var caller = new RequestPrincipal("user-1", Roles: new HashSet<string>(["reader"]));
+        var traceId = Guid.NewGuid();
+        var idempotencyKey = Guid.NewGuid();
+        var deadline = actionCall.Deadline;
+        var authority = new HostActionEntryAuthority(
+            fixture.Binding.ModuleId,
+            fixture.Binding.GraphId,
+            fixture.Binding.SessionId,
+            fixture.Binding.RequestId,
+            fixture.Binding.CancellationId,
+            actionCall.CallId,
+            actionCall.ReplayNonce,
+            actionCall.Sequence,
+            caller,
+            ExtensionFeatureSet.Empty,
+            traceId,
+            idempotencyKey,
+            descriptor.Key,
+            descriptor.Version,
+            descriptor.Category,
+            typeof(string).AssemblyQualifiedName!,
+            typeof(string).AssemblyQualifiedName!,
+            HostActionEntryAuthorityValidator.ComputeDescriptorHash(descriptor),
+            payload.ContentHash,
+            payload.ByteLength,
+            deadline,
+            now.AddSeconds(-1),
+            fixture.Binding.ExpiresAt,
+            "");
+        authority = authority with
+        {
+            Proof = HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority),
+        };
+        var request = new HostActionEntryRequest<string, string>(
+            descriptor,
+            "input",
+            caller,
+            ExtensionFeatureSet.Empty,
+            traceId,
+            idempotencyKey,
+            deadline,
+            authority);
+
+        Assert.True(fixture.Session.ValidateHostActionEntry(
+            request,
+            now,
+            candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Accepted);
+        Assert.False(fixture.Session.ValidateHostActionEntry(
+            request with { Caller = new RequestPrincipal("attacker") },
+            now,
+            candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Accepted);
+
+        Assert.True(fixture.Session.CompleteCall(actionCall.CallId, 0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.ValidateHostActionEntry(
+                request,
+                now,
+                candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Code);
+    }
+
+    [Fact]
     public void Session_enforces_payload_hash_length_frame_size_and_capability_limits()
     {
         var fixture = CreateFixture(maxInFlight: 1, maxCalls: 2);
