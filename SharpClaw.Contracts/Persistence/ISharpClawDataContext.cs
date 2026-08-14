@@ -15,8 +15,6 @@ public interface ISharpClawDataContext
 {
     IQueryable<ProviderDB> Providers { get; }
     IQueryable<ModelDB> Models { get; }
-    IQueryable<UserDB> Users { get; }
-    IQueryable<RefreshTokenDB> RefreshTokens { get; }
     IQueryable<ModuleStateDB> ModuleStates { get; }
     IQueryable<ModuleConfigEntryDB> ModuleConfigEntries { get; }
     IQueryable<ModuleStorageRecordDB> ModuleStorageRecords { get; }
