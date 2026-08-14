@@ -61,7 +61,9 @@ public sealed class SidecarCapabilityTransportTests
     {
         var fixture = CreateFixture();
         Assert.True(fixture.Session.BeginCall(fixture.Call, SidecarCapabilityKind.Storage, null, 0, fixture.Now).Accepted);
-        Assert.True(fixture.Session.RecordTerminal(fixture.Call.CallId).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.RecordTerminal(fixture.Call.CallId).Code);
         Assert.True(fixture.Session.CompleteCall(fixture.Call.CallId).Accepted);
 
         var reusedCall = fixture.Call with { ReplayNonce = "new-nonce", Sequence = 2 };
@@ -84,6 +86,20 @@ public sealed class SidecarCapabilityTransportTests
             0,
             fixture.Now);
         Assert.Equal(SidecarCapabilityErrors.Disconnected, afterDisconnect.Code);
+    }
+
+    [Fact]
+    public void Session_requires_one_terminal_for_action_completion()
+    {
+        var fixture = CreateFixture();
+        var actionCall = fixture.Call with { Capability = SidecarCapabilityKind.Action };
+        var action = Payload("sample.input", new { value = 1 });
+        Assert.True(fixture.Session.BeginCall(actionCall, SidecarCapabilityKind.Action, action, action.ByteLength, fixture.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.TerminalAlreadyCalled,
+            fixture.Session.CompleteCall(actionCall.CallId).Code);
+        Assert.True(fixture.Session.RecordTerminal(actionCall.CallId).Accepted);
+        Assert.True(fixture.Session.CompleteCall(actionCall.CallId).Accepted);
     }
 
     [Fact]
@@ -179,7 +195,7 @@ public sealed class SidecarCapabilityTransportTests
             PayloadType("storage.result"),
             Cancellation(fixture),
             fixture.Call.Deadline);
-        var resultPayload = Payload("storage.claim.result", new { revision = 4 });
+        var resultPayload = Payload("storage.result", new { revision = 4 });
         var response = new SidecarStorageCapabilityResponse(
             new SidecarStorageResultIdentity(Guid.NewGuid(), fixture.Call.CallId, resultPayload.ContentHash, true),
             resultPayload,
@@ -195,6 +211,18 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Equal(
             SidecarCapabilityErrors.InvalidResponse,
             SidecarCapabilityTransportValidation.ValidateStorageResponse(request, spoofed, fixture.Binding).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateStorageResponse(
+                request,
+                response with { ResultPayload = resultPayload with { TypeIdentity = "storage.other" } },
+                fixture.Binding).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateStorageResponse(
+                request,
+                response with { ResultPayload = resultPayload with { SchemaVersion = 2 } },
+                fixture.Binding).Code);
     }
 
     [Fact]
@@ -212,9 +240,10 @@ public sealed class SidecarCapabilityTransportTests
             SidecarActionInvocationKind.RunRequired,
             descriptor,
             Payload("sample.input", new { value = 1 }),
+            replacement,
             snapshot,
             new SidecarCancellationIdentity(fixture.Call.CancellationId, "cancel-authority-hash", fixture.Call.Deadline),
-            new SidecarTerminalContinuationRequest(Guid.NewGuid(), true, replacement, receipt, fixture.Call.Deadline),
+            new SidecarTerminalContinuationRequest(Guid.NewGuid(), true, Payload("sample.result", new { value = 2 }), receipt, fixture.Call.Deadline),
             fixture.Call.Deadline);
         var outcomePayload = Payload("sample.result", new { value = 3 });
         var outcome = new SidecarActionOutcomeEnvelope(
@@ -246,12 +275,75 @@ public sealed class SidecarCapabilityTransportTests
             request.Deadline);
         var terminalResponse = new SidecarActionTerminalTransportResponse(
             resultIdentity,
-            outcome,
+            new SidecarTerminalExecutionResult(outcomePayload, null, true),
             receipt,
-            fixture.SafeFailure,
-            true);
-        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(terminalRequest, fixture.Binding, fixture.Now).Accepted);
+            fixture.SafeFailure);
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(request, terminalRequest, fixture.Binding, fixture.Now).Accepted);
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(terminalRequest, terminalResponse, fixture.Binding).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with
+                {
+                    Descriptor = descriptor with { Key = new SharpClawActionKey("other.action") },
+                    Receipt = receipt with { ActionKey = new SharpClawActionKey("other.action") },
+                },
+                fixture.Binding,
+                fixture.Now).Code);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidPayload,
+            SidecarCapabilityTransportValidation.ValidateActionRequest(
+                request with
+                {
+                    Continuation = request.Continuation with { ReplacementResult = replacement },
+                },
+                fixture.Binding,
+                fixture.Now).Code);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                terminalResponse with
+                {
+                    ResultIdentity = null,
+                    Execution = new SidecarTerminalExecutionResult(null, null, true),
+                },
+                fixture.Binding).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidPayload,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with { Receipt = receipt with { ReceiptId = "forged-receipt" } },
+                fixture.Binding,
+                fixture.Now).Code);
+        var wrongTerminalResult = Payload("wrong.result", new { value = 5 });
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                terminalResponse with
+                {
+                    ResultIdentity = resultIdentity with
+                    {
+                        ResultTypeIdentity = "wrong.result",
+                        ContentHash = wrongTerminalResult.ContentHash,
+                    },
+                    Execution = new SidecarTerminalExecutionResult(wrongTerminalResult, null, true),
+                },
+                fixture.Binding).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                terminalResponse with
+                {
+                    ResultIdentity = resultIdentity,
+                    Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
+                },
+                fixture.Binding).Code);
 
         var actionCall = fixture.Call with { Capability = SidecarCapabilityKind.Action };
         Assert.True(fixture.Session.BeginCall(actionCall, SidecarCapabilityKind.Action, request.Action, request.Action.ByteLength, fixture.Now).Accepted);
@@ -259,8 +351,20 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Equal(
             SidecarCapabilityErrors.TerminalAlreadyCalled,
             fixture.Session.RecordTerminal(actionCall.CallId).Code);
+        Assert.True(fixture.Session.CompleteCall(actionCall.CallId).Accepted);
         Assert.Equal("sample.input", terminalRequest.EffectiveAction.TypeIdentity);
         Assert.NotEqual(request.Action.Value.GetProperty("value").GetInt32(), terminalRequest.EffectiveAction.Value.GetProperty("value").GetInt32());
+
+        var nestedInvalid = response with
+        {
+            Continuation = response.Continuation! with
+            {
+                Outcome = response.Outcome with { Result = Payload("wrong.result", new { value = 4 }) },
+            },
+        };
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionResponse(request, nestedInvalid, fixture.Binding).Code);
     }
 
     [Fact]
@@ -274,6 +378,7 @@ public sealed class SidecarCapabilityTransportTests
             SidecarActionInvocationKind.Run,
             descriptor,
             Payload("sample.input", new { value = 1 }),
+            null,
             new ActionPipelineSnapshot("graph", []),
             new SidecarCancellationIdentity(fixture.Call.CancellationId, "cancel", fixture.Call.Deadline),
             null,
