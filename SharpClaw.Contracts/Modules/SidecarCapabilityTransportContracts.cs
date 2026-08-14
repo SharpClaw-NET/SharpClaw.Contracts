@@ -180,6 +180,7 @@ public sealed class SidecarCapabilitySession
     private readonly HashSet<Guid> _completedCalls = [];
     private readonly HashSet<string> _nonces = new(StringComparer.Ordinal);
     private readonly Dictionary<Guid, Guid> _terminalCalls = [];
+    private readonly Dictionary<Guid, SidecarTerminalReceipt> _terminalReceipts = [];
     private readonly HashSet<Guid> _usedTerminalAuthorities = [];
     private long _lastSequence;
     private int _inFlight;
@@ -305,7 +306,10 @@ public sealed class SidecarCapabilitySession
         }
     }
 
-    public SidecarCapabilityValidationResult RecordTerminal(Guid callId, Guid authorityId)
+    public SidecarCapabilityValidationResult RecordTerminal(
+        Guid callId,
+        Guid authorityId,
+        SidecarTerminalReceipt receipt)
     {
         lock (_sync)
         {
@@ -315,6 +319,12 @@ public sealed class SidecarCapabilitySession
                     "The sidecar capability session is disconnected.");
 
             if (authorityId == Guid.Empty ||
+                receipt is null ||
+                receipt.CallId != callId ||
+                string.IsNullOrWhiteSpace(receipt.ReceiptId) ||
+                receipt.Attempt < 1 ||
+                string.IsNullOrWhiteSpace(receipt.IdempotencyScope) ||
+                string.IsNullOrWhiteSpace(receipt.ContentHash) ||
                 !_calls.TryGetValue(callId, out var capability) ||
                 capability != SidecarCapabilityKind.Action)
                 return SidecarCapabilityValidationResult.Reject(
@@ -327,8 +337,15 @@ public sealed class SidecarCapabilitySession
                     "The call already recorded a terminal outcome.");
 
             _terminalCalls.Add(callId, authorityId);
+            _terminalReceipts.Add(callId, receipt);
             return SidecarCapabilityValidationResult.Accept();
         }
+    }
+
+    public bool TryGetTerminalReceipt(Guid callId, out SidecarTerminalReceipt? receipt)
+    {
+        lock (_sync)
+            return _terminalReceipts.TryGetValue(callId, out receipt);
     }
 
     public SidecarCapabilityValidationResult CompleteCall(Guid callId, int terminalCallCount)
@@ -365,6 +382,7 @@ public sealed class SidecarCapabilitySession
 
             _completedCalls.Add(callId);
             _terminalCalls.Remove(callId);
+            _terminalReceipts.Remove(callId);
             _inFlight--;
             return SidecarCapabilityValidationResult.Accept();
         }
@@ -377,6 +395,7 @@ public sealed class SidecarCapabilitySession
             _disconnected = true;
             _calls.Clear();
             _terminalCalls.Clear();
+            _terminalReceipts.Clear();
             _inFlight = 0;
         }
     }
@@ -944,11 +963,13 @@ public static class SidecarCapabilityTransportValidation
     public static SidecarCapabilityValidationResult ValidateActionResponse(
         SidecarActionCapabilityRequest request,
         SidecarActionCapabilityResponse response,
-        SidecarCapabilitySessionBinding binding)
+        SidecarCapabilitySessionBinding binding,
+        SidecarCapabilitySession session)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(response);
         ArgumentNullException.ThrowIfNull(binding);
+        ArgumentNullException.ThrowIfNull(session);
 
         if (response.Outcome is null ||
             response.SafeFailure is null ||
@@ -960,11 +981,36 @@ public static class SidecarCapabilityTransportValidation
                 "The action response does not bind to the action request.");
         }
 
+        var expectedReceipt = request.Continuation?.Receipt;
+        if (response.Outcome.TerminalCallCount == 1)
+        {
+            session.TryGetTerminalReceipt(request.Call.CallId, out var recordedReceipt);
+            if (recordedReceipt is not null)
+            {
+                if (expectedReceipt is not null && !SameReceipt(expectedReceipt, recordedReceipt))
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.InvalidResponse,
+                        "The action response receipt differs from the recorded host receipt.");
+                }
+
+                expectedReceipt ??= recordedReceipt;
+            }
+
+            if (expectedReceipt is null)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidResponse,
+                    "The action response has no host receipt authority.");
+            }
+        }
+
         var outcomeResult = ValidateActionOutcome(
             response.Outcome,
             request.Descriptor,
             binding,
-            request.Call.CallId);
+            request.Call.CallId,
+            expectedReceipt);
         if (!outcomeResult.Accepted)
             return outcomeResult;
 
@@ -990,7 +1036,8 @@ public static class SidecarCapabilityTransportValidation
                 response.Continuation.Outcome,
                 request.Descriptor,
                 binding,
-                request.Call.CallId);
+                request.Call.CallId,
+                expectedReceipt);
             if (!nestedOutcome.Accepted)
                 return nestedOutcome;
         }
@@ -1187,7 +1234,8 @@ public static class SidecarCapabilityTransportValidation
         SidecarActionOutcomeEnvelope outcome,
         SidecarActionDescriptorIdentity descriptor,
         SidecarCapabilitySessionBinding binding,
-        Guid callId)
+        Guid callId,
+        SidecarTerminalReceipt? expectedReceipt)
     {
         if (outcome.TerminalCallCount is < 0 or > 1 ||
             outcome.SafeFailure is null ||
@@ -1225,16 +1273,28 @@ public static class SidecarCapabilityTransportValidation
             return payloadResult;
 
         if (outcome.Result is not null &&
-            !string.Equals(outcome.Result.TypeIdentity, descriptor.ResultTypeIdentity, StringComparison.Ordinal))
+            (!string.Equals(outcome.Result.TypeIdentity, descriptor.ResultTypeIdentity, StringComparison.Ordinal) ||
+             outcome.Result.SchemaVersion != descriptor.ResultSchemaVersion))
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidResponse,
                 "The action result type does not match the descriptor.");
         }
 
-        return outcome.TerminalCallCount == 1
-            ? ValidateReceipt(outcome.Receipt, callId, descriptor, required: true)
-            : SidecarCapabilityValidationResult.Accept();
+        if (outcome.TerminalCallCount == 1)
+        {
+            var receiptResult = ValidateReceipt(outcome.Receipt, callId, descriptor, required: true);
+            if (!receiptResult.Accepted ||
+                expectedReceipt is null ||
+                !SameReceipt(outcome.Receipt!, expectedReceipt))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidResponse,
+                    "The action receipt does not match host receipt authority.");
+            }
+        }
+
+        return SidecarCapabilityValidationResult.Accept();
     }
 
     private static bool ValidateHostTerminalAuthority(
@@ -1283,10 +1343,22 @@ public static class SidecarCapabilityTransportValidation
         SidecarActionOutcomeEnvelope outcome,
         SidecarActionDescriptorIdentity descriptor,
         SidecarCapabilitySessionBinding binding,
-        Guid callId)
+        Guid callId,
+        SidecarTerminalReceipt? expectedReceipt)
     {
-        return ValidateActionOutcome(outcome, descriptor, binding, callId);
+        return ValidateActionOutcome(outcome, descriptor, binding, callId, expectedReceipt);
     }
+
+    private static bool SameReceipt(
+        SidecarTerminalReceipt left,
+        SidecarTerminalReceipt right) =>
+        string.Equals(left.ReceiptId, right.ReceiptId, StringComparison.Ordinal) &&
+        left.ActionKey == right.ActionKey &&
+        left.ActionVersion == right.ActionVersion &&
+        left.CallId == right.CallId &&
+        left.Attempt == right.Attempt &&
+        string.Equals(left.IdempotencyScope, right.IdempotencyScope, StringComparison.Ordinal) &&
+        string.Equals(left.ContentHash, right.ContentHash, StringComparison.OrdinalIgnoreCase);
 
     private static bool SameSafeFailure(
         SidecarSafeFailureIdentity left,

@@ -63,7 +63,17 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(fixture.Session.BeginCall(fixture.Call, SidecarCapabilityKind.Storage, null, 0, fixture.Now).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.InvalidBinding,
-            fixture.Session.RecordTerminal(fixture.Call.CallId, Guid.NewGuid()).Code);
+            fixture.Session.RecordTerminal(
+                fixture.Call.CallId,
+                Guid.NewGuid(),
+                new SidecarTerminalReceipt(
+                    "storage-receipt",
+                    new SharpClawActionKey("storage"),
+                    1,
+                    fixture.Call.CallId,
+                    1,
+                    "storage-scope",
+                    "storage-hash")).Code);
         Assert.True(fixture.Session.CompleteCall(fixture.Call.CallId, 0).Accepted);
 
         var reusedCall = fixture.Call with { ReplayNonce = "new-nonce", Sequence = 2 };
@@ -103,10 +113,18 @@ public sealed class SidecarCapabilityTransportTests
             SidecarCapabilityErrors.TerminalAlreadyCalled,
             fixture.Session.CompleteCall(terminalCall.CallId, 1).Code);
         var authorityId = Guid.NewGuid();
-        Assert.True(fixture.Session.RecordTerminal(terminalCall.CallId, authorityId).Accepted);
+        var terminalReceipt = new SidecarTerminalReceipt(
+            "terminal-receipt",
+            new SharpClawActionKey("sample.action"),
+            1,
+            terminalCall.CallId,
+            1,
+            "terminal-scope",
+            "terminal-hash");
+        Assert.True(fixture.Session.RecordTerminal(terminalCall.CallId, authorityId, terminalReceipt).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.TerminalAlreadyCalled,
-            fixture.Session.RecordTerminal(terminalCall.CallId, authorityId).Code);
+            fixture.Session.RecordTerminal(terminalCall.CallId, authorityId, terminalReceipt).Code);
         Assert.True(fixture.Session.CompleteCall(terminalCall.CallId, 1).Accepted);
     }
 
@@ -271,7 +289,43 @@ public sealed class SidecarCapabilityTransportTests
             resultIdentity, outcome, continuationResponse, fixture.SafeFailure, true);
 
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionRequest(request, fixture.Binding, fixture.Now).Accepted);
-        Assert.True(SidecarCapabilityTransportValidation.ValidateActionResponse(request, response, fixture.Binding).Accepted);
+        var actionCall = fixture.Call with { Capability = SidecarCapabilityKind.Action };
+        Assert.True(fixture.Session.BeginCall(actionCall, SidecarCapabilityKind.Action, request.Action, request.Action.ByteLength, fixture.Now).Accepted);
+        Assert.True(fixture.Session.RecordTerminal(actionCall.CallId, Guid.NewGuid(), receipt).Accepted);
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionResponse(request, response, fixture.Binding, fixture.Session).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionResponse(
+                request,
+                response with { Outcome = outcome with { Receipt = receipt with { Attempt = 2 } } },
+                fixture.Binding,
+                fixture.Session).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionResponse(
+                request,
+                response with
+                {
+                    Continuation = continuationResponse with
+                    {
+                        Outcome = outcome with { Receipt = receipt with { ContentHash = "nested-forged" } },
+                    },
+                },
+                fixture.Binding,
+                fixture.Session).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionResponse(
+                request,
+                response with
+                {
+                    Continuation = continuationResponse with
+                    {
+                        Outcome = outcome with { Result = outcomePayload with { SchemaVersion = 2 } },
+                    },
+                },
+                fixture.Binding,
+                fixture.Session).Code);
 
         var terminalRequest = new SidecarActionTerminalTransportRequest(
             request.Call,
@@ -437,7 +491,8 @@ public sealed class SidecarCapabilityTransportTests
                 {
                     Outcome = outcome with { Result = outcomePayload with { SchemaVersion = 2 } },
                 },
-                fixture.Binding).Code);
+                fixture.Binding,
+                fixture.Session).Code);
         Assert.Equal(
             SidecarCapabilityErrors.InvalidResponse,
             SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
@@ -476,12 +531,12 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 fixture.Binding).Code);
 
-        var actionCall = fixture.Call with { Capability = SidecarCapabilityKind.Action };
-        Assert.True(fixture.Session.BeginCall(actionCall, SidecarCapabilityKind.Action, request.Action, request.Action.ByteLength, fixture.Now).Accepted);
-        Assert.True(fixture.Session.RecordTerminal(actionCall.CallId, terminalRequest.Authority.AuthorityId).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.TerminalAlreadyCalled,
-            fixture.Session.RecordTerminal(actionCall.CallId, terminalRequest.Authority.AuthorityId).Code);
+            fixture.Session.RecordTerminal(actionCall.CallId, terminalRequest.Authority.AuthorityId, receipt).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.TerminalAlreadyCalled,
+            fixture.Session.RecordTerminal(actionCall.CallId, terminalRequest.Authority.AuthorityId, receipt).Code);
         Assert.True(fixture.Session.CompleteCall(actionCall.CallId, 1).Accepted);
         Assert.Equal("sample.input", terminalRequest.EffectiveAction.TypeIdentity);
         Assert.NotEqual(request.Action.Value.GetProperty("value").GetInt32(), terminalRequest.EffectiveAction.Value.GetProperty("value").GetInt32());
@@ -491,7 +546,8 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionResponse(
             zeroRequest,
             response with { ResultIdentity = resultIdentity, Outcome = zeroOutcome, Continuation = null },
-            fixture.Binding).Accepted);
+            fixture.Binding,
+            fixture.Session).Accepted);
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionResponse(
             zeroRequest,
             response with
@@ -505,7 +561,8 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 Continuation = null,
             },
-            fixture.Binding).Accepted);
+            fixture.Binding,
+            fixture.Session).Accepted);
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionResponse(
             zeroRequest,
             response with
@@ -520,7 +577,8 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 Continuation = null,
             },
-            fixture.Binding).Accepted);
+            fixture.Binding,
+            fixture.Session).Accepted);
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionResponse(
             zeroRequest,
             response with
@@ -534,7 +592,8 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 Continuation = null,
             },
-            fixture.Binding).Accepted);
+            fixture.Binding,
+            fixture.Session).Accepted);
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionResponse(
             zeroRequest,
             response with
@@ -555,7 +614,8 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 Continuation = null,
             },
-            fixture.Binding).Accepted);
+            fixture.Binding,
+            fixture.Session).Accepted);
 
         var nestedInvalid = response with
         {
@@ -566,7 +626,7 @@ public sealed class SidecarCapabilityTransportTests
         };
         Assert.Equal(
             SidecarCapabilityErrors.InvalidResponse,
-            SidecarCapabilityTransportValidation.ValidateActionResponse(request, nestedInvalid, fixture.Binding).Code);
+            SidecarCapabilityTransportValidation.ValidateActionResponse(request, nestedInvalid, fixture.Binding, fixture.Session).Code);
     }
 
     [Fact]
@@ -595,13 +655,14 @@ public sealed class SidecarCapabilityTransportTests
 
         Assert.Equal(
             SidecarCapabilityErrors.InvalidResponse,
-            SidecarCapabilityTransportValidation.ValidateActionResponse(request, response, fixture.Binding).Code);
+            SidecarCapabilityTransportValidation.ValidateActionResponse(request, response, fixture.Binding, fixture.Session).Code);
         Assert.Equal(
             SidecarCapabilityErrors.InvalidResponse,
             SidecarCapabilityTransportValidation.ValidateActionResponse(
                 request,
                 response with { ResultIdentity = response.ResultIdentity! with { CallId = fixture.Call.CallId, ActionKey = new SharpClawActionKey("other.action") } },
-                fixture.Binding).Code);
+                fixture.Binding,
+                fixture.Session).Code);
 
         var tamperedResult = response with
         {
@@ -612,8 +673,79 @@ public sealed class SidecarCapabilityTransportTests
             },
         };
         Assert.Equal(
-            SidecarCapabilityErrors.InvalidPayload,
-            SidecarCapabilityTransportValidation.ValidateActionResponse(request, tamperedResult, fixture.Binding).Code);
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionResponse(request, tamperedResult, fixture.Binding, fixture.Session).Code);
+    }
+
+    [Fact]
+    public void Action_response_uses_recorded_duplex_receipt_when_request_has_no_receipt()
+    {
+        var fixture = CreateFixture();
+        var key = new SharpClawActionKey("duplex.action");
+        var descriptor = new SidecarActionDescriptorIdentity(
+            key,
+            1,
+            "duplex",
+            "duplex.input",
+            "input-schema",
+            1,
+            "duplex.result",
+            "result-schema",
+            1,
+            "duplex-descriptor");
+        var call = fixture.Call with { Capability = SidecarCapabilityKind.Action };
+        var action = Payload("duplex.input", new { value = 1 });
+        var request = new SidecarActionCapabilityRequest(
+            call,
+            SidecarActionInvocationKind.Run,
+            descriptor,
+            action,
+            new ActionPipelineSnapshot("duplex-graph", []),
+            new SidecarCancellationIdentity(call.CancellationId, "duplex-cancel", call.Deadline),
+            null,
+            call.Deadline);
+        var result = Payload("duplex.result", new { value = 2 });
+        var receipt = new SidecarTerminalReceipt(
+            "duplex-receipt",
+            key,
+            1,
+            call.CallId,
+            1,
+            "duplex-scope",
+            "duplex-receipt-hash");
+        var outcome = new SidecarActionOutcomeEnvelope(
+            ActionOutcomeKind.Completed,
+            result,
+            null,
+            null,
+            null,
+            receipt,
+            fixture.SafeFailure,
+            1);
+        var response = new SidecarActionCapabilityResponse(
+            new SidecarActionResultIdentity(Guid.NewGuid(), call.CallId, key, 1, "duplex.result", result.ContentHash),
+            outcome,
+            null,
+            fixture.SafeFailure,
+            true);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionResponse(
+                request,
+                response,
+                fixture.Binding,
+                fixture.Session).Code);
+        Assert.True(fixture.Session.BeginCall(call, SidecarCapabilityKind.Action, action, action.ByteLength, fixture.Now).Accepted);
+        Assert.True(fixture.Session.RecordTerminal(call.CallId, Guid.NewGuid(), receipt).Accepted);
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionResponse(request, response, fixture.Binding, fixture.Session).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionResponse(
+                request,
+                response with { Outcome = outcome with { Receipt = receipt with { IdempotencyScope = "forged-scope" } } },
+                fixture.Binding,
+                fixture.Session).Code);
     }
 
     [Fact]
