@@ -585,8 +585,10 @@ public sealed record SidecarActionDescriptorIdentity(
     string Category,
     string InputTypeIdentity,
     string InputSchemaHash,
+    int InputSchemaVersion,
     string ResultTypeIdentity,
     string ResultSchemaHash,
+    int ResultSchemaVersion,
     string DescriptorHash);
 
 public sealed record SidecarCancellationIdentity(
@@ -663,8 +665,17 @@ public sealed record SidecarHostTerminalAuthority(
     SharpClawActionKey ActionKey,
     int ActionVersion,
     string DescriptorHash,
-    string EffectiveActionHash,
+    string EffectiveActionTypeIdentity,
+    int EffectiveActionSchemaVersion,
+    string EffectiveActionContentHash,
+    int EffectiveActionByteLength,
     string ReceiptId,
+    SharpClawActionKey ReceiptActionKey,
+    int ReceiptActionVersion,
+    Guid ReceiptCallId,
+    int ReceiptAttempt,
+    string ReceiptIdempotencyScope,
+    string ReceiptContentHash,
     DateTimeOffset Deadline,
     DateTimeOffset IssuedAt,
     DateTimeOffset ExpiresAt,
@@ -892,6 +903,7 @@ public static class SidecarCapabilityTransportValidation
         if (!IsValidDescriptor(request.Descriptor) ||
             request.Action is null ||
             !string.Equals(request.Action.TypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
+            request.Action.SchemaVersion != request.Descriptor.InputSchemaVersion ||
             request.Snapshot is null ||
             string.IsNullOrWhiteSpace(request.Snapshot.ContractHash))
         {
@@ -911,14 +923,15 @@ public static class SidecarCapabilityTransportValidation
             (request.Continuation.ContinuationRequestId == Guid.Empty ||
              request.Continuation.Deadline > request.Deadline ||
              (request.Continuation.ReplacementResult is not null &&
-              !string.Equals(
-                  request.Continuation.ReplacementResult.TypeIdentity,
-                  request.Descriptor.ResultTypeIdentity,
-                  StringComparison.Ordinal) ||
-              !ValidateSerializedPayload(
-                  request.Continuation.ReplacementResult,
-                  false,
-                  binding.PayloadLimits.ActionResultBytes).Accepted)))
+              (!string.Equals(
+                   request.Continuation.ReplacementResult.TypeIdentity,
+                   request.Descriptor.ResultTypeIdentity,
+                   StringComparison.Ordinal) ||
+               request.Continuation.ReplacementResult.SchemaVersion != request.Descriptor.ResultSchemaVersion ||
+               !ValidateSerializedPayload(
+                   request.Continuation.ReplacementResult,
+                   false,
+                   binding.PayloadLimits.ActionResultBytes).Accepted))))
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidPayload,
@@ -963,6 +976,7 @@ public static class SidecarCapabilityTransportValidation
              response.ResultIdentity.ActionKey != request.Descriptor.Key ||
              response.ResultIdentity.ActionVersion != request.Descriptor.Version ||
              !string.Equals(response.ResultIdentity.ResultTypeIdentity, request.Descriptor.ResultTypeIdentity, StringComparison.Ordinal) ||
+             response.Outcome.Result.SchemaVersion != request.Descriptor.ResultSchemaVersion ||
              !string.Equals(response.ResultIdentity.ContentHash, response.Outcome.Result.ContentHash, StringComparison.OrdinalIgnoreCase)))
         {
             return SidecarCapabilityValidationResult.Reject(
@@ -1037,6 +1051,8 @@ public static class SidecarCapabilityTransportValidation
             !IsValidDescriptor(request.Descriptor) ||
             request.EffectiveAction is null ||
             request.Receipt is null ||
+            !string.Equals(request.EffectiveAction.TypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
+            request.EffectiveAction.SchemaVersion != request.Descriptor.InputSchemaVersion ||
             request.Receipt.CallId != request.Call.CallId ||
             request.Receipt.ActionKey != request.Descriptor.Key ||
             request.Receipt.ActionVersion != request.Descriptor.Version)
@@ -1094,6 +1110,7 @@ public static class SidecarCapabilityTransportValidation
              response.ResultIdentity.ActionVersion != request.Descriptor.Version ||
              !string.Equals(response.ResultIdentity.ResultTypeIdentity, request.Descriptor.ResultTypeIdentity, StringComparison.Ordinal) ||
              !string.Equals(response.Execution.Result.TypeIdentity, request.Descriptor.ResultTypeIdentity, StringComparison.Ordinal) ||
+             response.Execution.Result.SchemaVersion != request.Descriptor.ResultSchemaVersion ||
              !string.Equals(response.ResultIdentity.ContentHash, response.Execution.Result.ContentHash, StringComparison.OrdinalIgnoreCase)))
         {
             return SidecarCapabilityValidationResult.Reject(
@@ -1119,8 +1136,10 @@ public static class SidecarCapabilityTransportValidation
         !string.IsNullOrWhiteSpace(descriptor.Category) &&
         !string.IsNullOrWhiteSpace(descriptor.InputTypeIdentity) &&
         !string.IsNullOrWhiteSpace(descriptor.InputSchemaHash) &&
+        descriptor.InputSchemaVersion >= 1 &&
         !string.IsNullOrWhiteSpace(descriptor.ResultTypeIdentity) &&
         !string.IsNullOrWhiteSpace(descriptor.ResultSchemaHash) &&
+        descriptor.ResultSchemaVersion >= 1 &&
         !string.IsNullOrWhiteSpace(descriptor.DescriptorHash);
 
     private static bool MatchesBinding(
@@ -1238,9 +1257,20 @@ public static class SidecarCapabilityTransportValidation
             authority.ActionVersion == request.Descriptor.Version &&
             string.Equals(authority.DescriptorHash, request.Descriptor.DescriptorHash, StringComparison.Ordinal) &&
             request.EffectiveAction is not null &&
-            string.Equals(authority.EffectiveActionHash, request.EffectiveAction.ContentHash, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(request.EffectiveAction.TypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) &&
+            request.EffectiveAction.SchemaVersion == request.Descriptor.InputSchemaVersion &&
+            string.Equals(authority.EffectiveActionTypeIdentity, request.EffectiveAction.TypeIdentity, StringComparison.Ordinal) &&
+            authority.EffectiveActionSchemaVersion == request.EffectiveAction.SchemaVersion &&
+            string.Equals(authority.EffectiveActionContentHash, request.EffectiveAction.ContentHash, StringComparison.OrdinalIgnoreCase) &&
+            authority.EffectiveActionByteLength == request.EffectiveAction.ByteLength &&
             request.Receipt is not null &&
             string.Equals(authority.ReceiptId, request.Receipt.ReceiptId, StringComparison.Ordinal) &&
+            authority.ReceiptActionKey == request.Receipt.ActionKey &&
+            authority.ReceiptActionVersion == request.Receipt.ActionVersion &&
+            authority.ReceiptCallId == request.Receipt.CallId &&
+            authority.ReceiptAttempt == request.Receipt.Attempt &&
+            string.Equals(authority.ReceiptIdempotencyScope, request.Receipt.IdempotencyScope, StringComparison.Ordinal) &&
+            string.Equals(authority.ReceiptContentHash, request.Receipt.ContentHash, StringComparison.OrdinalIgnoreCase) &&
             authority.Deadline == request.Deadline &&
             authority.IssuedAt <= now &&
             authority.ExpiresAt >= request.Deadline &&

@@ -240,7 +240,7 @@ public sealed class SidecarCapabilityTransportTests
         var key = new SharpClawActionKey("sample.action");
         var snapshot = new ActionPipelineSnapshot("graph-hash", [new ActionCapabilityGrant(key, 1, ActionInterceptionCapabilities.Inspect)]);
         var descriptor = new SidecarActionDescriptorIdentity(
-            key, 1, "sample", "sample.input", "input-schema-hash", "sample.result", "result-schema-hash", "descriptor-hash");
+            key, 1, "sample", "sample.input", "input-schema-hash", 1, "sample.result", "result-schema-hash", 1, "descriptor-hash");
         var receipt = new SidecarTerminalReceipt("receipt-1", key, 1, fixture.Call.CallId, 1, "sample.scope", "receipt-hash");
         var replacement = Payload("sample.input", new { value = 2 });
         var replacementResult = Payload("sample.result", new { value = 2 });
@@ -290,8 +290,17 @@ public sealed class SidecarCapabilityTransportTests
                 descriptor.Key,
                 descriptor.Version,
                 descriptor.DescriptorHash,
+                replacement.TypeIdentity,
+                replacement.SchemaVersion,
                 replacement.ContentHash,
+                replacement.ByteLength,
                 receipt.ReceiptId,
+                receipt.ActionKey,
+                receipt.ActionVersion,
+                receipt.CallId,
+                receipt.Attempt,
+                receipt.IdempotencyScope,
+                receipt.ContentHash,
                 request.Deadline,
                 fixture.Now.AddMinutes(-1),
                 request.Deadline,
@@ -360,6 +369,87 @@ public sealed class SidecarCapabilityTransportTests
                 fixture.Binding,
                 fixture.Now,
                 _ => true).Code);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with { EffectiveAction = replacement with { TypeIdentity = "other.input" } },
+                fixture.Binding,
+                fixture.Now,
+                _ => true).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with { EffectiveAction = replacement with { SchemaVersion = 2 } },
+                fixture.Binding,
+                fixture.Now,
+                _ => true).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with { Receipt = receipt with { Attempt = 2 } },
+                fixture.Binding,
+                fixture.Now,
+                _ => true).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with { Receipt = receipt with { IdempotencyScope = "other.scope" } },
+                fixture.Binding,
+                fixture.Now,
+                _ => true).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with { Receipt = receipt with { ContentHash = "other-receipt-hash" } },
+                fixture.Binding,
+                fixture.Now,
+                _ => true).Code);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidPayload,
+            SidecarCapabilityTransportValidation.ValidateActionRequest(
+                request with { Action = request.Action with { SchemaVersion = 2 } },
+                fixture.Binding,
+                fixture.Now).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidPayload,
+            SidecarCapabilityTransportValidation.ValidateActionRequest(
+                request with
+                {
+                    Continuation = request.Continuation with
+                    {
+                        ReplacementResult = replacementResult with { SchemaVersion = 2 },
+                    },
+                },
+                fixture.Binding,
+                fixture.Now).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionResponse(
+                request,
+                response with
+                {
+                    Outcome = outcome with { Result = outcomePayload with { SchemaVersion = 2 } },
+                },
+                fixture.Binding).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                terminalResponse with
+                {
+                    Execution = new SidecarTerminalExecutionResult(
+                        outcomePayload with { SchemaVersion = 2 },
+                        null,
+                        true),
+                },
+                fixture.Binding).Code);
         var wrongTerminalResult = Payload("wrong.result", new { value = 5 });
         Assert.Equal(
             SidecarCapabilityErrors.InvalidResponse,
@@ -484,7 +574,7 @@ public sealed class SidecarCapabilityTransportTests
     {
         var fixture = CreateFixture();
         var key = new SharpClawActionKey("sample.action");
-        var descriptor = new SidecarActionDescriptorIdentity(key, 1, "sample", "sample.input", "input", "sample.result", "result", "descriptor");
+        var descriptor = new SidecarActionDescriptorIdentity(key, 1, "sample", "sample.input", "input", 1, "sample.result", "result", 1, "descriptor");
         var request = new SidecarActionCapabilityRequest(
             fixture.Call with { Capability = SidecarCapabilityKind.Action },
             SidecarActionInvocationKind.Run,
