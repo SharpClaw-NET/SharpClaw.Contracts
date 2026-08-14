@@ -142,7 +142,11 @@ public sealed class SidecarCapabilityTransportTests
             HasIrreversibleEffects: false,
             new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "sample.action"),
             ContinuationPolicy: null,
-            TimeSpan.FromSeconds(5));
+            TimeSpan.FromSeconds(5))
+        {
+            InputSchema = new JsonSchemaReference("sample.action.input", 1, "sample-input-schema"),
+            ResultSchema = new JsonSchemaReference("sample.action.result", 1, "sample-result-schema"),
+        };
         var payload = Payload(typeof(string).AssemblyQualifiedName!, "input");
         var actionCall = fixture.Call with
         {
@@ -181,6 +185,10 @@ public sealed class SidecarCapabilityTransportTests
             typeof(string).AssemblyQualifiedName!,
             typeof(string).AssemblyQualifiedName!,
             HostActionEntryAuthorityValidator.ComputeDescriptorHash(descriptor),
+            descriptor.InputSchema.ContentHash!,
+            descriptor.InputSchema.Version,
+            descriptor.ResultSchema.ContentHash!,
+            descriptor.ResultSchema.Version,
             payload.ContentHash,
             payload.ByteLength,
             deadline,
@@ -205,6 +213,17 @@ public sealed class SidecarCapabilityTransportTests
             request,
             now,
             candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Accepted);
+        var changedCallAuthority = authority with { ReplayNonce = "wrong-nonce" };
+        changedCallAuthority = changedCallAuthority with
+        {
+            Proof = HostActionEntryAuthorityValidator.ComputeAuthorityHash(changedCallAuthority),
+        };
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.ValidateHostActionEntry(
+                request with { Authority = changedCallAuthority },
+                now,
+                candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Code);
         Assert.False(fixture.Session.ValidateHostActionEntry(
             request with { Caller = new RequestPrincipal("attacker") },
             now,

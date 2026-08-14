@@ -106,7 +106,11 @@ public sealed class SimpleKernelContractTests
             HasIrreversibleEffects: false,
             new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "demo.entry"),
             ContinuationPolicy: null,
-            TimeSpan.FromSeconds(5));
+            TimeSpan.FromSeconds(5))
+        {
+            InputSchema = new JsonSchemaReference("demo.entry.input", 1, "demo-entry-input-schema"),
+            ResultSchema = new JsonSchemaReference("demo.entry.result", 1, "demo-entry-result-schema"),
+        };
         var caller = new RequestPrincipal("caller-1", Roles: new HashSet<string>(["reader"]));
         var features = new ExtensionFeatureSet([]);
         var traceId = Guid.NewGuid();
@@ -159,7 +163,11 @@ public sealed class SimpleKernelContractTests
             HasIrreversibleEffects: false,
             new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "demo.entry"),
             ContinuationPolicy: null,
-            TimeSpan.FromSeconds(5));
+            TimeSpan.FromSeconds(5))
+        {
+            InputSchema = new JsonSchemaReference("demo.entry.input", 1, "demo-entry-input-schema"),
+            ResultSchema = new JsonSchemaReference("demo.entry.result", 1, "demo-entry-result-schema"),
+        };
         var caller = new RequestPrincipal("caller-1", Roles: new HashSet<string>(["reader"]));
         var features = new ExtensionFeatureSet([]);
         var traceId = Guid.NewGuid();
@@ -214,6 +222,69 @@ public sealed class SimpleKernelContractTests
         {
             Authority = request.Authority with { Proof = "forged-proof" },
         }).Validate(now, HostProof).Accepted);
+        var changedSchemaAuthority = request.Authority with
+        {
+            InputSchemaVersion = request.Authority.InputSchemaVersion + 1,
+        };
+        changedSchemaAuthority = changedSchemaAuthority with
+        {
+            Proof = HostActionEntryAuthorityValidator.ComputeAuthorityHash(changedSchemaAuthority),
+        };
+        Assert.False((request with { Authority = changedSchemaAuthority }).Validate(
+            now,
+            authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
+    }
+
+    [Fact]
+    public void HostActionEntryUsesSidecarSerializationForRecordPayloads()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var descriptor = new ActionDescriptor<EntryRecordAction, string>(
+            new SharpClawActionKey("demo.record-entry"),
+            1,
+            "demo",
+            ActionInterceptionCapabilities.Inspect,
+            ContainsSensitiveData: false,
+            HasIrreversibleEffects: false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "demo.record-entry"),
+            ContinuationPolicy: null,
+            TimeSpan.FromSeconds(5))
+        {
+            InputSchema = new JsonSchemaReference("demo.record-entry.input", 2, "record-entry-input-schema"),
+            ResultSchema = new JsonSchemaReference("demo.record-entry.result", 3, "record-entry-result-schema"),
+        };
+        var action = new EntryRecordAction("InputValue");
+        var caller = new RequestPrincipal("caller-1");
+        var features = ExtensionFeatureSet.Empty;
+        var traceId = Guid.NewGuid();
+        var idempotencyKey = Guid.NewGuid();
+        var deadline = now.AddMinutes(1);
+        var request = new HostActionEntryRequest<EntryRecordAction, string>(
+            descriptor,
+            action,
+            caller,
+            features,
+            traceId,
+            idempotencyKey,
+            deadline,
+            CreateHostActionAuthority(
+                descriptor,
+                action,
+                caller,
+                features,
+                traceId,
+                idempotencyKey,
+                deadline,
+                now));
+        var defaultBytes = JsonSerializer.SerializeToUtf8Bytes(action);
+        var transportBytes = SidecarCapabilityTransportCodec.Serialize(action);
+
+        Assert.NotEqual(defaultBytes, transportBytes);
+        Assert.Equal(2, request.Authority.InputSchemaVersion);
+        Assert.Equal(3, request.Authority.ResultSchemaVersion);
+        Assert.True(request.Validate(
+            now,
+            authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
     }
 
     private static HostActionEntryAuthority CreateHostActionAuthority<TAction, TResult>(
@@ -226,7 +297,7 @@ public sealed class SimpleKernelContractTests
         DateTimeOffset deadline,
         DateTimeOffset now)
     {
-        var actionBytes = JsonSerializer.SerializeToUtf8Bytes(action, JsonOptions);
+        var actionBytes = SidecarCapabilityTransportCodec.Serialize(action);
         var authority = new HostActionEntryAuthority(
             "module-a",
             "graph-a",
@@ -246,6 +317,10 @@ public sealed class SimpleKernelContractTests
             typeof(TAction).AssemblyQualifiedName!,
             typeof(TResult).AssemblyQualifiedName!,
             HostActionEntryAuthorityValidator.ComputeDescriptorHash(descriptor),
+            descriptor.InputSchema!.ContentHash!,
+            descriptor.InputSchema.Version,
+            descriptor.ResultSchema!.ContentHash!,
+            descriptor.ResultSchema.Version,
             Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(actionBytes)),
             actionBytes.Length,
             deadline,
@@ -273,6 +348,8 @@ public sealed class SimpleKernelContractTests
                 new RecordedOutcome<TResult>(ActionOutcomeKind.Completed));
         }
     }
+
+    private sealed record EntryRecordAction(string PascalCaseValue);
 
     private sealed record RecordedOutcome<TResult>(ActionOutcomeKind Kind) : IActionOutcome<TResult>
     {

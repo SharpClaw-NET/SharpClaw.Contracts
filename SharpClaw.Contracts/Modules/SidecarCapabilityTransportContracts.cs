@@ -177,6 +177,7 @@ public sealed class SidecarCapabilitySession
     private readonly Func<SidecarCapabilityAuthenticationAuthority, bool> _authenticate;
     private readonly Func<string, bool> _registerAuthenticationNonce;
     private readonly Dictionary<Guid, SidecarCapabilityKind> _calls = [];
+    private readonly Dictionary<Guid, SidecarCapabilityCallIdentity> _callIdentities = [];
     private readonly Dictionary<Guid, SidecarSerializedPayload?> _callPayloads = [];
     private readonly HashSet<Guid> _completedCalls = [];
     private readonly HashSet<string> _nonces = new(StringComparer.Ordinal);
@@ -253,9 +254,18 @@ public sealed class SidecarCapabilitySession
                 authority.Deadline > Binding.ExpiresAt ||
                 !_calls.TryGetValue(authority.CallId, out var capability) ||
                 capability != SidecarCapabilityKind.Action ||
+                !_callIdentities.TryGetValue(authority.CallId, out var activeCall) ||
+                activeCall.SessionId != authority.SessionId ||
+                activeCall.RequestId != authority.RequestId ||
+                activeCall.CancellationId != authority.CancellationId ||
+                activeCall.CallId != authority.CallId ||
+                !string.Equals(activeCall.ReplayNonce, authority.ReplayNonce, StringComparison.Ordinal) ||
+                activeCall.Sequence != authority.Sequence ||
+                activeCall.Deadline != authority.Deadline ||
                 !_callPayloads.TryGetValue(authority.CallId, out var callPayload) ||
                 callPayload is null ||
                 !string.Equals(callPayload.TypeIdentity, authority.InputTypeIdentity, StringComparison.Ordinal) ||
+                callPayload.SchemaVersion != authority.InputSchemaVersion ||
                 !string.Equals(callPayload.ContentHash, authority.ActionContentHash, StringComparison.OrdinalIgnoreCase) ||
                 callPayload.ByteLength != authority.ActionByteLength)
             {
@@ -356,6 +366,7 @@ public sealed class SidecarCapabilitySession
                     "The session request call limit was reached.");
 
             _calls.Add(identity.CallId, capability);
+            _callIdentities.Add(identity.CallId, identity);
             _callPayloads.Add(identity.CallId, payload);
             _lastSequence = identity.Sequence;
             _totalCalls++;
@@ -437,6 +448,7 @@ public sealed class SidecarCapabilitySession
                     "Storage calls cannot complete with a terminal callback.");
 
             _calls.Remove(callId);
+            _callIdentities.Remove(callId);
 
             _completedCalls.Add(callId);
             _terminalCalls.Remove(callId);
@@ -453,6 +465,7 @@ public sealed class SidecarCapabilitySession
         {
             _disconnected = true;
             _calls.Clear();
+            _callIdentities.Clear();
             _callPayloads.Clear();
             _terminalCalls.Clear();
             _terminalReceipts.Clear();

@@ -51,6 +51,10 @@ public sealed record ActionDescriptor<TAction, TResult>(
         ContractVersionRange.Exact(1);
 
     public IReadOnlyList<ActionSafePoint> SafePoints { get; init; } = [];
+
+    public JsonSchemaReference? InputSchema { get; init; }
+
+    public JsonSchemaReference? ResultSchema { get; init; }
 }
 
 public enum ActionOutcomeKind
@@ -223,6 +227,10 @@ public sealed record HostActionEntryAuthority(
     string InputTypeIdentity,
     string ResultTypeIdentity,
     string DescriptorHash,
+    string InputSchemaHash,
+    int InputSchemaVersion,
+    string ResultSchemaHash,
+    int ResultSchemaVersion,
     string ActionContentHash,
     int ActionByteLength,
     DateTimeOffset Deadline,
@@ -251,6 +259,10 @@ public sealed record HostActionEntryAuthority(
         !string.IsNullOrWhiteSpace(InputTypeIdentity) &&
         !string.IsNullOrWhiteSpace(ResultTypeIdentity) &&
         !string.IsNullOrWhiteSpace(DescriptorHash) &&
+        !string.IsNullOrWhiteSpace(InputSchemaHash) &&
+        InputSchemaVersion >= 1 &&
+        !string.IsNullOrWhiteSpace(ResultSchemaHash) &&
+        ResultSchemaVersion >= 1 &&
         !string.IsNullOrWhiteSpace(ActionContentHash) &&
         ActionByteLength > 0 &&
         !string.IsNullOrWhiteSpace(Proof);
@@ -316,7 +328,18 @@ public static class HostActionEntryAuthorityValidator
         var inputTypeIdentity = TypeIdentity<TAction>();
         var resultTypeIdentity = TypeIdentity<TResult>();
         var descriptorHash = ComputeDescriptorHash(request.Descriptor);
-        var actionBytes = JsonSerializer.SerializeToUtf8Bytes(request.Action);
+        if (request.Descriptor.InputSchema is null || request.Descriptor.ResultSchema is null ||
+            string.IsNullOrWhiteSpace(request.Descriptor.InputSchema.ContentHash) ||
+            string.IsNullOrWhiteSpace(request.Descriptor.ResultSchema.ContentHash) ||
+            request.Descriptor.InputSchema.Version < 1 ||
+            request.Descriptor.ResultSchema.Version < 1)
+        {
+            return HostActionEntryValidationResult.Reject(
+                "host_action_missing_schema",
+                "The host action descriptor does not contain complete schema authority.");
+        }
+
+        var actionBytes = SidecarCapabilityTransportCodec.Serialize(request.Action);
         var actionContentHash = Convert.ToHexString(SHA256.HashData(actionBytes));
         if (!string.Equals(authority.ActionKey.Value, request.Descriptor.Key.Value, StringComparison.Ordinal) ||
             authority.ActionVersion != request.Descriptor.Version ||
@@ -324,6 +347,10 @@ public static class HostActionEntryAuthorityValidator
             !string.Equals(authority.InputTypeIdentity, inputTypeIdentity, StringComparison.Ordinal) ||
             !string.Equals(authority.ResultTypeIdentity, resultTypeIdentity, StringComparison.Ordinal) ||
             !string.Equals(authority.DescriptorHash, descriptorHash, StringComparison.Ordinal) ||
+            !string.Equals(authority.InputSchemaHash, request.Descriptor.InputSchema.ContentHash, StringComparison.Ordinal) ||
+            authority.InputSchemaVersion != request.Descriptor.InputSchema.Version ||
+            !string.Equals(authority.ResultSchemaHash, request.Descriptor.ResultSchema.ContentHash, StringComparison.Ordinal) ||
+            authority.ResultSchemaVersion != request.Descriptor.ResultSchema.Version ||
             !string.Equals(authority.ActionContentHash, actionContentHash, StringComparison.Ordinal) ||
             authority.ActionByteLength != actionBytes.Length ||
             !SamePrincipal(authority.Caller, request.Caller) ||
@@ -371,6 +398,22 @@ public static class HostActionEntryAuthorityValidator
             ProtocolMinimum = descriptor.ProtocolVersionRange.Minimum,
             ProtocolMaximum = descriptor.ProtocolVersionRange.Maximum,
             SafePoints = descriptor.SafePoints.Select(point => point.ToString()).ToArray(),
+            InputSchema = descriptor.InputSchema is null
+                ? null
+                : new
+                {
+                    descriptor.InputSchema.ContractName,
+                    descriptor.InputSchema.Version,
+                    descriptor.InputSchema.ContentHash,
+                },
+            ResultSchema = descriptor.ResultSchema is null
+                ? null
+                : new
+                {
+                    descriptor.ResultSchema.ContractName,
+                    descriptor.ResultSchema.Version,
+                    descriptor.ResultSchema.ContentHash,
+                },
             InputTypeIdentity = TypeIdentity<TAction>(),
             ResultTypeIdentity = TypeIdentity<TResult>(),
         };
@@ -413,6 +456,10 @@ public static class HostActionEntryAuthorityValidator
             authority.InputTypeIdentity,
             authority.ResultTypeIdentity,
             authority.DescriptorHash,
+            authority.InputSchemaHash,
+            authority.InputSchemaVersion,
+            authority.ResultSchemaHash,
+            authority.ResultSchemaVersion,
             authority.ActionContentHash,
             authority.ActionByteLength,
             authority.Deadline,
