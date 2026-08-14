@@ -94,6 +94,66 @@ public sealed class SimpleKernelContractTests
     }
 
     [Fact]
+    public async Task HostActionEntryCarriesTypedCallerInputAndDeadlineWithoutSnapshotAuthority()
+    {
+        var descriptor = new ActionDescriptor<string, string>(
+            new SharpClawActionKey("demo.entry"),
+            1,
+            "demo",
+            ActionInterceptionCapabilities.Inspect,
+            ContainsSensitiveData: false,
+            HasIrreversibleEffects: false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "demo.entry"),
+            ContinuationPolicy: null,
+            TimeSpan.FromSeconds(5));
+        var request = new HostActionEntryRequest<string, string>(
+            descriptor,
+            "input",
+            new RequestPrincipal("caller-1"),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            DateTimeOffset.UtcNow.AddMinutes(1));
+        var cancellation = new CancellationTokenSource().Token;
+        var entry = new RecordingHostActionEntry();
+
+        var outcome = await entry.InvokeAsync(request, cancellation);
+        var json = JsonSerializer.Serialize(request, JsonOptions);
+
+        Assert.True(request.IsValid(DateTimeOffset.UtcNow));
+        Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
+        Assert.Same(request, entry.Request);
+        Assert.Equal(cancellation, entry.CancellationToken);
+        Assert.DoesNotContain("Snapshot", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("ActionGrants", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("EventGrants", json, StringComparison.Ordinal);
+        Assert.NotNull(typeof(IHostActionEntry).GetMethod(nameof(IHostActionEntry.InvokeAsync)));
+    }
+
+    private sealed class RecordingHostActionEntry : IHostActionEntry
+    {
+        public object? Request { get; private set; }
+        public CancellationToken CancellationToken { get; private set; }
+
+        public ValueTask<IActionOutcome<TResult>> InvokeAsync<TAction, TResult>(
+            HostActionEntryRequest<TAction, TResult> request,
+            CancellationToken cancellationToken = default)
+        {
+            Request = request;
+            CancellationToken = cancellationToken;
+            return ValueTask.FromResult<IActionOutcome<TResult>>(
+                new RecordedOutcome<TResult>(ActionOutcomeKind.Completed));
+        }
+    }
+
+    private sealed record RecordedOutcome<TResult>(ActionOutcomeKind Kind) : IActionOutcome<TResult>
+    {
+        public TResult? Result => default;
+        public ContinuationToken? Continuation => null;
+        public ExecutionError? Error => null;
+        public ActionUncertainty? Uncertainty => null;
+    }
+
+    [Fact]
     public void TypedAndWildcardEventEnvelopesPreserveCompleteDescriptor()
     {
         var key = new SharpClawEventKey("demo.event");

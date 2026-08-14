@@ -188,6 +188,37 @@ public sealed record ActionContext<TAction>(
     ExtensionFeatureSet Features,
     ActionPipelineSnapshot Snapshot);
 
+/// <summary>Typed input supplied to the host action entry.</summary>
+public sealed record HostActionEntryRequest<TAction, TResult>(
+    ActionDescriptor<TAction, TResult> Descriptor,
+    TAction Action,
+    RequestPrincipal Caller,
+    Guid TraceId,
+    Guid IdempotencyKey,
+    DateTimeOffset Deadline)
+{
+    public bool IsValid(DateTimeOffset now) =>
+        Descriptor is not null &&
+        Descriptor.Version >= 1 &&
+        Caller is not null &&
+        !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
+        TraceId != Guid.Empty &&
+        IdempotencyKey != Guid.Empty &&
+        Deadline > now;
+}
+
+/// <summary>Host-owned entry for typed module action calls.</summary>
+/// <remarks>
+/// Implementations resolve the authorized descriptor and pipeline snapshot from host state.
+/// They must not use caller-supplied descriptor capabilities as authorization.
+/// </remarks>
+public interface IHostActionEntry
+{
+    ValueTask<IActionOutcome<TResult>> InvokeAsync<TAction, TResult>(
+        HostActionEntryRequest<TAction, TResult> request,
+        CancellationToken cancellationToken = default);
+}
+
 public interface IActionDispatcher
 {
     ValueTask<IActionOutcome<TResult>> RunAsync<TAction, TResult>(
