@@ -179,7 +179,8 @@ public sealed class SidecarCapabilitySession
     private readonly Dictionary<Guid, SidecarCapabilityKind> _calls = [];
     private readonly HashSet<Guid> _completedCalls = [];
     private readonly HashSet<string> _nonces = new(StringComparer.Ordinal);
-    private readonly HashSet<Guid> _terminalCalls = [];
+    private readonly Dictionary<Guid, Guid> _terminalCalls = [];
+    private readonly HashSet<Guid> _usedTerminalAuthorities = [];
     private long _lastSequence;
     private int _inFlight;
     private int _totalCalls;
@@ -304,7 +305,7 @@ public sealed class SidecarCapabilitySession
         }
     }
 
-    public SidecarCapabilityValidationResult RecordTerminal(Guid callId)
+    public SidecarCapabilityValidationResult RecordTerminal(Guid callId, Guid authorityId)
     {
         lock (_sync)
         {
@@ -313,21 +314,24 @@ public sealed class SidecarCapabilitySession
                     SidecarCapabilityErrors.Disconnected,
                     "The sidecar capability session is disconnected.");
 
-            if (!_calls.TryGetValue(callId, out var capability) || capability != SidecarCapabilityKind.Action)
+            if (authorityId == Guid.Empty ||
+                !_calls.TryGetValue(callId, out var capability) ||
+                capability != SidecarCapabilityKind.Action)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.InvalidBinding,
                     "Only an active action call can record a terminal outcome.");
 
-            if (!_terminalCalls.Add(callId))
+            if (_terminalCalls.ContainsKey(callId) || !_usedTerminalAuthorities.Add(authorityId))
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.TerminalAlreadyCalled,
                     "The call already recorded a terminal outcome.");
 
+            _terminalCalls.Add(callId, authorityId);
             return SidecarCapabilityValidationResult.Accept();
         }
     }
 
-    public SidecarCapabilityValidationResult CompleteCall(Guid callId)
+    public SidecarCapabilityValidationResult CompleteCall(Guid callId, int terminalCallCount)
     {
         lock (_sync)
         {
@@ -341,10 +345,21 @@ public sealed class SidecarCapabilitySession
                     SidecarCapabilityErrors.Duplicate,
                     "The call was already completed or was never active.");
 
-            if (capability == SidecarCapabilityKind.Action && !_terminalCalls.Contains(callId))
+            if (terminalCallCount is < 0 or > 1)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The terminal call count must be zero or one.");
+
+            if (capability == SidecarCapabilityKind.Action &&
+                _terminalCalls.ContainsKey(callId) != (terminalCallCount == 1))
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.TerminalAlreadyCalled,
-                    "The action call cannot complete before one terminal outcome.");
+                    "The action completion count does not match the recorded terminal authority.");
+
+            if (capability == SidecarCapabilityKind.Storage && terminalCallCount != 0)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "Storage calls cannot complete with a terminal callback.");
 
             _calls.Remove(callId);
 
@@ -616,7 +631,6 @@ public sealed record SidecarActionCapabilityRequest(
     SidecarActionInvocationKind Invocation,
     SidecarActionDescriptorIdentity Descriptor,
     SidecarSerializedPayload Action,
-    SidecarSerializedPayload? EffectiveAction,
     ActionPipelineSnapshot Snapshot,
     SidecarCancellationIdentity Cancellation,
     SidecarTerminalContinuationRequest? Continuation,
@@ -631,17 +645,37 @@ public sealed record SidecarActionResultIdentity(
     string ContentHash);
 
 public sealed record SidecarActionCapabilityResponse(
-    SidecarActionResultIdentity ResultIdentity,
+    SidecarActionResultIdentity? ResultIdentity,
     SidecarActionOutcomeEnvelope Outcome,
     SidecarTerminalContinuationResponse? Continuation,
     SidecarSafeFailureIdentity SafeFailure,
     bool Completed);
+
+public sealed record SidecarHostTerminalAuthority(
+    Guid AuthorityId,
+    Guid SessionId,
+    Guid RequestId,
+    Guid CancellationId,
+    Guid CallId,
+    string ModuleId,
+    string GraphId,
+    SidecarActionInvocationKind Invocation,
+    SharpClawActionKey ActionKey,
+    int ActionVersion,
+    string DescriptorHash,
+    string EffectiveActionHash,
+    string ReceiptId,
+    DateTimeOffset Deadline,
+    DateTimeOffset IssuedAt,
+    DateTimeOffset ExpiresAt,
+    string Proof);
 
 public sealed record SidecarActionTerminalTransportRequest(
     SidecarCapabilityCallIdentity Call,
     SidecarActionInvocationKind Invocation,
     SidecarActionDescriptorIdentity Descriptor,
     SidecarSerializedPayload EffectiveAction,
+    SidecarHostTerminalAuthority Authority,
     SidecarTerminalReceipt Receipt,
     SidecarCancellationIdentity Cancellation,
     DateTimeOffset Deadline);
@@ -858,8 +892,6 @@ public static class SidecarCapabilityTransportValidation
         if (!IsValidDescriptor(request.Descriptor) ||
             request.Action is null ||
             !string.Equals(request.Action.TypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
-            request.EffectiveAction is not null &&
-            !string.Equals(request.EffectiveAction.TypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
             request.Snapshot is null ||
             string.IsNullOrWhiteSpace(request.Snapshot.ContractHash))
         {
@@ -871,13 +903,6 @@ public static class SidecarCapabilityTransportValidation
         var payloadResult = ValidateSerializedPayload(
             request.Action,
             true,
-            binding.PayloadLimits.ActionInputBytes);
-        if (!payloadResult.Accepted)
-            return payloadResult;
-
-        payloadResult = ValidateSerializedPayload(
-            request.EffectiveAction,
-            false,
             binding.PayloadLimits.ActionInputBytes);
         if (!payloadResult.Accepted)
             return payloadResult;
@@ -912,39 +937,37 @@ public static class SidecarCapabilityTransportValidation
         ArgumentNullException.ThrowIfNull(response);
         ArgumentNullException.ThrowIfNull(binding);
 
-        if (response.ResultIdentity is null ||
-            response.ResultIdentity.ResultId == Guid.Empty ||
-            response.ResultIdentity.CallId != request.Call.CallId ||
-            response.ResultIdentity.ActionKey != request.Descriptor.Key ||
-            response.ResultIdentity.ActionVersion != request.Descriptor.Version ||
-            response.Outcome is null ||
-            response.Outcome.TerminalCallCount != 1 ||
-            response.Outcome.SafeFailure is null ||
-            !SameSafeFailure(response.Outcome.SafeFailure, binding.SafeFailure) ||
+        if (response.Outcome is null ||
             response.SafeFailure is null ||
             !SameSafeFailure(response.SafeFailure, binding.SafeFailure) ||
-            !response.Completed ||
-            !string.Equals(response.ResultIdentity.ResultTypeIdentity, request.Descriptor.ResultTypeIdentity, StringComparison.Ordinal))
+            !response.Completed)
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidResponse,
                 "The action response does not bind to the action request.");
         }
 
-        var payloadResult = ValidateSerializedPayload(
-            response.Outcome.Result,
-            false,
-            binding.PayloadLimits.ActionResultBytes);
-        if (!payloadResult.Accepted)
-            return payloadResult;
+        var outcomeResult = ValidateActionOutcome(
+            response.Outcome,
+            request.Descriptor,
+            binding,
+            request.Call.CallId);
+        if (!outcomeResult.Accepted)
+            return outcomeResult;
 
-        if (response.Outcome.Result is not null &&
-            (!string.Equals(response.Outcome.Result.TypeIdentity, request.Descriptor.ResultTypeIdentity, StringComparison.Ordinal) ||
+        if (response.Outcome.Result is null && response.ResultIdentity is not null ||
+            response.Outcome.Result is not null &&
+            (response.ResultIdentity is null ||
+             response.ResultIdentity.ResultId == Guid.Empty ||
+             response.ResultIdentity.CallId != request.Call.CallId ||
+             response.ResultIdentity.ActionKey != request.Descriptor.Key ||
+             response.ResultIdentity.ActionVersion != request.Descriptor.Version ||
+             !string.Equals(response.ResultIdentity.ResultTypeIdentity, request.Descriptor.ResultTypeIdentity, StringComparison.Ordinal) ||
              !string.Equals(response.ResultIdentity.ContentHash, response.Outcome.Result.ContentHash, StringComparison.OrdinalIgnoreCase)))
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidResponse,
-                "The action result identity does not match the result payload.");
+                "The action result identity does not match the outcome.");
         }
 
         if (response.Continuation?.Outcome is not null)
@@ -974,25 +997,32 @@ public static class SidecarCapabilityTransportValidation
                 "The action continuation response does not bind to the request.");
         }
 
-        return ValidateReceipt(response.Outcome.Receipt, request.Call.CallId, request.Descriptor);
+        return SidecarCapabilityValidationResult.Accept();
     }
 
     public static SidecarCapabilityValidationResult ValidateActionTerminalRequest(
         SidecarActionCapabilityRequest initiatingRequest,
         SidecarActionTerminalTransportRequest request,
         SidecarCapabilitySessionBinding binding,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        Func<SidecarHostTerminalAuthority, bool> authenticateHostTerminalAuthority)
     {
         ArgumentNullException.ThrowIfNull(initiatingRequest);
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(binding);
+        ArgumentNullException.ThrowIfNull(authenticateHostTerminalAuthority);
 
         if (!MatchesBinding(request.Call, binding, SidecarCapabilityKind.Action) ||
             request.Call != initiatingRequest.Call ||
             request.Invocation != initiatingRequest.Invocation ||
             request.Descriptor != initiatingRequest.Descriptor ||
             request.Cancellation != initiatingRequest.Cancellation ||
-            request.Deadline != initiatingRequest.Deadline)
+            request.Deadline != initiatingRequest.Deadline ||
+            !ValidateHostTerminalAuthority(
+                request,
+                binding,
+                now,
+                authenticateHostTerminalAuthority))
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.SpoofedIdentity,
@@ -1006,26 +1036,24 @@ public static class SidecarCapabilityTransportValidation
             request.Cancellation.ExpiresAt < request.Deadline ||
             !IsValidDescriptor(request.Descriptor) ||
             request.EffectiveAction is null ||
-            !PayloadEquals(
-                request.EffectiveAction,
-                initiatingRequest.EffectiveAction ?? initiatingRequest.Action) ||
             request.Receipt is null ||
             request.Receipt.CallId != request.Call.CallId ||
             request.Receipt.ActionKey != request.Descriptor.Key ||
-            request.Receipt.ActionVersion != request.Descriptor.Version ||
-            initiatingRequest.Continuation is not null &&
-            initiatingRequest.Continuation.Receipt is not null &&
-            request.Receipt != initiatingRequest.Continuation.Receipt)
+            request.Receipt.ActionVersion != request.Descriptor.Version)
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidPayload,
                 "The terminal request does not bind to the effective action.");
         }
 
-        return ValidateSerializedPayload(
+        var payloadResult = ValidateSerializedPayload(
             request.EffectiveAction,
             true,
             binding.PayloadLimits.ActionInputBytes);
+        if (!payloadResult.Accepted)
+            return payloadResult;
+
+        return ValidateReceipt(request.Receipt, request.Call.CallId, request.Descriptor, required: true);
     }
 
     public static SidecarCapabilityValidationResult ValidateActionTerminalResponse(
@@ -1110,10 +1138,15 @@ public static class SidecarCapabilityTransportValidation
     private static SidecarCapabilityValidationResult ValidateReceipt(
         SidecarTerminalReceipt? receipt,
         Guid callId,
-        SidecarActionDescriptorIdentity descriptor)
+        SidecarActionDescriptorIdentity descriptor,
+        bool required = false)
     {
         if (receipt is null)
-            return SidecarCapabilityValidationResult.Accept();
+            return required
+                ? SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidResponse,
+                    "The terminal receipt is required for this outcome.")
+                : SidecarCapabilityValidationResult.Accept();
 
         if (string.IsNullOrWhiteSpace(receipt.ReceiptId) ||
             receipt.CallId != callId ||
@@ -1131,19 +1164,38 @@ public static class SidecarCapabilityTransportValidation
         return SidecarCapabilityValidationResult.Accept();
     }
 
-    private static SidecarCapabilityValidationResult ValidateNestedOutcome(
+    private static SidecarCapabilityValidationResult ValidateActionOutcome(
         SidecarActionOutcomeEnvelope outcome,
         SidecarActionDescriptorIdentity descriptor,
         SidecarCapabilitySessionBinding binding,
         Guid callId)
     {
-        if (outcome.TerminalCallCount != 1 ||
+        if (outcome.TerminalCallCount is < 0 or > 1 ||
             outcome.SafeFailure is null ||
             !SameSafeFailure(outcome.SafeFailure, binding.SafeFailure))
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidResponse,
-                "The nested action outcome has invalid terminal or safe-failure state.");
+                "The action outcome has invalid terminal or safe-failure state.");
+        }
+
+        var hasResult = outcome.Result is not null;
+        var hasError = outcome.Error is not null;
+        var hasUncertainty = outcome.Uncertainty is not null;
+        var validShape = outcome.Kind switch
+        {
+            ActionOutcomeKind.Completed => hasResult && !hasError && !hasUncertainty && outcome.Continuation is null,
+            ActionOutcomeKind.Cancelled => !hasResult && !hasUncertainty && outcome.Continuation is null,
+            ActionOutcomeKind.Deferred => !hasResult && !hasError && !hasUncertainty && outcome.Continuation is not null,
+            ActionOutcomeKind.Failed => !hasResult && hasError && !hasUncertainty && outcome.Continuation is null,
+            ActionOutcomeKind.Uncertain => !hasResult && !hasError && hasUncertainty && outcome.Continuation is null,
+            _ => false,
+        };
+        if (!validShape || outcome.TerminalCallCount == 0 && outcome.Receipt is not null)
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidResponse,
+                "The action outcome shape does not match its outcome kind and terminal stage.");
         }
 
         var payloadResult = ValidateSerializedPayload(
@@ -1158,10 +1210,52 @@ public static class SidecarCapabilityTransportValidation
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidResponse,
-                "The nested action result type does not match the descriptor.");
+                "The action result type does not match the descriptor.");
         }
 
-        return ValidateReceipt(outcome.Receipt, callId, descriptor);
+        return outcome.TerminalCallCount == 1
+            ? ValidateReceipt(outcome.Receipt, callId, descriptor, required: true)
+            : SidecarCapabilityValidationResult.Accept();
+    }
+
+    private static bool ValidateHostTerminalAuthority(
+        SidecarActionTerminalTransportRequest request,
+        SidecarCapabilitySessionBinding binding,
+        DateTimeOffset now,
+        Func<SidecarHostTerminalAuthority, bool> authenticate)
+    {
+        var authority = request.Authority;
+        return authority is not null &&
+            authority.AuthorityId != Guid.Empty &&
+            authority.SessionId == binding.SessionId &&
+            authority.RequestId == binding.RequestId &&
+            authority.CancellationId == binding.CancellationId &&
+            authority.CallId == request.Call.CallId &&
+            string.Equals(authority.ModuleId, binding.ModuleId, StringComparison.Ordinal) &&
+            string.Equals(authority.GraphId, binding.GraphId, StringComparison.Ordinal) &&
+            authority.Invocation == request.Invocation &&
+            authority.ActionKey == request.Descriptor.Key &&
+            authority.ActionVersion == request.Descriptor.Version &&
+            string.Equals(authority.DescriptorHash, request.Descriptor.DescriptorHash, StringComparison.Ordinal) &&
+            request.EffectiveAction is not null &&
+            string.Equals(authority.EffectiveActionHash, request.EffectiveAction.ContentHash, StringComparison.OrdinalIgnoreCase) &&
+            request.Receipt is not null &&
+            string.Equals(authority.ReceiptId, request.Receipt.ReceiptId, StringComparison.Ordinal) &&
+            authority.Deadline == request.Deadline &&
+            authority.IssuedAt <= now &&
+            authority.ExpiresAt >= request.Deadline &&
+            authority.ExpiresAt <= binding.ExpiresAt &&
+            !string.IsNullOrWhiteSpace(authority.Proof) &&
+            authenticate(authority);
+    }
+
+    private static SidecarCapabilityValidationResult ValidateNestedOutcome(
+        SidecarActionOutcomeEnvelope outcome,
+        SidecarActionDescriptorIdentity descriptor,
+        SidecarCapabilitySessionBinding binding,
+        Guid callId)
+    {
+        return ValidateActionOutcome(outcome, descriptor, binding, callId);
     }
 
     private static bool SameSafeFailure(
@@ -1172,23 +1266,6 @@ public static class SidecarCapabilityTransportValidation
         string.Equals(left.Message, right.Message, StringComparison.Ordinal) &&
         left.Retryable == right.Retryable;
 
-    private static bool PayloadEquals(
-        SidecarSerializedPayload left,
-        SidecarSerializedPayload right)
-    {
-        if (left is null || right is null ||
-            !string.Equals(left.TypeIdentity, right.TypeIdentity, StringComparison.Ordinal) ||
-            left.SchemaVersion != right.SchemaVersion ||
-            !string.Equals(left.ContentHash, right.ContentHash, StringComparison.OrdinalIgnoreCase) ||
-            left.ByteLength != right.ByteLength)
-        {
-            return false;
-        }
-
-        var leftBytes = SidecarCapabilityTransportCodec.Serialize(left.Value);
-        var rightBytes = SidecarCapabilityTransportCodec.Serialize(right.Value);
-        return leftBytes.AsSpan().SequenceEqual(rightBytes);
-    }
 }
 
 public interface ISidecarCapabilityTransport
