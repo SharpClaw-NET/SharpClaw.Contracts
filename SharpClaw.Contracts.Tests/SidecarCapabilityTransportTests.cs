@@ -929,6 +929,92 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Contains(methods, method => method.Name == nameof(ISidecarCapabilityTransport.InvokeActionTerminalAsync));
     }
 
+    [Fact]
+    public async Task Host_entry_uses_existing_action_exchange_without_module_snapshot()
+    {
+        var fixture = CreateFixture();
+        var call = fixture.Call with { Capability = SidecarCapabilityKind.Action };
+        var key = new SharpClawActionKey("host.entry");
+        var descriptor = new SidecarActionDescriptorIdentity(
+            key,
+            1,
+            "host",
+            typeof(string).AssemblyQualifiedName!,
+            "host-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "host-result",
+            1,
+            "host-descriptor");
+        var request = SidecarActionCapabilityRequest.HostEntry(
+            call,
+            descriptor,
+            Payload(typeof(string).AssemblyQualifiedName!, "input"),
+            new SidecarCancellationIdentity(call.CancellationId, "host-cancel", call.Deadline),
+            call.Deadline);
+        var transport = new RecordingSidecarTransport(fixture.SafeFailure);
+
+        var response = await transport.InvokeActionAsync(request);
+
+        Assert.Equal(1, transport.ActionCalls);
+        Assert.Equal(SidecarActionInvocationKind.HostEntry, transport.Request!.Invocation);
+        Assert.Null(transport.Request.Snapshot);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidPayload,
+            SidecarCapabilityTransportValidation.ValidateActionRequest(
+                transport.Request with { Snapshot = new ActionPipelineSnapshot("module-graph", []) },
+                fixture.Binding,
+                fixture.Now).Code);
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionRequest(
+            transport.Request,
+            fixture.Binding,
+            fixture.Now).Accepted);
+        Assert.False(response.Completed);
+    }
+
+    [Fact]
+    public async Task Host_action_entry_proxy_sends_typed_request_through_existing_transport()
+    {
+        var fixture = CreateFixture();
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "proxy-host-entry",
+        };
+        var descriptor = new ActionDescriptor<string, string>(
+            new SharpClawActionKey("proxy.host.entry"),
+            1,
+            "proxy",
+            ActionInterceptionCapabilities.Inspect,
+            ContainsSensitiveData: false,
+            HasIrreversibleEffects: false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "proxy.host.entry"),
+            ContinuationPolicy: null,
+            TimeSpan.FromSeconds(5))
+        {
+            InputSchema = new JsonSchemaReference("proxy.host.input", 1, "proxy-host-input"),
+            ResultSchema = new JsonSchemaReference("proxy.host.result", 1, "proxy-host-result"),
+        };
+        var moduleRequest = new HostActionEntryRequest<string, string>(
+            descriptor,
+            "input",
+            new RequestPrincipal("module-user"),
+            ExtensionFeatureSet.Empty,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            call.Deadline);
+        var transport = new RecordingSidecarTransport(fixture.SafeFailure);
+        var proxy = new TransportHostActionEntryProxy(transport, call);
+
+        var outcome = await proxy.InvokeAsync(moduleRequest);
+
+        Assert.Equal(ActionOutcomeKind.Cancelled, outcome.Kind);
+        Assert.Equal(1, transport.ActionCalls);
+        Assert.Equal(SidecarActionInvocationKind.HostEntry, transport.Request!.Invocation);
+        Assert.Null(transport.Request.Snapshot);
+    }
+
     private static Fixture CreateFixture(
         int maxInFlight = 2,
         int maxCalls = 4,
@@ -1054,6 +1140,84 @@ public sealed class SidecarCapabilityTransportTests
 
             TransportValidated = true;
             return ValueTask.FromResult<IActionOutcome<string>>(new RecordedOutcome<string>(ActionOutcomeKind.Completed));
+        }
+    }
+
+    private sealed class RecordingSidecarTransport(SidecarSafeFailureIdentity safeFailure) : ISidecarCapabilityTransport
+    {
+        public SidecarActionCapabilityRequest? Request { get; private set; }
+        public int ActionCalls { get; private set; }
+
+        public ValueTask<SidecarStorageCapabilityResponse> InvokeStorageAsync(
+            SidecarStorageCapabilityRequest request,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public ValueTask<SidecarActionCapabilityResponse> InvokeActionAsync(
+            SidecarActionCapabilityRequest request,
+            CancellationToken ct = default)
+        {
+            Request = request;
+            ActionCalls++;
+            return ValueTask.FromResult(new SidecarActionCapabilityResponse(
+                null,
+                new SidecarActionOutcomeEnvelope(
+                    ActionOutcomeKind.Cancelled,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    safeFailure,
+                    0),
+                null,
+                safeFailure,
+                false));
+        }
+
+        public ValueTask<SidecarActionTerminalTransportResponse> InvokeActionTerminalAsync(
+            SidecarActionTerminalTransportRequest request,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+    }
+
+    private sealed class TransportHostActionEntryProxy(
+        ISidecarCapabilityTransport transport,
+        SidecarCapabilityCallIdentity call) : IHostActionEntry
+    {
+        public async ValueTask<IActionOutcome<TResult>> InvokeAsync<TAction, TResult>(
+            HostActionEntryRequest<TAction, TResult> request,
+            CancellationToken cancellationToken = default)
+        {
+            var inputSchema = request.Descriptor.InputSchema ?? throw new InvalidOperationException();
+            var resultSchema = request.Descriptor.ResultSchema ?? throw new InvalidOperationException();
+            var descriptor = new SidecarActionDescriptorIdentity(
+                request.Descriptor.Key,
+                request.Descriptor.Version,
+                request.Descriptor.Category,
+                typeof(TAction).AssemblyQualifiedName ?? typeof(TAction).FullName ?? typeof(TAction).Name,
+                inputSchema.ContentHash!,
+                inputSchema.Version,
+                typeof(TResult).AssemblyQualifiedName ?? typeof(TResult).FullName ?? typeof(TResult).Name,
+                resultSchema.ContentHash!,
+                resultSchema.Version,
+                HostActionEntryAuthorityValidator.ComputeDescriptorHash(request.Descriptor));
+            var bytes = SidecarCapabilityTransportCodec.Serialize(request.Action);
+            using var document = JsonDocument.Parse(bytes);
+            var action = new SidecarSerializedPayload(
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                SidecarCapabilityTransportCodec.ComputeSha256(bytes),
+                document.RootElement.Clone(),
+                bytes.Length);
+            var sidecarRequest = SidecarActionCapabilityRequest.HostEntry(
+                call,
+                descriptor,
+                action,
+                new SidecarCancellationIdentity(call.CancellationId, "proxy-cancel", call.Deadline),
+                request.Deadline);
+            var response = await transport.InvokeActionAsync(sidecarRequest, cancellationToken);
+            return new RecordedOutcome<TResult>(response.Outcome.Kind);
         }
     }
 

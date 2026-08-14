@@ -24,6 +24,7 @@ public enum SidecarActionInvocationKind
 {
     Run,
     RunRequired,
+    HostEntry,
 }
 
 public sealed record SidecarAuthenticationProof(
@@ -862,10 +863,27 @@ public sealed record SidecarActionCapabilityRequest(
     SidecarActionInvocationKind Invocation,
     SidecarActionDescriptorIdentity Descriptor,
     SidecarSerializedPayload Action,
-    ActionPipelineSnapshot Snapshot,
+    ActionPipelineSnapshot? Snapshot,
     SidecarCancellationIdentity Cancellation,
     SidecarTerminalContinuationRequest? Continuation,
-    DateTimeOffset Deadline);
+    DateTimeOffset Deadline)
+{
+    public static SidecarActionCapabilityRequest HostEntry(
+        SidecarCapabilityCallIdentity call,
+        SidecarActionDescriptorIdentity descriptor,
+        SidecarSerializedPayload action,
+        SidecarCancellationIdentity cancellation,
+        DateTimeOffset deadline) =>
+        new(
+            call,
+            SidecarActionInvocationKind.HostEntry,
+            descriptor,
+            action,
+            null,
+            cancellation,
+            null,
+            deadline);
+}
 
 public sealed record SidecarActionResultIdentity(
     Guid ResultId,
@@ -1129,12 +1147,16 @@ public static class SidecarCapabilityTransportValidation
                 "The action request does not bind to the call authority.");
         }
 
-        if (!IsValidDescriptor(request.Descriptor) ||
+        var requiresSnapshot = request.Invocation is SidecarActionInvocationKind.Run or SidecarActionInvocationKind.RunRequired;
+        var hostEntry = request.Invocation == SidecarActionInvocationKind.HostEntry;
+        if (!Enum.IsDefined(request.Invocation) ||
+            !IsValidDescriptor(request.Descriptor) ||
             request.Action is null ||
             !string.Equals(request.Action.TypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
             request.Action.SchemaVersion != request.Descriptor.InputSchemaVersion ||
-            request.Snapshot is null ||
-            string.IsNullOrWhiteSpace(request.Snapshot.ContractHash))
+            requiresSnapshot &&
+            (request.Snapshot is null || string.IsNullOrWhiteSpace(request.Snapshot.ContractHash)) ||
+            hostEntry && request.Snapshot is not null)
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidPayload,
