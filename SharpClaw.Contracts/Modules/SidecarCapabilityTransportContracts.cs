@@ -545,6 +545,15 @@ public sealed class SidecarCapabilitySession
                     SidecarCapabilityErrors.Disconnected,
                     "The sidecar capability session is disconnected.");
 
+            var validation = SidecarCapabilitySessionValidator.Validate(
+                replacement,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!validation.Accepted)
+                return validation;
+
             var identityMatches =
                 string.Equals(replacement.ModuleId, Binding.ModuleId, StringComparison.Ordinal) &&
                 string.Equals(replacement.GraphId, Binding.GraphId, StringComparison.Ordinal) &&
@@ -562,12 +571,18 @@ public sealed class SidecarCapabilitySession
                     SidecarCapabilityErrors.InvalidBinding,
                     "The capability session cannot rotate while a capability call is active.");
 
+            if (_issuedEntryContexts.Count != 0)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The capability session cannot rotate while a carrier context is pending activation.");
+
             var requiredExpiry = _activeEntryCarriers.Count == 0
                 ? now
                 : _activeEntryCarriers.Values.Max(value => value.ExpiresAt);
             if (replacement.ExpiresAt < requiredExpiry ||
                 (_activeEntryCarriers.Count > 0 && !replacement.Grant.Allows(SidecarCapabilityKind.Action)) ||
                 replacement.PayloadLimits.ActionInputBytes < Binding.PayloadLimits.ActionInputBytes ||
+                replacement.PayloadLimits.ActionResultBytes < Binding.PayloadLimits.ActionResultBytes ||
                 replacement.PayloadLimits.ProtocolMessageBytes < Binding.PayloadLimits.ProtocolMessageBytes ||
                 replacement.ConcurrencyLimits.MaximumInFlightCalls < Binding.ConcurrencyLimits.MaximumInFlightCalls ||
                 replacement.ConcurrencyLimits.MaximumCallsPerRequest < Binding.ConcurrencyLimits.MaximumCallsPerRequest)
@@ -577,7 +592,7 @@ public sealed class SidecarCapabilitySession
                     "The rotated binding would strand active carrier authority.");
             }
 
-            var validation = SidecarCapabilitySessionValidator.Validate(
+            validation = SidecarCapabilitySessionValidator.Validate(
                 replacement,
                 _authenticate,
                 _registerAuthenticationNonce,

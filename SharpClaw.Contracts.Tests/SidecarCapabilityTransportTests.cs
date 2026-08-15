@@ -785,6 +785,73 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void Pending_context_blocks_rebind_and_remains_activatable()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("pending-rebind"),
+            HostActionEntryIngress.Cli);
+        var rotated = CreateRotatedBinding(fixture, "pending-rebind-nonce");
+        fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+
+        var result = fixture.Session.RotateBinding(rotated, fixture.Now);
+
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, result.Code);
+        Assert.Equal(fixture.Binding.RequestId, fixture.Session.Binding.RequestId);
+        Assert.Equal(1, fixture.Session.IssuedHostActionEntryContextCount);
+        var authority = ActivateContext(fixture, context);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            authority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public void Rebind_rejects_null_nested_authority_records_without_changing_binding()
+    {
+        var fixture = CreateFixture();
+        var original = fixture.Session.Binding;
+        var malformed = new[]
+        {
+            original with { Grant = null! },
+            original with { PayloadLimits = null! },
+            original with { ConcurrencyLimits = null! },
+        };
+
+        foreach (var replacement in malformed)
+        {
+            var result = fixture.Session.RotateBinding(replacement, fixture.Now);
+            Assert.Equal(SidecarCapabilityErrors.InvalidBinding, result.Code);
+            Assert.Equal(original, fixture.Session.Binding);
+        }
+    }
+
+    [Fact]
+    public void Rebind_rejects_action_result_limit_reduction_for_an_active_carrier()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("result-limit"),
+            HostActionEntryIngress.Tool);
+        _ = ActivateContext(fixture, context);
+        var rotated = CreateRotatedBinding(
+            fixture,
+            "result-limit-nonce",
+            fixture.Binding.PayloadLimits.ActionResultBytes - 1);
+        fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+
+        var result = fixture.Session.RotateBinding(rotated, fixture.Now);
+
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, result.Code);
+        Assert.Equal(fixture.Binding.ExpiresAt, fixture.Session.Binding.ExpiresAt);
+        Assert.Equal(
+            fixture.Binding.PayloadLimits.ActionResultBytes,
+            fixture.Session.Binding.PayloadLimits.ActionResultBytes);
+    }
+
+    [Fact]
     public void One_carrier_cannot_start_a_second_host_entry_call()
     {
         var fixture = CreateFixture();
@@ -2177,6 +2244,38 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(result.Accepted, result.Message);
         Assert.NotNull(authority);
         return authority!;
+    }
+
+    private static SidecarCapabilitySessionBinding CreateRotatedBinding(
+        Fixture fixture,
+        string nonce,
+        int? actionResultBytes = null)
+    {
+        var expiry = fixture.Binding.ExpiresAt.AddMinutes(1);
+        var rotated = fixture.Binding with
+        {
+            SessionId = Guid.NewGuid(),
+            RequestId = Guid.NewGuid(),
+            CancellationId = Guid.NewGuid(),
+            ExpiresAt = expiry,
+            Grant = fixture.Binding.Grant with { ExpiresAt = expiry },
+            PayloadLimits = actionResultBytes is null
+                ? fixture.Binding.PayloadLimits
+                : fixture.Binding.PayloadLimits with { ActionResultBytes = actionResultBytes.Value },
+            Authentication = fixture.Binding.Authentication with
+            {
+                Nonce = nonce,
+                ExpiresAt = expiry,
+                BindingHash = string.Empty,
+            },
+        };
+        return rotated with
+        {
+            Authentication = rotated.Authentication with
+            {
+                BindingHash = SidecarCapabilitySessionValidator.ComputeBindingHash(rotated),
+            },
+        };
     }
 
     private static SidecarSerializedPayload Payload<T>(string typeIdentity, T value)
