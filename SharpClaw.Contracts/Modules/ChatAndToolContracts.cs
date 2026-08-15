@@ -140,8 +140,11 @@ public sealed record ToolInvocation(
     string ToolCallId,
     string ToolName,
     JsonElement Arguments,
-    RequestPrincipal Caller,
-    ExtensionFeatureSet Features);
+    HostActionEntryRequestContext HostActionContext)
+{
+    public RequestPrincipal Caller => HostActionContext.Caller;
+    public ExtensionFeatureSet Features => HostActionContext.Features;
+}
 
 /// <summary>One tool result returned by a module handler.</summary>
 public sealed record ToolResult(

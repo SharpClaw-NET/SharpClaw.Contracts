@@ -116,14 +116,12 @@ public sealed class SimpleKernelContractTests
         var traceId = Guid.NewGuid();
         var idempotencyKey = Guid.NewGuid();
         var deadline = now.AddMinutes(1);
+        var context = CreateHostActionEntryContext(
+            caller, features, traceId, idempotencyKey, deadline, now);
         var request = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
-            caller,
-            features,
-            traceId,
-            idempotencyKey,
-            deadline);
+            context);
         var transport = new HostActionEntryTransportRequest<string, string>(
             request,
             CreateHostActionAuthority(
@@ -134,7 +132,8 @@ public sealed class SimpleKernelContractTests
                 traceId,
                 idempotencyKey,
                 deadline,
-                now));
+                now,
+                context));
         var cancellation = new CancellationTokenSource().Token;
         var entry = new RecordingHostActionEntry();
 
@@ -175,14 +174,12 @@ public sealed class SimpleKernelContractTests
         var traceId = Guid.NewGuid();
         var idempotencyKey = Guid.NewGuid();
         var deadline = now.AddMinutes(1);
+        var context = CreateHostActionEntryContext(
+            caller, features, traceId, idempotencyKey, deadline, now);
         var request = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
-            caller,
-            features,
-            traceId,
-            idempotencyKey,
-            deadline);
+            context);
         var authority = CreateHostActionAuthority(
                 descriptor,
                 "input",
@@ -191,7 +188,8 @@ public sealed class SimpleKernelContractTests
                 traceId,
                 idempotencyKey,
                 deadline,
-                now);
+                now,
+                context);
         var transport = new HostActionEntryTransportRequest<string, string>(request, authority);
         var expectedProof = authority.Proof;
         bool HostProof(HostActionEntryAuthority authority) =>
@@ -199,16 +197,16 @@ public sealed class SimpleKernelContractTests
             authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority);
 
         Assert.True(transport.Validate(now, HostProof).Accepted);
-        Assert.False((transport with { Request = request with
+        Assert.False((transport with { Request = request with { Context = context with
         {
             Caller = new RequestPrincipal("attacker", Roles: new HashSet<string>(["administrator"]))
-        }}).Validate(now, HostProof).Accepted);
-        Assert.False((transport with { Request = request with
+        }}}).Validate(now, HostProof).Accepted);
+        Assert.False((transport with { Request = request with { Context = context with
         {
             Features = new ExtensionFeatureSet([new ExtensionFeature("forged", 1, "attacker", 64, CreateElement(new { enabled = true }))])
-        }}).Validate(now, HostProof).Accepted);
-        Assert.False((transport with { Request = request with { TraceId = Guid.NewGuid() } }).Validate(now, HostProof).Accepted);
-        Assert.False((transport with { Request = request with { IdempotencyKey = Guid.NewGuid() } }).Validate(now, HostProof).Accepted);
+        }}}).Validate(now, HostProof).Accepted);
+        Assert.False((transport with { Request = request with { Context = context with { TraceId = Guid.NewGuid() } } }).Validate(now, HostProof).Accepted);
+        Assert.False((transport with { Request = request with { Context = context with { IdempotencyKey = Guid.NewGuid() } } }).Validate(now, HostProof).Accepted);
         Assert.False((transport with { Request = request with { Action = "changed" } }).Validate(now, HostProof).Accepted);
         Assert.False((transport with
         {
@@ -262,14 +260,12 @@ public sealed class SimpleKernelContractTests
         var traceId = Guid.NewGuid();
         var idempotencyKey = Guid.NewGuid();
         var deadline = now.AddMinutes(1);
+        var context = CreateHostActionEntryContext(
+            caller, features, traceId, idempotencyKey, deadline, now);
         var request = new HostActionEntryRequest<EntryRecordAction, string>(
             descriptor,
             action,
-            caller,
-            features,
-            traceId,
-            idempotencyKey,
-            deadline);
+            context);
         var authority = CreateHostActionAuthority(
                 descriptor,
                 action,
@@ -278,7 +274,8 @@ public sealed class SimpleKernelContractTests
                 traceId,
                 idempotencyKey,
                 deadline,
-                now);
+                now,
+                context);
         var transport = new HostActionEntryTransportRequest<EntryRecordAction, string>(request, authority);
         var defaultBytes = JsonSerializer.SerializeToUtf8Bytes(action);
         var transportBytes = SidecarCapabilityTransportCodec.Serialize(action);
@@ -299,15 +296,16 @@ public sealed class SimpleKernelContractTests
         Guid traceId,
         Guid idempotencyKey,
         DateTimeOffset deadline,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        HostActionEntryRequestContext context)
     {
         var actionBytes = SidecarCapabilityTransportCodec.Serialize(action);
         var authority = new HostActionEntryAuthority(
             "module-a",
             "graph-a",
             Guid.NewGuid(),
-            Guid.NewGuid(),
-            Guid.NewGuid(),
+            context.RequestId,
+            context.CancellationId,
             Guid.NewGuid(),
             "entry-nonce",
             1,
@@ -329,13 +327,43 @@ public sealed class SimpleKernelContractTests
             actionBytes.Length,
             deadline,
             now.AddSeconds(-1),
-            now.AddMinutes(2),
+            context.ExpiresAt,
             "");
-        return authority with
+        var boundAuthority = authority with
         {
-            Proof = HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority),
+            Ingress = context.Ingress,
+            InvocationId = context.InvocationId,
+            CapabilityId = context.CapabilityId,
+            CapabilityHandleHash = HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(
+                context.CapabilityHandle),
+        };
+        return boundAuthority with
+        {
+            Proof = HostActionEntryAuthorityValidator.ComputeAuthorityHash(boundAuthority),
         };
     }
+
+    private static HostActionEntryRequestContext CreateHostActionEntryContext(
+        RequestPrincipal caller,
+        ExtensionFeatureSet features,
+        Guid traceId,
+        Guid idempotencyKey,
+        DateTimeOffset deadline,
+        DateTimeOffset now,
+        HostActionEntryIngress ingress = HostActionEntryIngress.Endpoint) =>
+        new(
+            Guid.NewGuid(),
+            "opaque-test-capability",
+            ingress,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            caller,
+            features,
+            traceId,
+            idempotencyKey,
+            deadline,
+            now.AddMinutes(2));
 
     private sealed class RecordingHostActionEntry : IHostActionEntry
     {
@@ -3296,8 +3324,14 @@ public sealed class SimpleKernelContractTests
             "call-1",
             "clock_now",
             CreateElement(new { }),
-            new RequestPrincipal("user-1"),
-            ExtensionFeatureSet.Empty);
+            CreateHostActionEntryContext(
+                new RequestPrincipal("user-1"),
+                ExtensionFeatureSet.Empty,
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                DateTimeOffset.UtcNow.AddMinutes(1),
+                DateTimeOffset.UtcNow,
+                HostActionEntryIngress.Tool));
         var turn = new ChatTurnInput(
             "What time is it?",
             invocation.ConversationId,

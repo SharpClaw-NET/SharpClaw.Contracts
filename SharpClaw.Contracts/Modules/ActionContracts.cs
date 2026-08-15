@@ -207,6 +207,41 @@ public sealed record HostActionEntryValidationResult(
         new(false, code, message);
 }
 
+public enum HostActionEntryIngress
+{
+    Endpoint,
+    Cli,
+    Tool,
+    CrossModule,
+}
+
+public sealed record HostActionEntryContextRequest(
+    HostActionEntryIngress Ingress,
+    Guid InvocationId,
+    Guid RequestId,
+    Guid CancellationId,
+    RequestPrincipal Caller,
+    ExtensionFeatureSet Features,
+    Guid TraceId,
+    Guid IdempotencyKey,
+    DateTimeOffset Deadline,
+    DateTimeOffset ExpiresAt)
+{
+    public bool IsWellFormed(DateTimeOffset now) =>
+        Enum.IsDefined(Ingress) &&
+        InvocationId != Guid.Empty &&
+        RequestId != Guid.Empty &&
+        CancellationId != Guid.Empty &&
+        Caller is not null &&
+        !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
+        Features is not null &&
+        Features.Items is not null &&
+        TraceId != Guid.Empty &&
+        IdempotencyKey != Guid.Empty &&
+        Deadline > now &&
+        ExpiresAt >= Deadline;
+}
+
 /// <summary>Host-issued authority for one typed module action entry.</summary>
 public sealed record HostActionEntryAuthority(
     string ModuleId,
@@ -238,6 +273,11 @@ public sealed record HostActionEntryAuthority(
     DateTimeOffset ExpiresAt,
     string Proof)
 {
+    public HostActionEntryIngress Ingress { get; init; }
+    public Guid InvocationId { get; init; }
+    public Guid CapabilityId { get; init; }
+    public string CapabilityHandleHash { get; init; } = string.Empty;
+
     public bool IsValid =>
         !string.IsNullOrWhiteSpace(ModuleId) &&
         !string.IsNullOrWhiteSpace(GraphId) &&
@@ -265,49 +305,62 @@ public sealed record HostActionEntryAuthority(
         ResultSchemaVersion >= 1 &&
         !string.IsNullOrWhiteSpace(ActionContentHash) &&
         ActionByteLength > 0 &&
+        Enum.IsDefined(Ingress) &&
+        InvocationId != Guid.Empty &&
+        CapabilityId != Guid.Empty &&
+        !string.IsNullOrWhiteSpace(CapabilityHandleHash) &&
         !string.IsNullOrWhiteSpace(Proof);
 }
 
-/// <summary>Typed input supplied to the host action entry.</summary>
+/// <summary>Host-issued context capability for one typed module action entry.</summary>
 public sealed record HostActionEntryRequestContext(
+    Guid CapabilityId,
+    string CapabilityHandle,
+    HostActionEntryIngress Ingress,
+    Guid InvocationId,
     Guid RequestId,
+    Guid CancellationId,
     RequestPrincipal Caller,
     ExtensionFeatureSet Features,
     Guid TraceId,
     Guid IdempotencyKey,
+    DateTimeOffset Deadline,
     DateTimeOffset ExpiresAt)
 {
     public bool IsWellFormed(DateTimeOffset now) =>
+        CapabilityId != Guid.Empty &&
+        !string.IsNullOrWhiteSpace(CapabilityHandle) &&
+        Enum.IsDefined(Ingress) &&
+        InvocationId != Guid.Empty &&
         RequestId != Guid.Empty &&
+        CancellationId != Guid.Empty &&
         Caller is not null &&
         !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
         Features is not null &&
         Features.Items is not null &&
         TraceId != Guid.Empty &&
         IdempotencyKey != Guid.Empty &&
-        ExpiresAt > now;
+        Deadline > now &&
+        ExpiresAt >= Deadline;
 }
 
 public sealed record HostActionEntryRequest<TAction, TResult>(
     ActionDescriptor<TAction, TResult> Descriptor,
     TAction Action,
-    RequestPrincipal Caller,
-    ExtensionFeatureSet Features,
-    Guid TraceId,
-    Guid IdempotencyKey,
-    DateTimeOffset Deadline)
+    HostActionEntryRequestContext Context)
 {
+    public RequestPrincipal Caller => Context.Caller;
+    public ExtensionFeatureSet Features => Context.Features;
+    public Guid TraceId => Context.TraceId;
+    public Guid IdempotencyKey => Context.IdempotencyKey;
+    public DateTimeOffset Deadline => Context.Deadline;
+
     public bool IsWellFormed(DateTimeOffset now) =>
         Descriptor is not null &&
         Descriptor.Version >= 1 &&
         !string.IsNullOrWhiteSpace(Descriptor.Key.Value) &&
-        Caller is not null &&
-        !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
-        Features is not null &&
-        Features.Items is not null &&
-        TraceId != Guid.Empty &&
-        IdempotencyKey != Guid.Empty &&
-        Deadline > now;
+        Context is not null &&
+        Context.IsWellFormed(now);
 }
 
 /// <summary>Host-only transport envelope after authority issuance.</summary>
@@ -350,11 +403,7 @@ public static class HostActionEntryAuthorityValidator
                 "host_action_unauthenticated",
                 "The host action entry authority proof was not accepted.");
 
-        if (request.Descriptor is null || request.Descriptor.Version < 1 ||
-            string.IsNullOrWhiteSpace(request.Descriptor.Key.Value) ||
-            request.Caller is null || string.IsNullOrWhiteSpace(request.Caller.SubjectId) ||
-            request.Features is null || request.Features.Items is null || request.TraceId == Guid.Empty ||
-            request.IdempotencyKey == Guid.Empty || request.Deadline <= now)
+        if (!request.IsWellFormed(now))
         {
             return HostActionEntryValidationResult.Reject(
                 "host_action_invalid_request",
@@ -389,11 +438,10 @@ public static class HostActionEntryAuthorityValidator
             authority.ResultSchemaVersion != request.Descriptor.ResultSchema.Version ||
             !string.Equals(authority.ActionContentHash, actionContentHash, StringComparison.Ordinal) ||
             authority.ActionByteLength != actionBytes.Length ||
-            !SamePrincipal(authority.Caller, request.Caller) ||
-            !SameFeatures(authority.Features, request.Features) ||
-            authority.TraceId != request.TraceId ||
-            authority.IdempotencyKey != request.IdempotencyKey ||
-            authority.Deadline != request.Deadline)
+            !SameContext(authority, request.Context) ||
+            !string.Equals(authority.CapabilityHandleHash,
+                ComputeCapabilityHandleHash(request.Context.CapabilityHandle),
+                StringComparison.OrdinalIgnoreCase))
         {
             return HostActionEntryValidationResult.Reject(
                 "host_action_spoofed_authority",
@@ -408,11 +456,8 @@ public static class HostActionEntryAuthorityValidator
         HostActionEntryRequestContext context) =>
         request is not null &&
         context is not null &&
-        request.Deadline <= context.ExpiresAt &&
-        SamePrincipal(request.Caller, context.Caller) &&
-        SameFeatures(request.Features, context.Features) &&
-        request.TraceId == context.TraceId &&
-        request.IdempotencyKey == context.IdempotencyKey;
+        request.Context is not null &&
+        SameContext(request.Context, context);
 
     public static bool MatchesAuthorityContext(
         HostActionEntryAuthority authority,
@@ -420,11 +465,41 @@ public static class HostActionEntryAuthorityValidator
         authority is not null &&
         context is not null &&
         authority.RequestId == context.RequestId &&
-        authority.Deadline <= context.ExpiresAt &&
+        SameContext(authority, context);
+
+    public static string ComputeCapabilityHandleHash(string capabilityHandle) =>
+        Convert.ToHexString(SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(capabilityHandle)));
+
+    public static bool SameContext(
+        HostActionEntryRequestContext left,
+        HostActionEntryRequestContext right) =>
+        left.CapabilityId == right.CapabilityId &&
+        string.Equals(left.CapabilityHandle, right.CapabilityHandle, StringComparison.Ordinal) &&
+        left.Ingress == right.Ingress &&
+        left.InvocationId == right.InvocationId &&
+        left.RequestId == right.RequestId &&
+        left.CancellationId == right.CancellationId &&
+        SamePrincipal(left.Caller, right.Caller) &&
+        SameFeatures(left.Features, right.Features) &&
+        left.TraceId == right.TraceId &&
+        left.IdempotencyKey == right.IdempotencyKey &&
+        left.Deadline == right.Deadline &&
+        left.ExpiresAt == right.ExpiresAt;
+
+    private static bool SameContext(
+        HostActionEntryAuthority authority,
+        HostActionEntryRequestContext context) =>
+        authority.Ingress == context.Ingress &&
+        authority.InvocationId == context.InvocationId &&
+        authority.RequestId == context.RequestId &&
+        authority.CancellationId == context.CancellationId &&
         SamePrincipal(authority.Caller, context.Caller) &&
         SameFeatures(authority.Features, context.Features) &&
         authority.TraceId == context.TraceId &&
-        authority.IdempotencyKey == context.IdempotencyKey;
+        authority.IdempotencyKey == context.IdempotencyKey &&
+        authority.Deadline == context.Deadline &&
+        authority.ExpiresAt == context.ExpiresAt;
 
     public static string ComputeDescriptorHash<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor)
@@ -524,6 +599,10 @@ public static class HostActionEntryAuthorityValidator
             authority.Deadline,
             authority.IssuedAt,
             authority.ExpiresAt,
+            authority.Ingress,
+            authority.InvocationId,
+            authority.CapabilityId,
+            authority.CapabilityHandleHash,
         };
         return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(canonical)));
     }

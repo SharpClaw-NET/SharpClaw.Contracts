@@ -14,8 +14,7 @@ public sealed record ModuleCliInvocation(
     Guid InvocationId,
     string Command,
     IReadOnlyList<string> Arguments,
-    RequestPrincipal Caller,
-    DateTimeOffset Deadline);
+    HostActionEntryRequestContext HostActionContext);
 
 public sealed record ModuleCliOutput(
     string Stream,

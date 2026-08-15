@@ -16,7 +16,10 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Equal(first, second);
         var roundTrip = SidecarCapabilityTransportCodec.Deserialize<SidecarCapabilitySessionBinding>(first);
         Assert.Equal(fixture.Binding.ModuleId, roundTrip.ModuleId);
-        Assert.Equal(fixture.Binding.Authentication.BindingHash, roundTrip.Authentication.BindingHash);
+        Assert.Equal(
+            SidecarCapabilityTransportCodec.ComputeSha256(first),
+            SidecarCapabilityTransportCodec.ComputeSha256(
+                SidecarCapabilityTransportCodec.Serialize(roundTrip)));
         Assert.Equal(first, SidecarCapabilityTransportCodec.Serialize(roundTrip));
 
         var json = Encoding.UTF8.GetString(first);
@@ -29,35 +32,34 @@ public sealed class SidecarCapabilityTransportTests
     public void Role_bearing_binding_round_trips_with_an_ordinal_canonical_fingerprint()
     {
         var roles = new HashSet<string>(StringComparer.Ordinal) { "writer", "reader" };
-        var fixture = CreateFixture(
-            hostActionContext: new HostActionEntryRequestContext(
-                Guid.Empty,
-                new RequestPrincipal("role-user", Roles: roles),
-                ExtensionFeatureSet.Empty,
-                Guid.NewGuid(),
-                Guid.NewGuid(),
-                new DateTimeOffset(2026, 8, 14, 12, 5, 0, TimeSpan.Zero)));
-
-        var encoded = SidecarCapabilityTransportCodec.Serialize(fixture.Binding);
-        var roundTrip = SidecarCapabilityTransportCodec.Deserialize<SidecarCapabilitySessionBinding>(encoded);
+        var fixture = CreateFixture();
+        var context = new HostActionEntryRequestContext(
+            Guid.NewGuid(),
+            "opaque-capability",
+            HostActionEntryIngress.Cli,
+            Guid.NewGuid(),
+            fixture.Binding.RequestId,
+            fixture.Binding.CancellationId,
+            new RequestPrincipal("role-user", Roles: roles),
+            ExtensionFeatureSet.Empty,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            fixture.Now.AddMinutes(1),
+            fixture.Binding.ExpiresAt);
+        var encoded = SidecarCapabilityTransportCodec.Serialize(context);
+        var roundTrip = SidecarCapabilityTransportCodec.Deserialize<HostActionEntryRequestContext>(encoded);
         var reversed = SidecarCapabilityTransportCodec.Serialize(
-            fixture.Binding with
+            context with
             {
-                HostActionContext = fixture.Binding.HostActionContext! with
+                Caller = context.Caller with
                 {
-                    Caller = fixture.Binding.HostActionContext.Caller with
-                    {
-                        Roles = new HashSet<string>(["reader", "writer"], StringComparer.Ordinal),
-                    },
+                    Roles = new HashSet<string>(["reader", "writer"], StringComparer.Ordinal),
                 },
             });
 
-        Assert.NotNull(roundTrip.HostActionContext);
-        Assert.NotNull(roundTrip.HostActionContext.Caller.Roles);
-        Assert.True(roundTrip.HostActionContext.Caller.Roles.SetEquals(roles));
-        Assert.Equal(fixture.Binding.Authentication.BindingHash, roundTrip.Authentication.BindingHash);
+        Assert.NotNull(roundTrip.Caller.Roles);
+        Assert.True(roundTrip.Caller.Roles.SetEquals(roles));
         Assert.Equal(encoded, SidecarCapabilityTransportCodec.Serialize(roundTrip));
-        Assert.Equal(encoded, reversed);
         Assert.Equal(
             SidecarCapabilityTransportCodec.ComputeSha256(encoded),
             SidecarCapabilityTransportCodec.ComputeSha256(reversed));
@@ -78,14 +80,8 @@ public sealed class SidecarCapabilityTransportTests
         var caller = new RequestPrincipal(
             "role-user",
             Roles: new HashSet<string>(["reader", "writer"], StringComparer.Ordinal));
-        var fixture = CreateFixture(
-            hostActionContext: new HostActionEntryRequestContext(
-                Guid.Empty,
-                caller,
-                ExtensionFeatureSet.Empty,
-                Guid.NewGuid(),
-                Guid.NewGuid(),
-                new DateTimeOffset(2026, 8, 14, 12, 5, 0, TimeSpan.Zero)));
+        var fixture = CreateFixture();
+        var context = IssueContext(fixture, caller, HostActionEntryIngress.Cli);
         var descriptor = new ActionDescriptor<string, string>(
             new SharpClawActionKey("roles.action"),
             1,
@@ -107,16 +103,18 @@ public sealed class SidecarCapabilityTransportTests
             ReplayNonce = "roles-entry",
         };
         var payload = Payload(typeof(string).AssemblyQualifiedName!, "input");
-        Assert.True(fixture.Session.BeginCall(call, SidecarCapabilityKind.Action, payload, payload.ByteLength, fixture.Now).Accepted);
+        Assert.True(fixture.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            payload,
+            payload.ByteLength,
+            fixture.Now,
+            context).Accepted);
 
         var request = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
-            caller,
-            ExtensionFeatureSet.Empty,
-            fixture.Binding.HostActionContext!.TraceId,
-            fixture.Binding.HostActionContext.IdempotencyKey,
-            call.Deadline);
+            context);
         var issued = fixture.Session.IssueHostActionEntry(
             request,
             call.CallId,
@@ -133,9 +131,12 @@ public sealed class SidecarCapabilityTransportTests
 
         var comparerSpoofedRequest = request with
         {
-            Caller = caller with
+            Context = context with
             {
-                Roles = new HashSet<string>(["READER", "WRITER"], StringComparer.OrdinalIgnoreCase),
+                Caller = caller with
+                {
+                    Roles = new HashSet<string>(["READER", "WRITER"], StringComparer.OrdinalIgnoreCase),
+                },
             },
         };
         var comparerSpoofedIssue = fixture.Session.IssueHostActionEntry(
@@ -173,7 +174,7 @@ public sealed class SidecarCapabilityTransportTests
         })
         {
             Assert.False(fixture.Session.ValidateHostActionEntry(
-                transport! with { Request = request with { Caller = changedCaller } },
+                transport! with { Request = request with { Context = context with { Caller = changedCaller } } },
                 fixture.Now,
                 authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
         }
@@ -253,6 +254,130 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public async Task Entry_contexts_are_distinct_single_use_and_bound_to_ingress_lifetime()
+    {
+        var fixture = CreateFixture();
+        var contexts = await Task.WhenAll(
+            Enum.GetValues<HostActionEntryIngress>().Select(ingress =>
+                Task.Run(() => IssueContext(
+                    fixture,
+                    new RequestPrincipal($"caller-{ingress}"),
+                    ingress))));
+
+        Assert.Equal(contexts.Length, contexts.Select(context => context.CapabilityId).Distinct().Count());
+        Assert.Equal(contexts.Length, contexts.Select(context => context.InvocationId).Distinct().Count());
+        Assert.Equal(contexts.Length, contexts.Select(context => context.TraceId).Distinct().Count());
+        Assert.Equal(contexts.Length, contexts.Select(context => context.IdempotencyKey).Distinct().Count());
+
+        var firstCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "entry-context-1",
+            Sequence = 1,
+        };
+        var firstPayload = Payload(typeof(string).AssemblyQualifiedName!, "first");
+        Assert.True(fixture.Session.BeginCall(
+            firstCall,
+            SidecarCapabilityKind.Action,
+            firstPayload,
+            firstPayload.ByteLength,
+            fixture.Now,
+            contexts[0]).Accepted);
+
+        var wrongOwner = fixture.Session.BeginCall(
+            firstCall with
+            {
+                CallId = Guid.NewGuid(),
+                ReplayNonce = "entry-context-wrong-owner",
+                Sequence = 2,
+                ModuleId = "module-spoof",
+            },
+            SidecarCapabilityKind.Action,
+            firstPayload,
+            firstPayload.ByteLength,
+            fixture.Now,
+            contexts[1]);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, wrongOwner.Code);
+
+        var wrongGraph = fixture.Session.BeginCall(
+            firstCall with
+            {
+                CallId = Guid.NewGuid(),
+                ReplayNonce = "entry-context-wrong-graph",
+                Sequence = 2,
+                GraphId = "graph-spoof",
+            },
+            SidecarCapabilityKind.Action,
+            firstPayload,
+            firstPayload.ByteLength,
+            fixture.Now,
+            contexts[1]);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, wrongGraph.Code);
+
+        var replay = fixture.Session.BeginCall(
+            firstCall with { ReplayNonce = "entry-context-replay", Sequence = 2 },
+            SidecarCapabilityKind.Action,
+            firstPayload,
+            firstPayload.ByteLength,
+            fixture.Now,
+            contexts[0]);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, replay.Code);
+
+        var wrongIngress = contexts[1] with { Ingress = HostActionEntryIngress.Tool };
+        var wrongIngressResult = fixture.Session.BeginCall(
+            fixture.Call with
+            {
+                Capability = SidecarCapabilityKind.Action,
+                CallId = Guid.NewGuid(),
+                ReplayNonce = "entry-context-wrong-ingress",
+                Sequence = 2,
+            },
+            SidecarCapabilityKind.Action,
+            firstPayload,
+            firstPayload.ByteLength,
+            fixture.Now,
+            wrongIngress);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, wrongIngressResult.Code);
+
+        var expired = contexts[2] with
+        {
+            Deadline = fixture.Now.AddSeconds(-1),
+            ExpiresAt = fixture.Now.AddSeconds(-1),
+        };
+        var expiredResult = fixture.Session.BeginCall(
+            fixture.Call with
+            {
+                Capability = SidecarCapabilityKind.Action,
+                CallId = Guid.NewGuid(),
+                ReplayNonce = "entry-context-expired",
+                Sequence = 2,
+            },
+            SidecarCapabilityKind.Action,
+            firstPayload,
+            firstPayload.ByteLength,
+            fixture.Now,
+            expired);
+        Assert.False(expiredResult.Accepted);
+
+        fixture.Session.Disconnect();
+        var disconnected = fixture.Session.BeginCall(
+            fixture.Call with
+            {
+                Capability = SidecarCapabilityKind.Action,
+                CallId = Guid.NewGuid(),
+                ReplayNonce = "entry-context-disconnected",
+                Sequence = 2,
+            },
+            SidecarCapabilityKind.Action,
+            firstPayload,
+            firstPayload.ByteLength,
+            fixture.Now,
+            contexts[3]);
+        Assert.Equal(SidecarCapabilityErrors.Disconnected, disconnected.Code);
+    }
+
+    [Fact]
     public void Session_accepts_zero_or_one_terminal_for_action_completion()
     {
         var fixture = CreateFixture();
@@ -288,15 +413,15 @@ public sealed class SidecarCapabilityTransportTests
         var caller = new RequestPrincipal("user-1", Roles: new HashSet<string>(["reader"]));
         var traceId = Guid.NewGuid();
         var idempotencyKey = Guid.NewGuid();
-        var fixture = CreateFixture(
-            hostActionContext: new HostActionEntryRequestContext(
-                Guid.Empty,
-                caller,
-                ExtensionFeatureSet.Empty,
-                traceId,
-                idempotencyKey,
-                new DateTimeOffset(2026, 8, 14, 12, 5, 0, TimeSpan.Zero)));
+        var fixture = CreateFixture();
         var now = fixture.Now;
+        var context = IssueContext(
+            fixture,
+            caller,
+            HostActionEntryIngress.Endpoint,
+            traceId,
+            idempotencyKey,
+            actionDeadline: fixture.Call.Deadline);
         var descriptor = new ActionDescriptor<string, string>(
             new SharpClawActionKey("sample.action"),
             1,
@@ -324,7 +449,8 @@ public sealed class SidecarCapabilityTransportTests
             SidecarCapabilityKind.Action,
             payload,
             payload.ByteLength,
-            now).Accepted);
+            now,
+            context).Accepted);
 
         var deadline = actionCall.Deadline;
         var authority = new HostActionEntryAuthority(
@@ -355,7 +481,14 @@ public sealed class SidecarCapabilityTransportTests
             deadline,
             now.AddSeconds(-1),
             fixture.Binding.ExpiresAt,
-            "");
+            "")
+        {
+            Ingress = context.Ingress,
+            InvocationId = context.InvocationId,
+            CapabilityId = context.CapabilityId,
+            CapabilityHandleHash = HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(
+                context.CapabilityHandle),
+        };
         authority = authority with
         {
             Proof = HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority),
@@ -363,11 +496,7 @@ public sealed class SidecarCapabilityTransportTests
         var request = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
-            caller,
-            ExtensionFeatureSet.Empty,
-            traceId,
-            idempotencyKey,
-            deadline);
+            context);
         var transport = new HostActionEntryTransportRequest<string, string>(request, authority);
 
         Assert.True(fixture.Session.ValidateHostActionEntry(
@@ -386,7 +515,16 @@ public sealed class SidecarCapabilityTransportTests
                 now,
                 candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Code);
         Assert.False(fixture.Session.ValidateHostActionEntry(
-                transport with { Request = request with { Caller = new RequestPrincipal("attacker") } },
+                transport with
+                {
+                    Request = request with
+                    {
+                        Context = request.Context with
+                        {
+                            Caller = new RequestPrincipal("attacker"),
+                        },
+                    },
+                },
             now,
             candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Accepted);
 
@@ -404,14 +542,8 @@ public sealed class SidecarCapabilityTransportTests
     {
         var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var caller = new RequestPrincipal("endpoint-user", Roles: new HashSet<string>(["reader"]));
-        var fixture = CreateFixture(
-            hostActionContext: new HostActionEntryRequestContext(
-                Guid.Empty,
-                caller,
-                ExtensionFeatureSet.Empty,
-                Guid.NewGuid(),
-                Guid.NewGuid(),
-                now.AddMinutes(5)));
+        var fixture = CreateFixture();
+        var context = IssueContext(fixture, caller, HostActionEntryIngress.Endpoint);
         var descriptor = new ActionDescriptor<string, string>(
             new SharpClawActionKey("sample.nested"),
             1,
@@ -434,16 +566,18 @@ public sealed class SidecarCapabilityTransportTests
             Sequence = 1,
         };
         var payload = Payload(typeof(string).AssemblyQualifiedName!, "input");
-        Assert.True(fixture.Session.BeginCall(call, SidecarCapabilityKind.Action, payload, payload.ByteLength, now).Accepted);
+        Assert.True(fixture.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            payload,
+            payload.ByteLength,
+            now,
+            context).Accepted);
 
         var request = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
-            caller,
-            ExtensionFeatureSet.Empty,
-            fixture.Binding.HostActionContext!.TraceId,
-            fixture.Binding.HostActionContext.IdempotencyKey,
-            call.Deadline);
+            context);
         var proxy = new SessionHostActionEntryProxy(fixture.Session, call.CallId, now);
 
         var outcome = await proxy.InvokeAsync(request);
@@ -1088,6 +1222,7 @@ public sealed class SidecarCapabilityTransportTests
     {
         var fixture = CreateFixture();
         var call = fixture.Call with { Capability = SidecarCapabilityKind.Action };
+        var context = IssueContext(fixture, new RequestPrincipal("host-user"), HostActionEntryIngress.Endpoint, actionDeadline: call.Deadline);
         var key = new SharpClawActionKey("host.entry");
         var descriptor = new SidecarActionDescriptorIdentity(
             key,
@@ -1105,7 +1240,8 @@ public sealed class SidecarCapabilityTransportTests
             descriptor,
             Payload(typeof(string).AssemblyQualifiedName!, "input"),
             new SidecarCancellationIdentity(call.CancellationId, "host-cancel", call.Deadline),
-            call.Deadline);
+            call.Deadline,
+            context);
         var transport = new RecordingSidecarTransport(fixture.SafeFailure);
 
         var response = await transport.InvokeActionAsync(request);
@@ -1150,14 +1286,15 @@ public sealed class SidecarCapabilityTransportTests
             InputSchema = new JsonSchemaReference("proxy.host.input", 1, "proxy-host-input"),
             ResultSchema = new JsonSchemaReference("proxy.host.result", 1, "proxy-host-result"),
         };
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("module-user"),
+            HostActionEntryIngress.Endpoint,
+            actionDeadline: call.Deadline);
         var moduleRequest = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
-            new RequestPrincipal("module-user"),
-            ExtensionFeatureSet.Empty,
-            Guid.NewGuid(),
-            Guid.NewGuid(),
-            call.Deadline);
+            context);
         var transport = new RecordingSidecarTransport(fixture.SafeFailure);
         var proxy = new TransportHostActionEntryProxy(transport, call);
 
@@ -1172,8 +1309,7 @@ public sealed class SidecarCapabilityTransportTests
     private static Fixture CreateFixture(
         int maxInFlight = 2,
         int maxCalls = 4,
-        IReadOnlyList<SidecarCapabilityKind>? capabilities = null,
-        HostActionEntryRequestContext? hostActionContext = null)
+        IReadOnlyList<SidecarCapabilityKind>? capabilities = null)
     {
         var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var expires = now.AddMinutes(5);
@@ -1200,17 +1336,6 @@ public sealed class SidecarCapabilityTransportTests
             safeFailure,
             "host-a",
             proof);
-        if (hostActionContext is not null)
-        {
-            binding = binding with
-            {
-                HostActionContext = hostActionContext with
-                {
-                    RequestId = binding.RequestId,
-                    ExpiresAt = expires,
-                },
-            };
-        }
         binding = binding with
         {
             Authentication = proof with
@@ -1236,6 +1361,33 @@ public sealed class SidecarCapabilityTransportTests
             1,
             now.AddMinutes(1));
         return new Fixture(now, binding, session, call, safeFailure, nonces);
+    }
+
+    private static HostActionEntryRequestContext IssueContext(
+        Fixture fixture,
+        RequestPrincipal caller,
+        HostActionEntryIngress ingress,
+        Guid? traceId = null,
+        Guid? idempotencyKey = null,
+        DateTimeOffset? actionDeadline = null)
+    {
+        var request = new HostActionEntryContextRequest(
+            ingress,
+            Guid.NewGuid(),
+            fixture.Binding.RequestId,
+            fixture.Binding.CancellationId,
+            caller,
+            ExtensionFeatureSet.Empty,
+            traceId ?? Guid.NewGuid(),
+            idempotencyKey ?? Guid.NewGuid(),
+            actionDeadline ?? fixture.Now.AddMinutes(1),
+            fixture.Binding.ExpiresAt);
+        var result = fixture.Session.IssueHostActionEntryContext(
+            request,
+            fixture.Now,
+            out var context);
+        Assert.True(result.Accepted, result.Message);
+        return context!;
     }
 
     private static SidecarSerializedPayload Payload<T>(string typeIdentity, T value)
@@ -1369,7 +1521,8 @@ public sealed class SidecarCapabilityTransportTests
                 descriptor,
                 action,
                 new SidecarCancellationIdentity(call.CancellationId, "proxy-cancel", call.Deadline),
-                request.Deadline);
+                request.Deadline,
+                request.Context);
             var response = await transport.InvokeActionAsync(sidecarRequest, cancellationToken);
             return new RecordedOutcome<TResult>(response.Outcome.Kind);
         }

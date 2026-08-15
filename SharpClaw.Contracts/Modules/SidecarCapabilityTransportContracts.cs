@@ -81,10 +81,7 @@ public sealed record SidecarCapabilitySessionBinding(
     SidecarConcurrencyLimits ConcurrencyLimits,
     SidecarSafeFailureIdentity SafeFailure,
     string AuthenticationKeyId,
-    SidecarAuthenticationProof Authentication)
-{
-    public HostActionEntryRequestContext? HostActionContext { get; init; }
-}
+    SidecarAuthenticationProof Authentication);
 
 public sealed record SidecarCapabilityAuthenticationAuthority(
     SidecarCapabilitySessionBinding Binding,
@@ -183,6 +180,8 @@ public sealed class SidecarCapabilitySession
     private readonly Dictionary<Guid, SidecarCapabilityKind> _calls = [];
     private readonly Dictionary<Guid, SidecarCapabilityCallIdentity> _callIdentities = [];
     private readonly Dictionary<Guid, SidecarSerializedPayload?> _callPayloads = [];
+    private readonly Dictionary<Guid, HostActionEntryRequestContext> _issuedEntryContexts = [];
+    private readonly Dictionary<Guid, HostActionEntryRequestContext> _callEntryContexts = [];
     private readonly HashSet<Guid> _completedCalls = [];
     private readonly HashSet<string> _nonces = new(StringComparer.Ordinal);
     private readonly Dictionary<Guid, Guid> _terminalCalls = [];
@@ -250,10 +249,14 @@ public sealed class SidecarCapabilitySession
                 return bindingResult;
 
             var authority = request.Authority;
-            if (Binding.HostActionContext is null ||
+            if (!_callEntryContexts.TryGetValue(authority.CallId, out var entryContext) ||
                 !HostActionEntryAuthorityValidator.MatchesAuthorityContext(
                     authority,
-                    Binding.HostActionContext))
+                    entryContext) ||
+                request.Request.Context is null ||
+                !HostActionEntryAuthorityValidator.SameContext(
+                    request.Request.Context,
+                    entryContext))
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
@@ -292,6 +295,60 @@ public sealed class SidecarCapabilitySession
         }
     }
 
+    public SidecarCapabilityValidationResult IssueHostActionEntryContext(
+        HostActionEntryContextRequest request,
+        DateTimeOffset now,
+        out HostActionEntryRequestContext? context)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        context = null;
+
+        lock (_sync)
+        {
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            if (!request.IsWellFormed(now) ||
+                request.RequestId != Binding.RequestId ||
+                request.CancellationId != Binding.CancellationId ||
+                request.ExpiresAt > Binding.ExpiresAt)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The host action entry context does not match the session authority.");
+            }
+
+            var capabilityId = Guid.NewGuid();
+            var capabilityHandle = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+            context = new HostActionEntryRequestContext(
+                capabilityId,
+                capabilityHandle,
+                request.Ingress,
+                request.InvocationId,
+                request.RequestId,
+                request.CancellationId,
+                request.Caller,
+                request.Features,
+                request.TraceId,
+                request.IdempotencyKey,
+                request.Deadline,
+                request.ExpiresAt);
+            _issuedEntryContexts.Add(capabilityId, context);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
     public SidecarCapabilityValidationResult IssueHostActionEntry<TAction, TResult>(
         HostActionEntryRequest<TAction, TResult> request,
         Guid callId,
@@ -319,25 +376,22 @@ public sealed class SidecarCapabilitySession
             if (!bindingResult.Accepted)
                 return bindingResult;
 
-            if (Binding.HostActionContext is null ||
-                !Binding.HostActionContext.IsWellFormed(now) ||
-                !request.IsWellFormed(now) ||
-                !HostActionEntryAuthorityValidator.MatchesRequestContext(
-                    request,
-                    Binding.HostActionContext) ||
+            if (!request.IsWellFormed(now) ||
                 callId == Guid.Empty ||
                 !_calls.TryGetValue(callId, out var capability) ||
                 capability != SidecarCapabilityKind.Action ||
                 !_callIdentities.TryGetValue(callId, out var activeCall) ||
+                !_callEntryContexts.TryGetValue(callId, out var entryContext) ||
+                !HostActionEntryAuthorityValidator.SameContext(request.Context, entryContext) ||
                 !_callPayloads.TryGetValue(callId, out var callPayload) ||
                 callPayload is null)
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
-                    "The host action entry request does not match the active host request context.");
+                    "The host action entry request does not match the issued context.");
             }
 
-            if (activeCall.Deadline != request.Deadline ||
+            if (activeCall.Deadline != request.Context.Deadline ||
                 activeCall.SessionId != Binding.SessionId ||
                 activeCall.RequestId != Binding.RequestId ||
                 activeCall.CancellationId != Binding.CancellationId)
@@ -371,10 +425,10 @@ public sealed class SidecarCapabilitySession
                 activeCall.CallId,
                 activeCall.ReplayNonce,
                 activeCall.Sequence,
-                Binding.HostActionContext.Caller,
-                Binding.HostActionContext.Features,
-                Binding.HostActionContext.TraceId,
-                Binding.HostActionContext.IdempotencyKey,
+                request.Context.Caller,
+                request.Context.Features,
+                request.Context.TraceId,
+                request.Context.IdempotencyKey,
                 request.Descriptor.Key,
                 request.Descriptor.Version,
                 request.Descriptor.Category,
@@ -389,8 +443,15 @@ public sealed class SidecarCapabilitySession
                 actionBytes.Length,
                 activeCall.Deadline,
                 now,
-                activeCall.Deadline,
-                string.Empty);
+                request.Context.ExpiresAt,
+                string.Empty)
+            {
+                Ingress = request.Context.Ingress,
+                InvocationId = request.Context.InvocationId,
+                CapabilityId = request.Context.CapabilityId,
+                CapabilityHandleHash = HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(
+                    request.Context.CapabilityHandle),
+            };
             var proof = issueProof(authority);
             if (string.IsNullOrWhiteSpace(proof))
                 return SidecarCapabilityValidationResult.Reject(
@@ -409,7 +470,8 @@ public sealed class SidecarCapabilitySession
         SidecarCapabilityKind capability,
         SidecarSerializedPayload? payload,
         int frameByteLength,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        HostActionEntryRequestContext? hostContext = null)
     {
         lock (_sync)
         {
@@ -431,6 +493,23 @@ public sealed class SidecarCapabilitySession
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Unauthorized,
                     "The session grant does not allow this capability.");
+
+            if (capability != SidecarCapabilityKind.Action && hostContext is not null)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "Only action calls can carry a host action entry context.");
+
+            if (hostContext is not null &&
+                (!hostContext.IsWellFormed(now) ||
+                 !_issuedEntryContexts.TryGetValue(hostContext.CapabilityId, out var issuedContext) ||
+                 !HostActionEntryAuthorityValidator.SameContext(hostContext, issuedContext) ||
+                 hostContext.RequestId != Binding.RequestId ||
+                 hostContext.CancellationId != Binding.CancellationId))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The host action entry context was not issued by this session.");
+            }
 
             if (!identity.IsValid ||
                 identity.SessionId != Binding.SessionId ||
@@ -494,6 +573,11 @@ public sealed class SidecarCapabilitySession
             _calls.Add(identity.CallId, capability);
             _callIdentities.Add(identity.CallId, identity);
             _callPayloads.Add(identity.CallId, payload);
+            if (hostContext is not null)
+            {
+                _callEntryContexts.Add(identity.CallId, hostContext);
+                _issuedEntryContexts.Remove(hostContext.CapabilityId);
+            }
             _lastSequence = identity.Sequence;
             _totalCalls++;
             _inFlight++;
@@ -580,6 +664,7 @@ public sealed class SidecarCapabilitySession
             _terminalCalls.Remove(callId);
             _terminalReceipts.Remove(callId);
             _callPayloads.Remove(callId);
+            _callEntryContexts.Remove(callId);
             _inFlight--;
             return SidecarCapabilityValidationResult.Accept();
         }
@@ -593,6 +678,8 @@ public sealed class SidecarCapabilitySession
             _calls.Clear();
             _callIdentities.Clear();
             _callPayloads.Clear();
+            _callEntryContexts.Clear();
+            _issuedEntryContexts.Clear();
             _terminalCalls.Clear();
             _terminalReceipts.Clear();
             _inFlight = 0;
@@ -617,8 +704,7 @@ public static class SidecarCapabilitySessionValidator
             binding.PayloadLimits,
             binding.ConcurrencyLimits,
             binding.SafeFailure,
-            binding.AuthenticationKeyId,
-            binding.HostActionContext);
+            binding.AuthenticationKeyId);
         return SidecarCapabilityTransportCodec.ComputeSha256(
             SidecarCapabilityTransportCodec.Serialize(authority));
     }
@@ -653,16 +739,6 @@ public static class SidecarCapabilitySessionValidator
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidBinding,
                 "The sidecar capability binding is incomplete.");
-        }
-
-        if (binding.HostActionContext is not null &&
-            (!binding.HostActionContext.IsWellFormed(now) ||
-             binding.HostActionContext.RequestId != binding.RequestId ||
-             binding.HostActionContext.ExpiresAt != binding.ExpiresAt))
-        {
-            return SidecarCapabilityValidationResult.Reject(
-                SidecarCapabilityErrors.InvalidBinding,
-                "The host action request context does not bind to the session.");
         }
 
         if (binding.ExpiresAt <= now)
@@ -723,8 +799,7 @@ public static class SidecarCapabilitySessionValidator
         SidecarPayloadLimits PayloadLimits,
         SidecarConcurrencyLimits ConcurrencyLimits,
         SidecarSafeFailureIdentity SafeFailure,
-        string AuthenticationKeyId,
-        HostActionEntryRequestContext? HostActionContext);
+        string AuthenticationKeyId);
 }
 
 public sealed record SidecarStorageCapabilityRequest(
@@ -868,12 +943,15 @@ public sealed record SidecarActionCapabilityRequest(
     SidecarTerminalContinuationRequest? Continuation,
     DateTimeOffset Deadline)
 {
+    public HostActionEntryRequestContext? HostContext { get; init; }
+
     public static SidecarActionCapabilityRequest HostEntry(
         SidecarCapabilityCallIdentity call,
         SidecarActionDescriptorIdentity descriptor,
         SidecarSerializedPayload action,
         SidecarCancellationIdentity cancellation,
-        DateTimeOffset deadline) =>
+        DateTimeOffset deadline,
+        HostActionEntryRequestContext hostContext) =>
         new(
             call,
             SidecarActionInvocationKind.HostEntry,
@@ -882,7 +960,10 @@ public sealed record SidecarActionCapabilityRequest(
             null,
             cancellation,
             null,
-            deadline);
+            deadline)
+        {
+            HostContext = hostContext,
+        };
 }
 
 public sealed record SidecarActionResultIdentity(
@@ -1156,7 +1237,11 @@ public static class SidecarCapabilityTransportValidation
             request.Action.SchemaVersion != request.Descriptor.InputSchemaVersion ||
             requiresSnapshot &&
             (request.Snapshot is null || string.IsNullOrWhiteSpace(request.Snapshot.ContractHash)) ||
-            hostEntry && request.Snapshot is not null)
+            hostEntry &&
+            (request.Snapshot is not null ||
+             request.HostContext is null ||
+             !request.HostContext.IsWellFormed(now)) ||
+            !hostEntry && request.HostContext is not null)
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidPayload,
