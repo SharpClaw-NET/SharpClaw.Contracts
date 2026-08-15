@@ -222,18 +222,52 @@ public sealed record HostActionEntryLineage(
     string InputTypeIdentity,
     int InputSchemaVersion,
     string InputSchemaHash,
-    string PayloadContentHash,
-    int PayloadByteLength)
+    string? PayloadContentHash,
+    int? PayloadByteLength)
 {
-    public bool IsWellFormed =>
+    public bool IsDescriptorWellFormed =>
         !string.IsNullOrWhiteSpace(ActionKey.Value) &&
         ActionVersion >= 1 &&
         !string.IsNullOrWhiteSpace(DescriptorHash) &&
         !string.IsNullOrWhiteSpace(InputTypeIdentity) &&
         InputSchemaVersion >= 1 &&
-        !string.IsNullOrWhiteSpace(InputSchemaHash) &&
+        !string.IsNullOrWhiteSpace(InputSchemaHash);
+
+    public bool IsPayloadBound =>
         !string.IsNullOrWhiteSpace(PayloadContentHash) &&
-        PayloadByteLength > 0;
+        PayloadByteLength is > 0;
+
+    public bool IsWellFormed =>
+        IsDescriptorWellFormed &&
+        ((PayloadContentHash is null && PayloadByteLength is null) || IsPayloadBound);
+}
+
+public sealed record HostActionEntryIngressBinding(
+    HostActionEntryIngress Ingress,
+    string PrimaryIdentity,
+    string? SecondaryIdentity = null)
+{
+    public bool IsWellFormed =>
+        Enum.IsDefined(Ingress) &&
+        !string.IsNullOrWhiteSpace(PrimaryIdentity) &&
+        Ingress switch
+        {
+            HostActionEntryIngress.CrossModule =>
+                !string.IsNullOrWhiteSpace(SecondaryIdentity) &&
+                !string.Equals(PrimaryIdentity, SecondaryIdentity, StringComparison.Ordinal),
+            _ => SecondaryIdentity is null,
+        };
+}
+
+public sealed record HostActionEntryContribution(
+    HostActionEntryIngressBinding IngressBinding,
+    HostActionEntryLineage Lineage)
+{
+    public bool IsWellFormed =>
+        IngressBinding is not null &&
+        IngressBinding.IsWellFormed &&
+        Lineage is not null &&
+        Lineage.IsWellFormed;
 }
 
 public sealed record HostActionEntryContextRequest(
@@ -248,7 +282,7 @@ public sealed record HostActionEntryContextRequest(
     DateTimeOffset Deadline,
     DateTimeOffset ExpiresAt)
 {
-    public HostActionEntryLineage? Lineage { get; init; }
+    public HostActionEntryContribution? Contribution { get; init; }
 
     public bool IsWellFormed(DateTimeOffset now) =>
         Enum.IsDefined(Ingress) &&
@@ -263,8 +297,10 @@ public sealed record HostActionEntryContextRequest(
         IdempotencyKey != Guid.Empty &&
         Deadline > now &&
         ExpiresAt >= Deadline &&
-        Lineage is not null &&
-        Lineage.IsWellFormed;
+        Contribution is not null &&
+        Contribution.IsWellFormed &&
+        Contribution.IngressBinding.Ingress == Ingress &&
+        !Contribution.Lineage.IsPayloadBound;
 }
 
 public sealed record HostEndpointInvocation(
@@ -278,6 +314,8 @@ public sealed record HostEndpointInvocation(
         HostActionContext is not null &&
         HostActionContext.Ingress == HostActionEntryIngress.Endpoint &&
         HostActionContext.InvocationId == InvocationId &&
+        HostActionContext.Contribution?.IngressBinding.Ingress == HostActionEntryIngress.Endpoint &&
+        string.Equals(HostActionContext.Contribution.IngressBinding.PrimaryIdentity, Endpoint, StringComparison.Ordinal) &&
         HostActionContext.IsWellFormed(now);
 }
 
@@ -295,6 +333,9 @@ public sealed record CrossModuleActionInvocation(
         HostActionContext is not null &&
         HostActionContext.Ingress == HostActionEntryIngress.CrossModule &&
         HostActionContext.InvocationId == InvocationId &&
+        HostActionContext.Contribution?.IngressBinding.Ingress == HostActionEntryIngress.CrossModule &&
+        string.Equals(HostActionContext.Contribution.IngressBinding.PrimaryIdentity, SourceModuleId, StringComparison.Ordinal) &&
+        string.Equals(HostActionContext.Contribution.IngressBinding.SecondaryIdentity, TargetModuleId, StringComparison.Ordinal) &&
         HostActionContext.IsWellFormed(now);
 }
 
@@ -383,7 +424,7 @@ public sealed record HostActionEntryRequestContext(
     DateTimeOffset Deadline,
     DateTimeOffset ExpiresAt)
 {
-    public HostActionEntryLineage? Lineage { get; init; }
+    public HostActionEntryContribution? Contribution { get; init; }
 
     public bool IsWellFormed(DateTimeOffset now) =>
         CapabilityId != Guid.Empty &&
@@ -400,8 +441,8 @@ public sealed record HostActionEntryRequestContext(
         IdempotencyKey != Guid.Empty &&
         Deadline > now &&
         ExpiresAt >= Deadline &&
-        Lineage is not null &&
-        Lineage.IsWellFormed;
+        Contribution is not null &&
+        Contribution.IsWellFormed;
 }
 
 public sealed record HostActionEntryRequest<TAction, TResult>(
@@ -499,7 +540,7 @@ public static class HostActionEntryAuthorityValidator
             !string.Equals(authority.ActionContentHash, actionContentHash, StringComparison.Ordinal) ||
             authority.ActionByteLength != actionBytes.Length ||
             !SameContext(authority, request.Context) ||
-            !MatchesLineage(request.Context.Lineage, request.Descriptor, request.Action) ||
+            !MatchesDescriptorLineage(request.Context.Contribution?.Lineage, request.Descriptor) ||
             !string.Equals(authority.CapabilityHandleHash,
                 ComputeCapabilityHandleHash(request.Context.CapabilityHandle),
                 StringComparison.OrdinalIgnoreCase))
@@ -537,20 +578,30 @@ public static class HostActionEntryAuthorityValidator
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action)
     {
-        if (lineage is null || !lineage.IsWellFormed ||
-            descriptor.InputSchema is null || descriptor.ResultSchema is null)
+        if (!MatchesDescriptorLineage(lineage, descriptor) ||
+            lineage is null || !lineage.IsPayloadBound)
             return false;
 
         var actionBytes = SidecarCapabilityTransportCodec.Serialize(action);
         var actionHash = Convert.ToHexString(SHA256.HashData(actionBytes));
+        return string.Equals(lineage.PayloadContentHash, actionHash, StringComparison.OrdinalIgnoreCase) &&
+               lineage.PayloadByteLength == actionBytes.Length;
+    }
+
+    public static bool MatchesDescriptorLineage<TAction, TResult>(
+        HostActionEntryLineage? lineage,
+        ActionDescriptor<TAction, TResult> descriptor)
+    {
+        if (lineage is null || !lineage.IsDescriptorWellFormed ||
+            descriptor.InputSchema is null || descriptor.ResultSchema is null)
+            return false;
+
         return string.Equals(lineage.ActionKey.Value, descriptor.Key.Value, StringComparison.Ordinal) &&
                lineage.ActionVersion == descriptor.Version &&
                string.Equals(lineage.DescriptorHash, ComputeDescriptorHash(descriptor), StringComparison.Ordinal) &&
                string.Equals(lineage.InputTypeIdentity, TypeIdentity<TAction>(), StringComparison.Ordinal) &&
                lineage.InputSchemaVersion == descriptor.InputSchema.Version &&
-               string.Equals(lineage.InputSchemaHash, descriptor.InputSchema.ContentHash, StringComparison.Ordinal) &&
-               string.Equals(lineage.PayloadContentHash, actionHash, StringComparison.OrdinalIgnoreCase) &&
-               lineage.PayloadByteLength == actionBytes.Length;
+               string.Equals(lineage.InputSchemaHash, descriptor.InputSchema.ContentHash, StringComparison.Ordinal);
     }
 
     public static bool SameContext(
@@ -568,11 +619,36 @@ public static class HostActionEntryAuthorityValidator
         left.IdempotencyKey == right.IdempotencyKey &&
         left.Deadline == right.Deadline &&
         left.ExpiresAt == right.ExpiresAt &&
-        SameLineage(left.Lineage, right.Lineage);
+        SameContribution(left.Contribution, right.Contribution, includePayload: true);
+
+    public static bool SameContextIgnoringPayload(
+        HostActionEntryRequestContext left,
+        HostActionEntryRequestContext right) =>
+        left.CapabilityId == right.CapabilityId &&
+        string.Equals(left.CapabilityHandle, right.CapabilityHandle, StringComparison.Ordinal) &&
+        left.Ingress == right.Ingress &&
+        left.InvocationId == right.InvocationId &&
+        left.RequestId == right.RequestId &&
+        left.CancellationId == right.CancellationId &&
+        SamePrincipal(left.Caller, right.Caller) &&
+        SameFeatures(left.Features, right.Features) &&
+        left.TraceId == right.TraceId &&
+        left.IdempotencyKey == right.IdempotencyKey &&
+        left.Deadline == right.Deadline &&
+        left.ExpiresAt == right.ExpiresAt &&
+        SameContribution(left.Contribution, right.Contribution, includePayload: false);
 
     private static bool SameLineage(
         HostActionEntryLineage? left,
         HostActionEntryLineage? right) =>
+        left is not null &&
+        right is not null &&
+        SameLineage(left, right, includePayload: true);
+
+    private static bool SameLineage(
+        HostActionEntryLineage? left,
+        HostActionEntryLineage? right,
+        bool includePayload) =>
         left is not null &&
         right is not null &&
         left.ActionKey.Value == right.ActionKey.Value &&
@@ -581,8 +657,20 @@ public static class HostActionEntryAuthorityValidator
         string.Equals(left.InputTypeIdentity, right.InputTypeIdentity, StringComparison.Ordinal) &&
         left.InputSchemaVersion == right.InputSchemaVersion &&
         string.Equals(left.InputSchemaHash, right.InputSchemaHash, StringComparison.Ordinal) &&
-        string.Equals(left.PayloadContentHash, right.PayloadContentHash, StringComparison.OrdinalIgnoreCase) &&
-        left.PayloadByteLength == right.PayloadByteLength;
+        (!includePayload ||
+         (string.Equals(left.PayloadContentHash, right.PayloadContentHash, StringComparison.OrdinalIgnoreCase) &&
+          left.PayloadByteLength == right.PayloadByteLength));
+
+    private static bool SameContribution(
+        HostActionEntryContribution? left,
+        HostActionEntryContribution? right,
+        bool includePayload) =>
+        left is not null &&
+        right is not null &&
+        left.IngressBinding.Ingress == right.IngressBinding.Ingress &&
+        string.Equals(left.IngressBinding.PrimaryIdentity, right.IngressBinding.PrimaryIdentity, StringComparison.Ordinal) &&
+        string.Equals(left.IngressBinding.SecondaryIdentity, right.IngressBinding.SecondaryIdentity, StringComparison.Ordinal) &&
+        SameLineage(left.Lineage, right.Lineage, includePayload);
 
     private static bool SameContext(
         HostActionEntryAuthority authority,

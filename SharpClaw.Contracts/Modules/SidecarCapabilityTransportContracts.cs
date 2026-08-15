@@ -254,7 +254,7 @@ public sealed class SidecarCapabilitySession
                     authority,
                     entryContext) ||
                 request.Request.Context is null ||
-                !HostActionEntryAuthorityValidator.SameContext(
+                !HostActionEntryAuthorityValidator.SameContextIgnoringPayload(
                     request.Request.Context,
                     entryContext))
             {
@@ -345,7 +345,7 @@ public sealed class SidecarCapabilitySession
                 request.Deadline,
                 request.ExpiresAt)
             {
-                Lineage = request.Lineage,
+                Contribution = request.Contribution,
             };
             _issuedEntryContexts.Add(capabilityId, context);
             return SidecarCapabilityValidationResult.Accept();
@@ -385,9 +385,9 @@ public sealed class SidecarCapabilitySession
                 capability != SidecarCapabilityKind.Action ||
                  !_callIdentities.TryGetValue(callId, out var activeCall) ||
                  !_callEntryContexts.TryGetValue(callId, out var entryContext) ||
-                 !HostActionEntryAuthorityValidator.SameContext(request.Context, entryContext) ||
+                 !HostActionEntryAuthorityValidator.SameContextIgnoringPayload(request.Context, entryContext) ||
                  !HostActionEntryAuthorityValidator.MatchesLineage(
-                     request.Context.Lineage,
+                     entryContext.Contribution?.Lineage,
                      request.Descriptor,
                      request.Action) ||
                  !_callPayloads.TryGetValue(callId, out var callPayload) ||
@@ -551,12 +551,10 @@ public sealed class SidecarCapabilitySession
                 return payloadResult;
 
             if (hostContext is not null &&
-                (hostContext.Lineage is null ||
+                (hostContext.Contribution?.Lineage is null ||
                  payload is null ||
-                 !string.Equals(hostContext.Lineage.InputTypeIdentity, payload.TypeIdentity, StringComparison.Ordinal) ||
-                 hostContext.Lineage.InputSchemaVersion != payload.SchemaVersion ||
-                 !string.Equals(hostContext.Lineage.PayloadContentHash, payload.ContentHash, StringComparison.OrdinalIgnoreCase) ||
-                 hostContext.Lineage.PayloadByteLength != payload.ByteLength))
+                 !string.Equals(hostContext.Contribution.Lineage.InputTypeIdentity, payload.TypeIdentity, StringComparison.Ordinal) ||
+                 hostContext.Contribution.Lineage.InputSchemaVersion != payload.SchemaVersion))
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
@@ -595,7 +593,17 @@ public sealed class SidecarCapabilitySession
             _callPayloads.Add(identity.CallId, payload);
             if (hostContext is not null)
             {
-                _callEntryContexts.Add(identity.CallId, hostContext);
+                var capturedLineage = hostContext.Contribution!.Lineage with
+                {
+                    PayloadContentHash = payload!.ContentHash,
+                    PayloadByteLength = payload.ByteLength,
+                };
+                _callEntryContexts.Add(
+                    identity.CallId,
+                    hostContext with
+                    {
+                        Contribution = hostContext.Contribution with { Lineage = capturedLineage },
+                    });
                 _issuedEntryContexts.Remove(hostContext.CapabilityId);
             }
             _lastSequence = identity.Sequence;
@@ -1276,15 +1284,19 @@ public static class SidecarCapabilityTransportValidation
             return payloadResult;
 
         if (hostEntry &&
-            (request.HostContext!.Lineage is null ||
-             !string.Equals(request.HostContext.Lineage.ActionKey.Value, request.Descriptor.Key.Value, StringComparison.Ordinal) ||
-             request.HostContext.Lineage.ActionVersion != request.Descriptor.Version ||
-             !string.Equals(request.HostContext.Lineage.DescriptorHash, request.Descriptor.DescriptorHash, StringComparison.Ordinal) ||
-             !string.Equals(request.HostContext.Lineage.InputTypeIdentity, request.Action.TypeIdentity, StringComparison.Ordinal) ||
-             request.HostContext.Lineage.InputSchemaVersion != request.Action.SchemaVersion ||
-             !string.Equals(request.HostContext.Lineage.InputSchemaHash, request.Descriptor.InputSchemaHash, StringComparison.Ordinal) ||
-             !string.Equals(request.HostContext.Lineage.PayloadContentHash, request.Action.ContentHash, StringComparison.OrdinalIgnoreCase) ||
-             request.HostContext.Lineage.PayloadByteLength != request.Action.ByteLength))
+            (request.HostContext!.Contribution?.Lineage is null ||
+             !string.Equals(request.HostContext.Contribution.Lineage.ActionKey.Value, request.Descriptor.Key.Value, StringComparison.Ordinal) ||
+             request.HostContext.Contribution.Lineage.ActionVersion != request.Descriptor.Version ||
+             !string.Equals(request.HostContext.Contribution.Lineage.DescriptorHash, request.Descriptor.DescriptorHash, StringComparison.Ordinal) ||
+             !string.Equals(request.HostContext.Contribution.Lineage.InputTypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
+             request.HostContext.Contribution.Lineage.InputSchemaVersion != request.Descriptor.InputSchemaVersion ||
+             !string.Equals(request.HostContext.Contribution.Lineage.InputSchemaHash, request.Descriptor.InputSchemaHash, StringComparison.Ordinal) ||
+             request.HostContext.Contribution.Lineage.IsPayloadBound &&
+             (!string.Equals(
+                 request.HostContext.Contribution.Lineage.PayloadContentHash,
+                 request.Action.ContentHash,
+                 StringComparison.OrdinalIgnoreCase) ||
+              request.HostContext.Contribution.Lineage.PayloadByteLength != request.Action.ByteLength)))
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.SpoofedIdentity,

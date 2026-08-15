@@ -14,7 +14,19 @@ public sealed record ModuleCliInvocation(
     Guid InvocationId,
     string Command,
     IReadOnlyList<string> Arguments,
-    HostActionEntryRequestContext HostActionContext);
+    HostActionEntryRequestContext HostActionContext)
+{
+    public bool IsWellFormed(DateTimeOffset now) =>
+        InvocationId != Guid.Empty &&
+        !string.IsNullOrWhiteSpace(Command) &&
+        Arguments is not null &&
+        HostActionContext is not null &&
+        HostActionContext.Ingress == HostActionEntryIngress.Cli &&
+        HostActionContext.InvocationId == InvocationId &&
+        HostActionContext.Contribution?.IngressBinding.Ingress == HostActionEntryIngress.Cli &&
+        string.Equals(HostActionContext.Contribution.IngressBinding.PrimaryIdentity, Command, StringComparison.Ordinal) &&
+        HostActionContext.IsWellFormed(now);
+}
 
 public sealed record ModuleCliOutput(
     string Stream,

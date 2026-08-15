@@ -144,6 +144,17 @@ public sealed record ToolInvocation(
 {
     public RequestPrincipal Caller => HostActionContext.Caller;
     public ExtensionFeatureSet Features => HostActionContext.Features;
+
+    public bool IsWellFormed(DateTimeOffset now) =>
+        InvocationId != Guid.Empty &&
+        !string.IsNullOrWhiteSpace(ToolCallId) &&
+        !string.IsNullOrWhiteSpace(ToolName) &&
+        HostActionContext is not null &&
+        HostActionContext.Ingress == HostActionEntryIngress.Tool &&
+        HostActionContext.InvocationId == InvocationId &&
+        HostActionContext.Contribution?.IngressBinding.Ingress == HostActionEntryIngress.Tool &&
+        string.Equals(HostActionContext.Contribution.IngressBinding.PrimaryIdentity, ToolName, StringComparison.Ordinal) &&
+        HostActionContext.IsWellFormed(now);
 }
 
 /// <summary>One tool result returned by a module handler.</summary>

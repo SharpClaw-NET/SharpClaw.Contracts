@@ -369,14 +369,21 @@ public sealed class SimpleKernelContractTests
             deadline,
             now.AddMinutes(2))
         {
-            Lineage = lineage,
+            Contribution = new HostActionEntryContribution(
+                ingress switch
+                {
+                    HostActionEntryIngress.Endpoint => new HostActionEntryIngressBinding(ingress, "/demo"),
+                    HostActionEntryIngress.Cli => new HostActionEntryIngressBinding(ingress, "demo"),
+                    HostActionEntryIngress.Tool => new HostActionEntryIngressBinding(ingress, "clock_now"),
+                    _ => new HostActionEntryIngressBinding(ingress, "source.module", "target.module"),
+                },
+                lineage),
         };
 
     private static HostActionEntryLineage Lineage<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action)
     {
-        var bytes = SidecarCapabilityTransportCodec.Serialize(action);
         return new HostActionEntryLineage(
             descriptor.Key,
             descriptor.Version,
@@ -384,8 +391,8 @@ public sealed class SimpleKernelContractTests
             typeof(TAction).AssemblyQualifiedName!,
             descriptor.InputSchema!.Version,
             descriptor.InputSchema.ContentHash!,
-            SidecarCapabilityTransportCodec.ComputeSha256(bytes),
-            bytes.Length);
+            null,
+            null);
     }
 
     private sealed class RecordingHostActionEntry : IHostActionEntry
@@ -3361,8 +3368,8 @@ public sealed class SimpleKernelContractTests
                      typeof(JsonElement).AssemblyQualifiedName!,
                      1,
                      "tool-schema",
-                     "tool-payload",
-                     1),
+                     null,
+                     null),
                  HostActionEntryIngress.Tool));
         var turn = new ChatTurnInput(
             "What time is it?",
