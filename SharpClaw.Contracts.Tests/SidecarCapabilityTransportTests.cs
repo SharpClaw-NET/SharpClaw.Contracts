@@ -26,6 +26,126 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void Role_bearing_binding_round_trips_with_an_ordinal_canonical_fingerprint()
+    {
+        var roles = new HashSet<string>(StringComparer.Ordinal) { "writer", "reader" };
+        var fixture = CreateFixture(
+            hostActionContext: new HostActionEntryRequestContext(
+                Guid.Empty,
+                new RequestPrincipal("role-user", Roles: roles),
+                ExtensionFeatureSet.Empty,
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                new DateTimeOffset(2026, 8, 14, 12, 5, 0, TimeSpan.Zero)));
+
+        var encoded = SidecarCapabilityTransportCodec.Serialize(fixture.Binding);
+        var roundTrip = SidecarCapabilityTransportCodec.Deserialize<SidecarCapabilitySessionBinding>(encoded);
+        var reversed = SidecarCapabilityTransportCodec.Serialize(
+            fixture.Binding with
+            {
+                HostActionContext = fixture.Binding.HostActionContext! with
+                {
+                    Caller = fixture.Binding.HostActionContext.Caller with
+                    {
+                        Roles = new HashSet<string>(["reader", "writer"], StringComparer.Ordinal),
+                    },
+                },
+            });
+
+        Assert.NotNull(roundTrip.HostActionContext);
+        Assert.NotNull(roundTrip.HostActionContext.Caller.Roles);
+        Assert.True(roundTrip.HostActionContext.Caller.Roles.SetEquals(roles));
+        Assert.Equal(fixture.Binding.Authentication.BindingHash, roundTrip.Authentication.BindingHash);
+        Assert.Equal(encoded, SidecarCapabilityTransportCodec.Serialize(roundTrip));
+        Assert.Equal(encoded, reversed);
+        Assert.Equal(
+            SidecarCapabilityTransportCodec.ComputeSha256(encoded),
+            SidecarCapabilityTransportCodec.ComputeSha256(reversed));
+
+        var nullRoles = SidecarCapabilityTransportCodec.Deserialize<RequestPrincipal>(
+            SidecarCapabilityTransportCodec.Serialize(new RequestPrincipal("null-roles")));
+        Assert.Null(nullRoles.Roles);
+
+        var duplicateRoles = Encoding.UTF8.GetBytes(
+            "{\"subjectId\":\"role-user\",\"displayName\":null,\"roles\":[\"reader\",\"reader\"],\"isAuthenticated\":true}");
+        Assert.Throws<JsonException>(() =>
+            SidecarCapabilityTransportCodec.Deserialize<RequestPrincipal>(duplicateRoles));
+    }
+
+    [Fact]
+    public void Role_bearing_host_entry_requires_the_complete_caller_role_set()
+    {
+        var caller = new RequestPrincipal(
+            "role-user",
+            Roles: new HashSet<string>(["reader", "writer"], StringComparer.Ordinal));
+        var fixture = CreateFixture(
+            hostActionContext: new HostActionEntryRequestContext(
+                Guid.Empty,
+                caller,
+                ExtensionFeatureSet.Empty,
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                new DateTimeOffset(2026, 8, 14, 12, 5, 0, TimeSpan.Zero)));
+        var descriptor = new ActionDescriptor<string, string>(
+            new SharpClawActionKey("roles.action"),
+            1,
+            "roles",
+            ActionInterceptionCapabilities.Inspect,
+            ContainsSensitiveData: false,
+            HasIrreversibleEffects: false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "roles.action"),
+            ContinuationPolicy: null,
+            TimeSpan.FromSeconds(5))
+        {
+            InputSchema = new JsonSchemaReference("roles.input", 1, "roles-input"),
+            ResultSchema = new JsonSchemaReference("roles.result", 1, "roles-result"),
+        };
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "roles-entry",
+        };
+        var payload = Payload(typeof(string).AssemblyQualifiedName!, "input");
+        Assert.True(fixture.Session.BeginCall(call, SidecarCapabilityKind.Action, payload, payload.ByteLength, fixture.Now).Accepted);
+
+        var request = new HostActionEntryRequest<string, string>(
+            descriptor,
+            "input",
+            caller,
+            ExtensionFeatureSet.Empty,
+            fixture.Binding.HostActionContext!.TraceId,
+            fixture.Binding.HostActionContext.IdempotencyKey,
+            call.Deadline);
+        var issued = fixture.Session.IssueHostActionEntry(
+            request,
+            call.CallId,
+            fixture.Now,
+            authority => HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority),
+            out var transport);
+
+        Assert.True(issued.Accepted);
+        Assert.NotNull(transport);
+        Assert.True(fixture.Session.ValidateHostActionEntry(
+            transport!,
+            fixture.Now,
+            authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
+
+        foreach (var changedCaller in new[]
+        {
+            caller with { Roles = new HashSet<string>(["reader"], StringComparer.Ordinal) },
+            caller with { Roles = new HashSet<string>(["reader", "writer", "admin"], StringComparer.Ordinal) },
+            caller with { Roles = new HashSet<string>(["reader", "auditor"], StringComparer.Ordinal) },
+        })
+        {
+            Assert.False(fixture.Session.ValidateHostActionEntry(
+                transport! with { Request = request with { Caller = changedCaller } },
+                fixture.Now,
+                authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
+        }
+    }
+
+    [Fact]
     public void Session_authentication_binds_the_proof_to_immutable_authority_and_rejects_nonce_replay()
     {
         var fixture = CreateFixture();

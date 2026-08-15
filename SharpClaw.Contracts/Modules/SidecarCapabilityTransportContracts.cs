@@ -1619,13 +1619,17 @@ public interface ISidecarCapabilityTransport
 
 public static class SidecarCapabilityTransportCodec
 {
-    public static JsonSerializerOptions CreateJsonOptions() =>
-        new(JsonSerializerDefaults.Web)
+    public static JsonSerializerOptions CreateJsonOptions()
+    {
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web)
         {
             PropertyNameCaseInsensitive = false,
             UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
             WriteIndented = false,
         };
+        options.Converters.Add(new OrdinalRoleSetJsonConverter());
+        return options;
+    }
 
     public static byte[] Serialize<T>(T value)
     {
@@ -1639,4 +1643,61 @@ public static class SidecarCapabilityTransportCodec
 
     public static string ComputeSha256(ReadOnlySpan<byte> payload) =>
         Convert.ToHexString(SHA256.HashData(payload));
+
+    private sealed class OrdinalRoleSetJsonConverter : JsonConverter<IReadOnlySet<string>>
+    {
+        public override bool HandleNull => true;
+
+        public override IReadOnlySet<string>? Read(
+            ref Utf8JsonReader reader,
+            Type typeToConvert,
+            JsonSerializerOptions options)
+        {
+            if (reader.TokenType == JsonTokenType.Null)
+                return null;
+
+            if (reader.TokenType != JsonTokenType.StartArray)
+                throw new JsonException("Roles must be encoded as a JSON array.");
+
+            var roles = new HashSet<string>(StringComparer.Ordinal);
+            while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+            {
+                if (reader.TokenType != JsonTokenType.String)
+                    throw new JsonException("Each role must be a JSON string.");
+
+                var role = reader.GetString();
+                if (string.IsNullOrWhiteSpace(role) || !roles.Add(role))
+                    throw new JsonException("Roles must be nonempty and unique under ordinal comparison.");
+            }
+
+            if (reader.TokenType != JsonTokenType.EndArray)
+                throw new JsonException("The roles JSON array is incomplete.");
+
+            return roles;
+        }
+
+        public override void Write(
+            Utf8JsonWriter writer,
+            IReadOnlySet<string> value,
+            JsonSerializerOptions options)
+        {
+            if (value is null)
+            {
+                writer.WriteNullValue();
+                return;
+            }
+
+            var roles = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var role in value)
+            {
+                if (string.IsNullOrWhiteSpace(role) || !roles.Add(role))
+                    throw new JsonException("Roles must be nonempty and unique under ordinal comparison.");
+            }
+
+            writer.WriteStartArray();
+            foreach (var role in roles.OrderBy(item => item, StringComparer.Ordinal))
+                writer.WriteStringValue(role);
+            writer.WriteEndArray();
+        }
+    }
 }
