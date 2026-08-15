@@ -266,11 +266,6 @@ public sealed record SidecarToolHandlerInvokeStart(
             ToolName,
             StringComparison.Ordinal) &&
         !HostActionContext.Contribution.Lineage.IsPayloadBound &&
-        HostActionContext.Contribution.Lineage.InputSchemaVersion == InputSchema.Version &&
-        string.Equals(
-            HostActionContext.Contribution.Lineage.InputSchemaHash,
-            InputSchema.ContentHash,
-            StringComparison.Ordinal) &&
         Header.Deadline == HostActionContext.Deadline &&
         SamePrincipal(Caller, HostActionContext.Caller);
 

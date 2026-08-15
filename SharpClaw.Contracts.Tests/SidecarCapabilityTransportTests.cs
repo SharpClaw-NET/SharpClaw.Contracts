@@ -198,7 +198,7 @@ public sealed class SidecarCapabilityTransportTests
                 "tool-descriptor",
                 typeof(JsonElement).AssemblyQualifiedName!,
                 1,
-                "context-input-schema",
+                "action-input-schema",
                 null,
                 null));
         var limits = new SidecarPayloadLimits(1_048_576, 1_048_576, 1_048_576, 2_097_152, 512);
@@ -213,7 +213,7 @@ public sealed class SidecarCapabilityTransportTests
             "clock_now",
             "clock-handler",
             JsonSerializer.SerializeToElement(new { value = 1 }),
-            new JsonSchemaReference("clock.input", 1, "context-input-schema"),
+            new JsonSchemaReference("clock.input", 1, "tool-input-schema"),
             context.Caller,
             context);
 
@@ -243,7 +243,7 @@ public sealed class SidecarCapabilityTransportTests
         Assert.False(malformedInput.IsWellFormed(fixture.Now));
         var changedSchema = roundTrip with
         {
-            InputSchema = roundTrip.InputSchema with { ContentHash = "changed-schema" },
+            InputSchema = roundTrip.InputSchema with { Version = 0 },
         };
         Assert.False(changedSchema.IsWellFormed(fixture.Now));
         var wrongInvocation = roundTrip with
@@ -354,6 +354,75 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Now);
         Assert.False(expiredResult.Accepted);
         Assert.Equal(SidecarProtocolErrors.DeadlineExceeded, expiredResult.ErrorCode);
+    }
+
+    [Fact]
+    public void Tool_start_keeps_raw_tool_schema_separate_from_action_lineage()
+    {
+        var fixture = CreateFixture();
+        var descriptor = new ActionDescriptor<string, string>(
+            new SharpClawActionKey("agents.api.dispatch"),
+            1,
+            "agents",
+            ActionInterceptionCapabilities.Inspect,
+            ContainsSensitiveData: false,
+            HasIrreversibleEffects: false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "agents.api.dispatch"),
+            ContinuationPolicy: null,
+            TimeSpan.FromSeconds(5))
+        {
+            InputSchema = new JsonSchemaReference("agents.action.input", 1, "action-input-schema"),
+            ResultSchema = new JsonSchemaReference("agents.action.result", 1, "action-result-schema"),
+        };
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("tool-user"),
+            HostActionEntryIngress.Tool,
+            actionDeadline: fixture.Call.Deadline,
+            lineage: Lineage(descriptor, "input"));
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "tool-action-call",
+        };
+        var start = new SidecarToolHandlerInvokeStart(
+            new SidecarMessageHeader(
+                1,
+                1,
+                context.Deadline,
+                new SidecarMessageSizeAuthority(1024, 1_048_576)),
+            context.InvocationId,
+            "clock_now",
+            "clock-handler",
+            JsonSerializer.SerializeToElement(new { timezone = "UTC" }),
+            new JsonSchemaReference("clock.tool.input", 1, "tool-input-schema"),
+            context.Caller,
+            context);
+
+        Assert.True(start.IsWellFormed(fixture.Now));
+
+        var actionPayload = Payload(typeof(string).AssemblyQualifiedName!, "input");
+        Assert.True(fixture.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            actionPayload,
+            actionPayload.ByteLength,
+            fixture.Now,
+            context).Accepted);
+
+        var issued = fixture.Session.IssueHostActionEntry(
+            new HostActionEntryRequest<string, string>(descriptor, "input", context),
+            call.CallId,
+            fixture.Now,
+            authority => HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority),
+            out var transport);
+
+        Assert.True(issued.Accepted, issued.Message);
+        Assert.NotNull(transport);
+        Assert.Equal("tool-input-schema", start.InputSchema.ContentHash);
+        Assert.Equal("action-input-schema", context.Contribution!.Lineage.InputSchemaHash);
+        Assert.Equal(actionPayload.ContentHash, transport!.Authority.ActionContentHash);
     }
 
     [Fact]
