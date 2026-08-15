@@ -81,7 +81,6 @@ public sealed class SidecarCapabilityTransportTests
             "role-user",
             Roles: new HashSet<string>(["reader", "writer"], StringComparer.Ordinal));
         var fixture = CreateFixture();
-        var context = IssueContext(fixture, caller, HostActionEntryIngress.Cli);
         var descriptor = new ActionDescriptor<string, string>(
             new SharpClawActionKey("roles.action"),
             1,
@@ -96,6 +95,11 @@ public sealed class SidecarCapabilityTransportTests
             InputSchema = new JsonSchemaReference("roles.input", 1, "roles-input"),
             ResultSchema = new JsonSchemaReference("roles.result", 1, "roles-result"),
         };
+        var context = IssueContext(
+            fixture,
+            caller,
+            HostActionEntryIngress.Cli,
+            lineage: Lineage(descriptor, "input"));
         var call = fixture.Call with
         {
             Capability = SidecarCapabilityKind.Action,
@@ -178,6 +182,66 @@ public sealed class SidecarCapabilityTransportTests
                 fixture.Now,
                 authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
         }
+    }
+
+    [Fact]
+    public void All_ingress_carriers_round_trip_the_issued_context()
+    {
+        var fixture = CreateFixture();
+        var endpointContext = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint"),
+            HostActionEntryIngress.Endpoint);
+        var cliContext = IssueContext(
+            fixture,
+            new RequestPrincipal("cli"),
+            HostActionEntryIngress.Cli);
+        var toolContext = IssueContext(
+            fixture,
+            new RequestPrincipal("tool"),
+            HostActionEntryIngress.Tool);
+        var crossModuleContext = IssueContext(
+            fixture,
+            new RequestPrincipal("cross-module"),
+            HostActionEntryIngress.CrossModule);
+
+        var endpoint = new HostEndpointInvocation(
+            endpointContext.InvocationId,
+            "/demo",
+            endpointContext);
+        var crossModule = new CrossModuleActionInvocation(
+            crossModuleContext.InvocationId,
+            "source.module",
+            "target.module",
+            crossModuleContext);
+        var cli = new ModuleCliInvocation(
+            cliContext.InvocationId,
+            "demo",
+            [],
+            cliContext);
+        var tool = new ToolInvocation(
+            toolContext.InvocationId,
+            null,
+            "tool-call",
+            "demo",
+            JsonDocument.Parse("{}").RootElement.Clone(),
+            toolContext);
+
+        var endpointRoundTrip = SidecarCapabilityTransportCodec.Deserialize<HostEndpointInvocation>(
+            SidecarCapabilityTransportCodec.Serialize(endpoint));
+        var crossModuleRoundTrip = SidecarCapabilityTransportCodec.Deserialize<CrossModuleActionInvocation>(
+            SidecarCapabilityTransportCodec.Serialize(crossModule));
+        var cliRoundTrip = SidecarCapabilityTransportCodec.Deserialize<ModuleCliInvocation>(
+            SidecarCapabilityTransportCodec.Serialize(cli));
+        var toolRoundTrip = SidecarCapabilityTransportCodec.Deserialize<ToolInvocation>(
+            SidecarCapabilityTransportCodec.Serialize(tool));
+
+        Assert.True(endpointRoundTrip.IsWellFormed(fixture.Now));
+        Assert.True(crossModuleRoundTrip.IsWellFormed(fixture.Now));
+        Assert.Equal(HostActionEntryIngress.Cli, cliRoundTrip.HostActionContext.Ingress);
+        Assert.Equal(HostActionEntryIngress.Tool, toolRoundTrip.HostActionContext.Ingress);
+        Assert.Equal(endpointContext.CapabilityId, endpointRoundTrip.HostActionContext.CapabilityId);
+        Assert.Equal(crossModuleContext.CapabilityId, crossModuleRoundTrip.HostActionContext.CapabilityId);
     }
 
     [Fact]
@@ -415,13 +479,6 @@ public sealed class SidecarCapabilityTransportTests
         var idempotencyKey = Guid.NewGuid();
         var fixture = CreateFixture();
         var now = fixture.Now;
-        var context = IssueContext(
-            fixture,
-            caller,
-            HostActionEntryIngress.Endpoint,
-            traceId,
-            idempotencyKey,
-            actionDeadline: fixture.Call.Deadline);
         var descriptor = new ActionDescriptor<string, string>(
             new SharpClawActionKey("sample.action"),
             1,
@@ -436,6 +493,14 @@ public sealed class SidecarCapabilityTransportTests
             InputSchema = new JsonSchemaReference("sample.action.input", 1, "sample-input-schema"),
             ResultSchema = new JsonSchemaReference("sample.action.result", 1, "sample-result-schema"),
         };
+        var context = IssueContext(
+            fixture,
+            caller,
+            HostActionEntryIngress.Endpoint,
+            traceId,
+            idempotencyKey,
+            actionDeadline: fixture.Call.Deadline,
+            lineage: Lineage(descriptor, "input"));
         var payload = Payload(typeof(string).AssemblyQualifiedName!, "input");
         var actionCall = fixture.Call with
         {
@@ -528,6 +593,41 @@ public sealed class SidecarCapabilityTransportTests
             now,
             candidate => candidate.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(candidate)).Accepted);
 
+        var otherDescriptor = descriptor with
+        {
+            Key = new SharpClawActionKey("other.action"),
+        };
+        var otherRequest = request with { Descriptor = otherDescriptor };
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.IssueHostActionEntry(
+                otherRequest,
+                actionCall.CallId,
+                now,
+                authorityCandidate => HostActionEntryAuthorityValidator.ComputeAuthorityHash(authorityCandidate),
+                out _).Code);
+
+        var changedPayloadContext = IssueContext(
+            fixture,
+            caller,
+            HostActionEntryIngress.Endpoint,
+            lineage: Lineage(descriptor, "input"));
+        var changedPayload = Payload(typeof(string).AssemblyQualifiedName!, "changed");
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.BeginCall(
+                actionCall with
+                {
+                    CallId = Guid.NewGuid(),
+                    ReplayNonce = "changed-payload",
+                    Sequence = 2,
+                },
+                SidecarCapabilityKind.Action,
+                changedPayload,
+                changedPayload.ByteLength,
+                now,
+                changedPayloadContext).Code);
+
         Assert.True(fixture.Session.CompleteCall(actionCall.CallId, 0).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
@@ -543,7 +643,6 @@ public sealed class SidecarCapabilityTransportTests
         var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var caller = new RequestPrincipal("endpoint-user", Roles: new HashSet<string>(["reader"]));
         var fixture = CreateFixture();
-        var context = IssueContext(fixture, caller, HostActionEntryIngress.Endpoint);
         var descriptor = new ActionDescriptor<string, string>(
             new SharpClawActionKey("sample.nested"),
             1,
@@ -558,6 +657,11 @@ public sealed class SidecarCapabilityTransportTests
             InputSchema = new JsonSchemaReference("sample.nested.input", 1, "sample-nested-input"),
             ResultSchema = new JsonSchemaReference("sample.nested.result", 1, "sample-nested-result"),
         };
+        var context = IssueContext(
+            fixture,
+            caller,
+            HostActionEntryIngress.Endpoint,
+            lineage: Lineage(descriptor, "input"));
         var call = fixture.Call with
         {
             Capability = SidecarCapabilityKind.Action,
@@ -1222,7 +1326,6 @@ public sealed class SidecarCapabilityTransportTests
     {
         var fixture = CreateFixture();
         var call = fixture.Call with { Capability = SidecarCapabilityKind.Action };
-        var context = IssueContext(fixture, new RequestPrincipal("host-user"), HostActionEntryIngress.Endpoint, actionDeadline: call.Deadline);
         var key = new SharpClawActionKey("host.entry");
         var descriptor = new SidecarActionDescriptorIdentity(
             key,
@@ -1235,6 +1338,20 @@ public sealed class SidecarCapabilityTransportTests
             "host-result",
             1,
             "host-descriptor");
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("host-user"),
+            HostActionEntryIngress.Endpoint,
+            actionDeadline: call.Deadline,
+            lineage: new HostActionEntryLineage(
+                key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                Payload(typeof(string).AssemblyQualifiedName!, "input").ContentHash,
+                Payload(typeof(string).AssemblyQualifiedName!, "input").ByteLength));
         var request = SidecarActionCapabilityRequest.HostEntry(
             call,
             descriptor,
@@ -1290,7 +1407,8 @@ public sealed class SidecarCapabilityTransportTests
             fixture,
             new RequestPrincipal("module-user"),
             HostActionEntryIngress.Endpoint,
-            actionDeadline: call.Deadline);
+            actionDeadline: call.Deadline,
+            lineage: Lineage(descriptor, "input"));
         var moduleRequest = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
@@ -1369,7 +1487,8 @@ public sealed class SidecarCapabilityTransportTests
         HostActionEntryIngress ingress,
         Guid? traceId = null,
         Guid? idempotencyKey = null,
-        DateTimeOffset? actionDeadline = null)
+        DateTimeOffset? actionDeadline = null,
+        HostActionEntryLineage? lineage = null)
     {
         var request = new HostActionEntryContextRequest(
             ingress,
@@ -1381,7 +1500,10 @@ public sealed class SidecarCapabilityTransportTests
             traceId ?? Guid.NewGuid(),
             idempotencyKey ?? Guid.NewGuid(),
             actionDeadline ?? fixture.Now.AddMinutes(1),
-            fixture.Binding.ExpiresAt);
+            fixture.Binding.ExpiresAt)
+        {
+            Lineage = LineageForContext(lineage),
+        };
         var result = fixture.Session.IssueHostActionEntryContext(
             request,
             fixture.Now,
@@ -1399,6 +1521,33 @@ public sealed class SidecarCapabilityTransportTests
             1,
             SidecarCapabilityTransportCodec.ComputeSha256(bytes),
             document.RootElement.Clone(),
+            bytes.Length);
+    }
+
+    private static HostActionEntryLineage LineageForContext(HostActionEntryLineage? lineage) =>
+        lineage ?? new HostActionEntryLineage(
+            new SharpClawActionKey("entry.context"),
+            1,
+            "context-descriptor",
+            typeof(string).AssemblyQualifiedName!,
+            1,
+            "context-input-schema",
+            Payload(typeof(string).AssemblyQualifiedName!, "first").ContentHash,
+            Payload(typeof(string).AssemblyQualifiedName!, "first").ByteLength);
+
+    private static HostActionEntryLineage Lineage<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action)
+    {
+        var bytes = SidecarCapabilityTransportCodec.Serialize(action);
+        return new HostActionEntryLineage(
+            descriptor.Key,
+            descriptor.Version,
+            HostActionEntryAuthorityValidator.ComputeDescriptorHash(descriptor),
+            typeof(TAction).AssemblyQualifiedName!,
+            descriptor.InputSchema!.Version,
+            descriptor.InputSchema.ContentHash!,
+            SidecarCapabilityTransportCodec.ComputeSha256(bytes),
             bytes.Length);
     }
 

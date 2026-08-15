@@ -343,7 +343,10 @@ public sealed class SidecarCapabilitySession
                 request.TraceId,
                 request.IdempotencyKey,
                 request.Deadline,
-                request.ExpiresAt);
+                request.ExpiresAt)
+            {
+                Lineage = request.Lineage,
+            };
             _issuedEntryContexts.Add(capabilityId, context);
             return SidecarCapabilityValidationResult.Accept();
         }
@@ -380,10 +383,14 @@ public sealed class SidecarCapabilitySession
                 callId == Guid.Empty ||
                 !_calls.TryGetValue(callId, out var capability) ||
                 capability != SidecarCapabilityKind.Action ||
-                !_callIdentities.TryGetValue(callId, out var activeCall) ||
-                !_callEntryContexts.TryGetValue(callId, out var entryContext) ||
-                !HostActionEntryAuthorityValidator.SameContext(request.Context, entryContext) ||
-                !_callPayloads.TryGetValue(callId, out var callPayload) ||
+                 !_callIdentities.TryGetValue(callId, out var activeCall) ||
+                 !_callEntryContexts.TryGetValue(callId, out var entryContext) ||
+                 !HostActionEntryAuthorityValidator.SameContext(request.Context, entryContext) ||
+                 !HostActionEntryAuthorityValidator.MatchesLineage(
+                     request.Context.Lineage,
+                     request.Descriptor,
+                     request.Action) ||
+                 !_callPayloads.TryGetValue(callId, out var callPayload) ||
                 callPayload is null)
             {
                 return SidecarCapabilityValidationResult.Reject(
@@ -542,6 +549,19 @@ public sealed class SidecarCapabilitySession
                 payloadLimit);
             if (!payloadResult.Accepted)
                 return payloadResult;
+
+            if (hostContext is not null &&
+                (hostContext.Lineage is null ||
+                 payload is null ||
+                 !string.Equals(hostContext.Lineage.InputTypeIdentity, payload.TypeIdentity, StringComparison.Ordinal) ||
+                 hostContext.Lineage.InputSchemaVersion != payload.SchemaVersion ||
+                 !string.Equals(hostContext.Lineage.PayloadContentHash, payload.ContentHash, StringComparison.OrdinalIgnoreCase) ||
+                 hostContext.Lineage.PayloadByteLength != payload.ByteLength))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The action payload does not match the issued host entry lineage.");
+            }
 
             if (frameByteLength < (payload is null ? 0 : payload.ByteLength) ||
                 frameByteLength > Binding.PayloadLimits.ProtocolMessageBytes)
@@ -1254,6 +1274,22 @@ public static class SidecarCapabilityTransportValidation
             binding.PayloadLimits.ActionInputBytes);
         if (!payloadResult.Accepted)
             return payloadResult;
+
+        if (hostEntry &&
+            (request.HostContext!.Lineage is null ||
+             !string.Equals(request.HostContext.Lineage.ActionKey.Value, request.Descriptor.Key.Value, StringComparison.Ordinal) ||
+             request.HostContext.Lineage.ActionVersion != request.Descriptor.Version ||
+             !string.Equals(request.HostContext.Lineage.DescriptorHash, request.Descriptor.DescriptorHash, StringComparison.Ordinal) ||
+             !string.Equals(request.HostContext.Lineage.InputTypeIdentity, request.Action.TypeIdentity, StringComparison.Ordinal) ||
+             request.HostContext.Lineage.InputSchemaVersion != request.Action.SchemaVersion ||
+             !string.Equals(request.HostContext.Lineage.InputSchemaHash, request.Descriptor.InputSchemaHash, StringComparison.Ordinal) ||
+             !string.Equals(request.HostContext.Lineage.PayloadContentHash, request.Action.ContentHash, StringComparison.OrdinalIgnoreCase) ||
+             request.HostContext.Lineage.PayloadByteLength != request.Action.ByteLength))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The host action entry context does not bind to the descriptor and payload.");
+        }
 
         if (request.Continuation is not null &&
             (request.Continuation.ContinuationRequestId == Guid.Empty ||

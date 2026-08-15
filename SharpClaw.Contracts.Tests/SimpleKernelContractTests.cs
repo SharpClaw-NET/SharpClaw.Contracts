@@ -117,7 +117,8 @@ public sealed class SimpleKernelContractTests
         var idempotencyKey = Guid.NewGuid();
         var deadline = now.AddMinutes(1);
         var context = CreateHostActionEntryContext(
-            caller, features, traceId, idempotencyKey, deadline, now);
+            caller, features, traceId, idempotencyKey, deadline, now,
+            Lineage(descriptor, "input"));
         var request = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
@@ -175,7 +176,8 @@ public sealed class SimpleKernelContractTests
         var idempotencyKey = Guid.NewGuid();
         var deadline = now.AddMinutes(1);
         var context = CreateHostActionEntryContext(
-            caller, features, traceId, idempotencyKey, deadline, now);
+            caller, features, traceId, idempotencyKey, deadline, now,
+            Lineage(descriptor, "input"));
         var request = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
@@ -261,7 +263,8 @@ public sealed class SimpleKernelContractTests
         var idempotencyKey = Guid.NewGuid();
         var deadline = now.AddMinutes(1);
         var context = CreateHostActionEntryContext(
-            caller, features, traceId, idempotencyKey, deadline, now);
+            caller, features, traceId, idempotencyKey, deadline, now,
+            Lineage(descriptor, action));
         var request = new HostActionEntryRequest<EntryRecordAction, string>(
             descriptor,
             action,
@@ -350,6 +353,7 @@ public sealed class SimpleKernelContractTests
         Guid idempotencyKey,
         DateTimeOffset deadline,
         DateTimeOffset now,
+        HostActionEntryLineage lineage,
         HostActionEntryIngress ingress = HostActionEntryIngress.Endpoint) =>
         new(
             Guid.NewGuid(),
@@ -363,7 +367,26 @@ public sealed class SimpleKernelContractTests
             traceId,
             idempotencyKey,
             deadline,
-            now.AddMinutes(2));
+            now.AddMinutes(2))
+        {
+            Lineage = lineage,
+        };
+
+    private static HostActionEntryLineage Lineage<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action)
+    {
+        var bytes = SidecarCapabilityTransportCodec.Serialize(action);
+        return new HostActionEntryLineage(
+            descriptor.Key,
+            descriptor.Version,
+            HostActionEntryAuthorityValidator.ComputeDescriptorHash(descriptor),
+            typeof(TAction).AssemblyQualifiedName!,
+            descriptor.InputSchema!.Version,
+            descriptor.InputSchema.ContentHash!,
+            SidecarCapabilityTransportCodec.ComputeSha256(bytes),
+            bytes.Length);
+    }
 
     private sealed class RecordingHostActionEntry : IHostActionEntry
     {
@@ -3328,10 +3351,19 @@ public sealed class SimpleKernelContractTests
                 new RequestPrincipal("user-1"),
                 ExtensionFeatureSet.Empty,
                 Guid.NewGuid(),
-                Guid.NewGuid(),
-                DateTimeOffset.UtcNow.AddMinutes(1),
-                DateTimeOffset.UtcNow,
-                HostActionEntryIngress.Tool));
+                 Guid.NewGuid(),
+                 DateTimeOffset.UtcNow.AddMinutes(1),
+                 DateTimeOffset.UtcNow,
+                 new HostActionEntryLineage(
+                     new SharpClawActionKey("tool.entry"),
+                     1,
+                     "tool-descriptor",
+                     typeof(JsonElement).AssemblyQualifiedName!,
+                     1,
+                     "tool-schema",
+                     "tool-payload",
+                     1),
+                 HostActionEntryIngress.Tool));
         var turn = new ChatTurnInput(
             "What time is it?",
             invocation.ConversationId,
