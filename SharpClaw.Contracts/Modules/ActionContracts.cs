@@ -537,9 +537,27 @@ public static class HostActionEntryAuthorityValidator
         left.IsAuthenticated == right.IsAuthenticated &&
         SameSets(left.Roles, right.Roles);
 
-    private static bool SameSets(IReadOnlySet<string>? left, IReadOnlySet<string>? right) =>
-        left is null && right is null ||
-        left is not null && right is not null && left.SetEquals(right);
+    private static bool SameSets(IReadOnlySet<string>? left, IReadOnlySet<string>? right)
+    {
+        if (left is null || right is null)
+            return left is null && right is null;
+
+        if (left.Count != right.Count)
+            return false;
+
+        foreach (var leftRole in left)
+        {
+            if (leftRole is null ||
+                !right.Any(rightRole =>
+                    rightRole is not null &&
+                    string.Equals(leftRole, rightRole, StringComparison.Ordinal)))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     private static bool SameFeatures(ExtensionFeatureSet left, ExtensionFeatureSet right) =>
         left.Items.Count == right.Items.Count &&

@@ -131,6 +131,40 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Now,
             authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Accepted);
 
+        var comparerSpoofedRequest = request with
+        {
+            Caller = caller with
+            {
+                Roles = new HashSet<string>(["READER", "WRITER"], StringComparer.OrdinalIgnoreCase),
+            },
+        };
+        var comparerSpoofedIssue = fixture.Session.IssueHostActionEntry(
+            comparerSpoofedRequest,
+            call.CallId,
+            fixture.Now,
+            authority => HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority),
+            out var comparerSpoofedTransport);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, comparerSpoofedIssue.Code);
+        Assert.Null(comparerSpoofedTransport);
+
+        var comparerSpoofedAuthority = transport!.Authority with
+        {
+            Caller = transport.Authority.Caller with
+            {
+                Roles = new HashSet<string>(["READER", "WRITER"], StringComparer.OrdinalIgnoreCase),
+            },
+        };
+        comparerSpoofedAuthority = comparerSpoofedAuthority with
+        {
+            Proof = HostActionEntryAuthorityValidator.ComputeAuthorityHash(comparerSpoofedAuthority),
+        };
+        Assert.Equal(
+            "host_action_spoofed_authority",
+            fixture.Session.ValidateHostActionEntry(
+                transport with { Authority = comparerSpoofedAuthority },
+                fixture.Now,
+                authority => authority.Proof == HostActionEntryAuthorityValidator.ComputeAuthorityHash(authority)).Code);
+
         foreach (var changedCaller in new[]
         {
             caller with { Roles = new HashSet<string>(["reader"], StringComparer.Ordinal) },
