@@ -677,6 +677,9 @@ public sealed class SidecarCapabilityTransportTests
         var rotatedExpiry = fixture.Binding.ExpiresAt.AddMinutes(1);
         var rotated = fixture.Binding with
         {
+            SessionId = Guid.NewGuid(),
+            RequestId = Guid.NewGuid(),
+            CancellationId = Guid.NewGuid(),
             ExpiresAt = rotatedExpiry,
             Grant = fixture.Binding.Grant with { ExpiresAt = rotatedExpiry },
             Authentication = fixture.Binding.Authentication with
@@ -705,6 +708,148 @@ public sealed class SidecarCapabilityTransportTests
             authority,
             HostActionEntryCarrierCompletionKind.Succeeded,
             fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public void Rebind_advances_request_identity_resets_call_budget_and_preserves_active_carrier()
+    {
+        var fixture = CreateFixture(maxCalls: 1);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("rebind-user"),
+            HostActionEntryIngress.Cli);
+        var authority = ActivateContext(fixture, context);
+        var firstPayload = Payload("storage.request", new { value = 1 });
+        Assert.True(fixture.Session.BeginCall(
+            fixture.Call,
+            SidecarCapabilityKind.Storage,
+            firstPayload,
+            firstPayload.ByteLength,
+            fixture.Now).Accepted);
+
+        var rotatedExpiry = fixture.Binding.ExpiresAt.AddMinutes(1);
+        var rotated = fixture.Binding with
+        {
+            SessionId = Guid.NewGuid(),
+            RequestId = Guid.NewGuid(),
+            CancellationId = Guid.NewGuid(),
+            ExpiresAt = rotatedExpiry,
+            Grant = fixture.Binding.Grant with { ExpiresAt = rotatedExpiry },
+            Authentication = fixture.Binding.Authentication with
+            {
+                Nonce = "rebind-nonce",
+                ExpiresAt = rotatedExpiry,
+                BindingHash = string.Empty,
+            },
+        };
+        rotated = rotated with
+        {
+            Authentication = rotated.Authentication with
+            {
+                BindingHash = SidecarCapabilitySessionValidator.ComputeBindingHash(rotated),
+            },
+        };
+        fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.RotateBinding(rotated, fixture.Now).Code);
+        Assert.True(fixture.Session.CompleteCall(fixture.Call.CallId, 0).Accepted);
+        Assert.True(fixture.Session.RotateBinding(rotated, fixture.Now).Accepted);
+        Assert.Equal(rotated.SessionId, fixture.Session.Binding.SessionId);
+        Assert.Equal(2L, fixture.Session.BindingGeneration);
+
+        var nextCall = fixture.Call with
+        {
+            SessionId = rotated.SessionId,
+            RequestId = rotated.RequestId,
+            CancellationId = rotated.CancellationId,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "rebind-call",
+            Sequence = 1,
+            Capability = SidecarCapabilityKind.Action,
+        };
+        var nextPayload = Payload(typeof(string).AssemblyQualifiedName!, "after-rebind");
+        Assert.True(fixture.Session.BeginCall(
+            nextCall,
+            SidecarCapabilityKind.Action,
+            nextPayload,
+            nextPayload.ByteLength,
+            fixture.Now,
+            context).Accepted);
+        Assert.True(fixture.Session.CompleteCall(nextCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            authority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public void One_carrier_cannot_start_a_second_host_entry_call()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("single-use"),
+            HostActionEntryIngress.Tool);
+        var authority = ActivateContext(fixture, context);
+        var first = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "single-use-first",
+        };
+        var payload = Payload(typeof(string).AssemblyQualifiedName!, "first");
+        Assert.True(fixture.Session.BeginCall(
+            first,
+            SidecarCapabilityKind.Action,
+            payload,
+            payload.ByteLength,
+            fixture.Now,
+            context).Accepted);
+        Assert.True(fixture.Session.CompleteCall(first.CallId, 0).Accepted);
+
+        var second = first with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "single-use-second",
+            Sequence = 2,
+        };
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            fixture.Session.BeginCall(
+                second,
+                SidecarCapabilityKind.Action,
+                payload,
+                payload.ByteLength,
+                fixture.Now,
+                context).Code);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            authority,
+            HostActionEntryCarrierCompletionKind.Failed,
+            fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public void Carrier_replay_tombstones_expire_after_their_required_lifetime()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("tombstone"),
+            HostActionEntryIngress.Cli);
+        var authority = ActivateContext(fixture, context);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            authority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+        Assert.Equal(1, fixture.Session.CompletedHostActionEntryTombstoneCount);
+
+        Assert.Equal(
+            0,
+            fixture.Session.SweepExpiredHostActionEntryCarriers(
+                authority.ExpiresAt.AddSeconds(1)));
+        Assert.Equal(0, fixture.Session.CompletedHostActionEntryTombstoneCount);
     }
 
     [Fact]

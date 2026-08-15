@@ -182,7 +182,8 @@ public sealed class SidecarCapabilitySession
     private readonly Dictionary<Guid, SidecarSerializedPayload?> _callPayloads = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _issuedEntryContexts = [];
     private readonly Dictionary<Guid, HostActionEntryCarrierAuthority> _activeEntryCarriers = [];
-    private readonly HashSet<Guid> _completedEntryCarriers = [];
+    private readonly Dictionary<Guid, CarrierReplayTombstone> _completedEntryCarriers = [];
+    private readonly HashSet<Guid> _consumedEntryCarriers = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _callEntryContexts = [];
     private readonly HashSet<Guid> _completedCalls = [];
     private readonly HashSet<string> _nonces = new(StringComparer.Ordinal);
@@ -194,6 +195,12 @@ public sealed class SidecarCapabilitySession
     private int _totalCalls;
     private long _bindingGeneration = 1;
     private bool _disconnected;
+
+    private sealed record CarrierReplayTombstone(
+        long BindingGeneration,
+        DateTimeOffset RetainUntil);
+
+    private static readonly TimeSpan CarrierReplayRetention = TimeSpan.FromMinutes(5);
 
     public SidecarCapabilitySession(
         SidecarCapabilitySessionBinding binding,
@@ -246,6 +253,15 @@ public sealed class SidecarCapabilitySession
         }
     }
 
+    public int CompletedHostActionEntryTombstoneCount
+    {
+        get
+        {
+            lock (_sync)
+                return _completedEntryCarriers.Count;
+        }
+    }
+
     public SidecarCapabilityValidationResult ValidateHostActionEntry<TAction, TResult>(
         HostActionEntryTransportRequest<TAction, TResult> request,
         DateTimeOffset now,
@@ -264,6 +280,7 @@ public sealed class SidecarCapabilitySession
 
         lock (_sync)
         {
+            SweepCompletedEntryCarriers(now);
             if (_disconnected)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Disconnected,
@@ -286,25 +303,26 @@ public sealed class SidecarCapabilitySession
                 request.Request.Context is null ||
                 !HostActionEntryAuthorityValidator.SameContextIgnoringPayload(
                     request.Request.Context,
-                    entryContext))
+                    entryContext) ||
+                !_activeEntryCarriers.TryGetValue(
+                    request.Request.Context.CapabilityId,
+                    out var activeCarrier) ||
+                !MatchesCarrierContext(request.Request.Context, activeCarrier))
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
                     "The host action entry authority does not match the host request context.");
             }
 
-            if (authority.SessionId != Binding.SessionId ||
-                authority.RequestId != Binding.RequestId ||
-                authority.CancellationId != Binding.CancellationId ||
-                !string.Equals(authority.ModuleId, Binding.ModuleId, StringComparison.Ordinal) ||
+            if (!string.Equals(authority.ModuleId, Binding.ModuleId, StringComparison.Ordinal) ||
                 !string.Equals(authority.GraphId, Binding.GraphId, StringComparison.Ordinal) ||
                 authority.Deadline > Binding.ExpiresAt ||
                 !_calls.TryGetValue(authority.CallId, out var capability) ||
                 capability != SidecarCapabilityKind.Action ||
                 !_callIdentities.TryGetValue(authority.CallId, out var activeCall) ||
-                activeCall.SessionId != authority.SessionId ||
-                activeCall.RequestId != authority.RequestId ||
-                activeCall.CancellationId != authority.CancellationId ||
+                activeCall.SessionId != Binding.SessionId ||
+                activeCall.RequestId != Binding.RequestId ||
+                activeCall.CancellationId != Binding.CancellationId ||
                 activeCall.CallId != authority.CallId ||
                 !string.Equals(activeCall.ReplayNonce, authority.ReplayNonce, StringComparison.Ordinal) ||
                 activeCall.Sequence != authority.Sequence ||
@@ -395,6 +413,7 @@ public sealed class SidecarCapabilitySession
         lock (_sync)
         {
             SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
             if (_disconnected)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Disconnected,
@@ -449,6 +468,7 @@ public sealed class SidecarCapabilitySession
 
         lock (_sync)
         {
+            SweepCompletedEntryCarriers(now);
             if (_disconnected)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Disconnected,
@@ -461,7 +481,7 @@ public sealed class SidecarCapabilitySession
 
             if (!_activeEntryCarriers.TryGetValue(authority.CapabilityId, out var activeAuthority))
                 return SidecarCapabilityValidationResult.Reject(
-                    _completedEntryCarriers.Contains(authority.CapabilityId)
+                    _completedEntryCarriers.ContainsKey(authority.CapabilityId)
                         ? SidecarCapabilityErrors.Replay
                         : SidecarCapabilityErrors.SpoofedIdentity,
                     "The host action entry carrier is not active.");
@@ -475,7 +495,7 @@ public sealed class SidecarCapabilitySession
 
             if (activeAuthority.ExpiresAt <= now)
             {
-                RemoveEntryCarrier(authority.CapabilityId);
+                RemoveEntryCarrier(authority.CapabilityId, now);
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Expired,
                     "The host action entry carrier has expired.");
@@ -489,7 +509,7 @@ public sealed class SidecarCapabilitySession
                     "The host action entry carrier has an active HostEntry call.");
             }
 
-            RemoveEntryCarrier(authority.CapabilityId);
+            RemoveEntryCarrier(authority.CapabilityId, now);
             return SidecarCapabilityValidationResult.Accept();
         }
     }
@@ -497,7 +517,11 @@ public sealed class SidecarCapabilitySession
     public int SweepExpiredHostActionEntryCarriers(DateTimeOffset now)
     {
         lock (_sync)
-            return SweepExpiredEntryContexts(now);
+        {
+            var removed = SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            return removed;
+        }
     }
 
     public bool TryGetActiveHostActionEntryCarrier(
@@ -525,27 +549,24 @@ public sealed class SidecarCapabilitySession
                 string.Equals(replacement.ModuleId, Binding.ModuleId, StringComparison.Ordinal) &&
                 string.Equals(replacement.GraphId, Binding.GraphId, StringComparison.Ordinal) &&
                 replacement.ProtocolVersion == Binding.ProtocolVersion &&
-                replacement.SessionId == Binding.SessionId &&
-                replacement.RequestId == Binding.RequestId &&
-                replacement.CancellationId == Binding.CancellationId;
+                replacement.SessionId != Binding.SessionId &&
+                replacement.RequestId != Binding.RequestId &&
+                replacement.CancellationId != Binding.CancellationId;
             if (!identityMatches)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
-                    "The rotated binding does not preserve session identity.");
+                    "The rotated binding does not advance the authenticated request identity.");
 
-            var validation = SidecarCapabilitySessionValidator.Validate(
-                replacement,
-                _authenticate,
-                _registerAuthenticationNonce,
-                now);
-            if (!validation.Accepted)
-                return validation;
+            if (_calls.Count != 0)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The capability session cannot rotate while a capability call is active.");
 
             var requiredExpiry = _activeEntryCarriers.Count == 0
                 ? now
                 : _activeEntryCarriers.Values.Max(value => value.ExpiresAt);
             if (replacement.ExpiresAt < requiredExpiry ||
-                _activeEntryCarriers.Count > 0 && !replacement.Grant.Allows(SidecarCapabilityKind.Action) ||
+                (_activeEntryCarriers.Count > 0 && !replacement.Grant.Allows(SidecarCapabilityKind.Action)) ||
                 replacement.PayloadLimits.ActionInputBytes < Binding.PayloadLimits.ActionInputBytes ||
                 replacement.PayloadLimits.ProtocolMessageBytes < Binding.PayloadLimits.ProtocolMessageBytes ||
                 replacement.ConcurrencyLimits.MaximumInFlightCalls < Binding.ConcurrencyLimits.MaximumInFlightCalls ||
@@ -556,8 +577,21 @@ public sealed class SidecarCapabilitySession
                     "The rotated binding would strand active carrier authority.");
             }
 
+            var validation = SidecarCapabilitySessionValidator.Validate(
+                replacement,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now);
+            if (!validation.Accepted)
+                return validation;
+
             Binding = replacement;
             _bindingGeneration++;
+            _lastSequence = 0;
+            _totalCalls = 0;
+            _nonces.Clear();
+            _completedCalls.Clear();
+            _completedEntryCarriers.Clear();
             return SidecarCapabilityValidationResult.Accept();
         }
     }
@@ -592,10 +626,12 @@ public sealed class SidecarCapabilitySession
             if (!request.IsWellFormed(now) ||
                 callId == Guid.Empty ||
                 !_calls.TryGetValue(callId, out var capability) ||
-                capability != SidecarCapabilityKind.Action ||
+                 capability != SidecarCapabilityKind.Action ||
                  !_callIdentities.TryGetValue(callId, out var activeCall) ||
                  !_callEntryContexts.TryGetValue(callId, out var entryContext) ||
                  !HostActionEntryAuthorityValidator.SameContextIgnoringPayload(request.Context, entryContext) ||
+                 !_activeEntryCarriers.TryGetValue(request.Context.CapabilityId, out var carrierAuthority) ||
+                 !MatchesCarrierContext(request.Context, carrierAuthority) ||
                  !HostActionEntryAuthorityValidator.MatchesLineage(
                      entryContext.Contribution?.Lineage,
                      request.Descriptor,
@@ -636,9 +672,9 @@ public sealed class SidecarCapabilitySession
             var authority = new HostActionEntryAuthority(
                 Binding.ModuleId,
                 Binding.GraphId,
-                Binding.SessionId,
-                Binding.RequestId,
-                Binding.CancellationId,
+                carrierAuthority.SessionId,
+                carrierAuthority.RequestId,
+                carrierAuthority.CancellationId,
                 activeCall.CallId,
                 activeCall.ReplayNonce,
                 activeCall.Sequence,
@@ -719,13 +755,19 @@ public sealed class SidecarCapabilitySession
             if (hostContext is not null &&
                 (!hostContext.IsWellFormed(now) ||
                  !_activeEntryCarriers.TryGetValue(hostContext.CapabilityId, out var activeCarrier) ||
-                 !MatchesCarrierContext(hostContext, activeCarrier) ||
-                 hostContext.RequestId != Binding.RequestId ||
-                 hostContext.CancellationId != Binding.CancellationId))
+                 !MatchesCarrierContext(hostContext, activeCarrier)))
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
                     "The host action entry context is not active for this carrier.");
+            }
+
+            if (hostContext is not null &&
+                _consumedEntryCarriers.Contains(hostContext.CapabilityId))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The host action entry carrier was already consumed.");
             }
 
             if (!identity.IsValid ||
@@ -814,7 +856,7 @@ public sealed class SidecarCapabilitySession
                     {
                         Contribution = hostContext.Contribution with { Lineage = capturedLineage },
                     });
-                _issuedEntryContexts.Remove(hostContext.CapabilityId);
+                _consumedEntryCarriers.Add(hostContext.CapabilityId);
             }
             _lastSequence = identity.Sequence;
             _totalCalls++;
@@ -917,7 +959,7 @@ public sealed class SidecarCapabilitySession
             .ToArray())
         {
             _issuedEntryContexts.Remove(capabilityId);
-            _completedEntryCarriers.Add(capabilityId);
+            RecordCarrierTombstone(capabilityId, _bindingGeneration, now, now);
             removed++;
         }
 
@@ -926,18 +968,55 @@ public sealed class SidecarCapabilitySession
             .Select(pair => pair.Key)
             .ToArray())
         {
-            RemoveEntryCarrier(capabilityId);
+            RemoveEntryCarrier(capabilityId, now);
             removed++;
         }
 
         return removed;
     }
 
-    private void RemoveEntryCarrier(Guid capabilityId)
+    private void RemoveEntryCarrier(Guid capabilityId, DateTimeOffset now)
     {
         _issuedEntryContexts.Remove(capabilityId);
-        _activeEntryCarriers.Remove(capabilityId);
-        _completedEntryCarriers.Add(capabilityId);
+        if (_activeEntryCarriers.Remove(capabilityId, out var authority))
+        {
+            RecordCarrierTombstone(
+                capabilityId,
+                authority.BindingGeneration,
+                now,
+                authority.ExpiresAt);
+        }
+        else
+        {
+            RecordCarrierTombstone(capabilityId, _bindingGeneration, now, now);
+        }
+
+        _consumedEntryCarriers.Remove(capabilityId);
+    }
+
+    private void RecordCarrierTombstone(
+        Guid capabilityId,
+        long generation,
+        DateTimeOffset now,
+        DateTimeOffset expiry)
+    {
+        var retainUntil = expiry > now
+            ? expiry
+            : now + CarrierReplayRetention;
+        _completedEntryCarriers[capabilityId] = new CarrierReplayTombstone(
+            generation,
+            retainUntil);
+    }
+
+    private void SweepCompletedEntryCarriers(DateTimeOffset now)
+    {
+        foreach (var capabilityId in _completedEntryCarriers
+            .Where(pair => pair.Value.RetainUntil <= now)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _completedEntryCarriers.Remove(capabilityId);
+        }
     }
 
     private static bool MatchesCarrier(
@@ -999,6 +1078,7 @@ public sealed class SidecarCapabilitySession
             _issuedEntryContexts.Clear();
             _activeEntryCarriers.Clear();
             _completedEntryCarriers.Clear();
+            _consumedEntryCarriers.Clear();
             _terminalCalls.Clear();
             _terminalReceipts.Clear();
             _inFlight = 0;
