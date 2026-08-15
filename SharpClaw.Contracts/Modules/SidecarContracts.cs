@@ -239,9 +239,59 @@ public sealed record SidecarToolHandlerInvokeStart(
     string HandlerId,
     JsonElement Input,
     JsonSchemaReference InputSchema,
-    RequestPrincipal Caller) : ISidecarProtocolMessage
+    RequestPrincipal Caller,
+    HostActionEntryRequestContext HostActionContext) : ISidecarProtocolMessage
 {
     public SidecarProtocolMessageKind MessageKind => SidecarProtocolMessageKind.ToolHandlerInvokeStart;
+
+    public bool IsWellFormed(DateTimeOffset now) =>
+        Header is not null &&
+        InvocationId != Guid.Empty &&
+        !string.IsNullOrWhiteSpace(ToolName) &&
+        !string.IsNullOrWhiteSpace(HandlerId) &&
+        Input.ValueKind != JsonValueKind.Undefined &&
+        InputSchema is not null &&
+        !string.IsNullOrWhiteSpace(InputSchema.ContractName) &&
+        InputSchema.Version >= 1 &&
+        !string.IsNullOrWhiteSpace(InputSchema.ContentHash) &&
+        Caller is not null &&
+        !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
+        HostActionContext is not null &&
+        HostActionContext.IsWellFormed(now) &&
+        HostActionContext.Ingress == HostActionEntryIngress.Tool &&
+        HostActionContext.InvocationId == InvocationId &&
+        HostActionContext.Contribution?.IngressBinding.Ingress == HostActionEntryIngress.Tool &&
+        string.Equals(
+            HostActionContext.Contribution.IngressBinding.PrimaryIdentity,
+            ToolName,
+            StringComparison.Ordinal) &&
+        !HostActionContext.Contribution.Lineage.IsPayloadBound &&
+        HostActionContext.Contribution.Lineage.InputSchemaVersion == InputSchema.Version &&
+        string.Equals(
+            HostActionContext.Contribution.Lineage.InputSchemaHash,
+            InputSchema.ContentHash,
+            StringComparison.Ordinal) &&
+        Header.Deadline == HostActionContext.Deadline &&
+        SamePrincipal(Caller, HostActionContext.Caller);
+
+    private static bool SamePrincipal(RequestPrincipal left, RequestPrincipal right) =>
+        string.Equals(left.SubjectId, right.SubjectId, StringComparison.Ordinal) &&
+        string.Equals(left.DisplayName, right.DisplayName, StringComparison.Ordinal) &&
+        left.IsAuthenticated == right.IsAuthenticated &&
+        SameRoles(left.Roles, right.Roles);
+
+    private static bool SameRoles(IReadOnlySet<string>? left, IReadOnlySet<string>? right)
+    {
+        if (left is null || right is null)
+            return left is null && right is null;
+
+        return left.Count == right.Count &&
+            left.All(leftRole =>
+                leftRole is not null &&
+                right.Any(rightRole =>
+                    rightRole is not null &&
+                    string.Equals(leftRole, rightRole, StringComparison.Ordinal)));
+    }
 }
 
 public sealed record SidecarToolHandlerResult(
@@ -909,7 +959,8 @@ public sealed record SidecarProtocolState(
     EventCapabilityGrant? EventGrant = null,
     int? EventVersion = null,
     SidecarContinuationCommand? RequestedCommand = null,
-    SidecarHostAuthorization? HostAuthorization = null)
+    SidecarHostAuthorization? HostAuthorization = null,
+    HostActionEntryRequestContext? HostActionContext = null)
 {
     /// <summary>Gets whether the sidecar supplied a terminal outcome before continuation.</summary>
     public bool DirectTerminalOutcomeAccepted { get; init; }
@@ -1065,6 +1116,13 @@ public static class SidecarProtocolStateMachine
         if (now > state.Deadline || now > message.Header.Deadline)
             return Reject(SidecarProtocolErrors.DeadlineExceeded, "The message deadline has expired.");
 
+        if (message is SidecarToolHandlerInvokeStart toolStart)
+        {
+            var toolContextFailure = ValidateToolEntry(state, toolStart, now);
+            if (toolContextFailure is not null)
+                return toolContextFailure;
+        }
+
         if (!CanApply(
                 state.Phase,
                 message.MessageKind,
@@ -1163,6 +1221,7 @@ public static class SidecarProtocolStateMachine
                 InvocationId = item.InvocationId,
                 HandlerId = item.HandlerId,
                 ToolName = item.ToolName,
+                HostActionContext = item.HostActionContext,
             },
             SidecarLifecycleHandlerInvokeStart item => nextState with
             {
@@ -1650,6 +1709,78 @@ public static class SidecarProtocolStateMachine
 
         return null;
     }
+
+    private static SidecarProtocolTransitionResult? ValidateToolEntry(
+        SidecarProtocolState state,
+        SidecarToolHandlerInvokeStart message,
+        DateTimeOffset now)
+    {
+        if (!message.IsWellFormed(now))
+            return Reject(SidecarProtocolErrors.MalformedMessage, "The tool start does not carry a valid host entry context.");
+
+        if (state.HostActionContext is { } expected && !SameHostActionContext(expected, message.HostActionContext))
+            return Reject(SidecarProtocolErrors.ExchangeIdentityMismatch, "The tool start host entry context does not match the exchange.");
+
+        return null;
+    }
+
+    private static bool SameHostActionContext(
+        HostActionEntryRequestContext left,
+        HostActionEntryRequestContext right) =>
+        left.CapabilityId == right.CapabilityId &&
+        string.Equals(left.CapabilityHandle, right.CapabilityHandle, StringComparison.Ordinal) &&
+        left.Ingress == right.Ingress &&
+        left.InvocationId == right.InvocationId &&
+        left.RequestId == right.RequestId &&
+        left.CancellationId == right.CancellationId &&
+        SamePrincipal(left.Caller, right.Caller) &&
+        SameFeatures(left.Features, right.Features) &&
+        left.TraceId == right.TraceId &&
+        left.IdempotencyKey == right.IdempotencyKey &&
+        left.Deadline == right.Deadline &&
+        left.ExpiresAt == right.ExpiresAt &&
+        left.Contribution is not null &&
+        right.Contribution is not null &&
+        left.Contribution.IngressBinding == right.Contribution.IngressBinding &&
+        SameLineage(left.Contribution.Lineage, right.Contribution.Lineage);
+
+    private static bool SamePrincipal(RequestPrincipal left, RequestPrincipal right) =>
+        string.Equals(left.SubjectId, right.SubjectId, StringComparison.Ordinal) &&
+        string.Equals(left.DisplayName, right.DisplayName, StringComparison.Ordinal) &&
+        left.IsAuthenticated == right.IsAuthenticated &&
+        SameRoles(left.Roles, right.Roles);
+
+    private static bool SameRoles(IReadOnlySet<string>? left, IReadOnlySet<string>? right)
+    {
+        if (left is null || right is null)
+            return left is null && right is null;
+
+        return left.Count == right.Count &&
+            left.All(leftRole =>
+                leftRole is not null &&
+                right.Any(rightRole =>
+                    rightRole is not null &&
+                    string.Equals(leftRole, rightRole, StringComparison.Ordinal)));
+    }
+
+    private static bool SameFeatures(ExtensionFeatureSet left, ExtensionFeatureSet right) =>
+        left.Items.Count == right.Items.Count &&
+        left.Items.Zip(right.Items).All(pair =>
+            string.Equals(pair.First.ContractName, pair.Second.ContractName, StringComparison.Ordinal) &&
+            pair.First.SchemaVersion == pair.Second.SchemaVersion &&
+            string.Equals(pair.First.OwnerModuleId, pair.Second.OwnerModuleId, StringComparison.Ordinal) &&
+            pair.First.MaxBytes == pair.Second.MaxBytes &&
+            string.Equals(pair.First.Value.GetRawText(), pair.Second.Value.GetRawText(), StringComparison.Ordinal));
+
+    private static bool SameLineage(HostActionEntryLineage left, HostActionEntryLineage right) =>
+        left.ActionKey == right.ActionKey &&
+        left.ActionVersion == right.ActionVersion &&
+        string.Equals(left.DescriptorHash, right.DescriptorHash, StringComparison.Ordinal) &&
+        string.Equals(left.InputTypeIdentity, right.InputTypeIdentity, StringComparison.Ordinal) &&
+        left.InputSchemaVersion == right.InputSchemaVersion &&
+        string.Equals(left.InputSchemaHash, right.InputSchemaHash, StringComparison.Ordinal) &&
+        string.Equals(left.PayloadContentHash, right.PayloadContentHash, StringComparison.Ordinal) &&
+        left.PayloadByteLength == right.PayloadByteLength;
 
     private static bool SameActionDescriptor(
         UntypedActionDescriptor left,

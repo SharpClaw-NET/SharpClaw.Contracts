@@ -756,14 +756,16 @@ public sealed class SimpleKernelContractTests
     {
         var invocationId = Guid.NewGuid();
         var input = CreateElement(new { value = 1 });
+        var toolHeader = Header(1);
         var toolStart = new SidecarToolHandlerInvokeStart(
-            Header(1),
+            toolHeader,
             invocationId,
             "demo.tool",
             "tool-handler",
             input,
             new JsonSchemaReference("demo.tool.input", 1, "input-hash"),
-            new RequestPrincipal("user-1"));
+            new RequestPrincipal("user-1"),
+            ToolContext(invocationId, "demo.tool", "input-hash", toolHeader.Deadline, "user-1"));
         var toolResult = new SidecarToolHandlerResult(
             Header(2),
             invocationId,
@@ -1679,25 +1681,41 @@ public sealed class SimpleKernelContractTests
         Assert.Equal(SidecarProtocolErrors.InvalidContinuationHandle, wrongCompletion.ErrorCode);
 
         var toolInvocation = Guid.NewGuid();
+        var toolHeader = Header(1);
         var toolState = new SidecarProtocolState(
             SidecarExchangeKind.ToolHandler,
             Guid.Empty,
             Guid.Empty,
             SidecarProtocolPhase.Negotiated,
             LastSequence: 0,
-            now.AddMinutes(1),
+            toolHeader.Deadline,
             NegotiatedProtocolVersion: 1,
             HostLimits: limits);
         var toolStart = new SidecarToolHandlerInvokeStart(
-            Header(1),
+            toolHeader,
             toolInvocation,
             "demo.tool",
             "handler-a",
             CreateElement(new { value = 1 }),
             new JsonSchemaReference("demo.input", 1, "input-hash"),
-            new RequestPrincipal("user-1"));
+            new RequestPrincipal("user-1"),
+            ToolContext(toolInvocation, "demo.tool", "input-hash", toolHeader.Deadline, "user-1"));
         var toolStarted = SidecarProtocolStateMachine.Validate(toolState, toolStart, now);
         Assert.True(toolStarted.Accepted);
+        var changedLineage = toolStart.HostActionContext.Contribution!.Lineage with
+        {
+            ActionKey = new SharpClawActionKey("other.action"),
+        };
+        var changedContext = toolStart.HostActionContext with
+        {
+            Contribution = toolStart.HostActionContext.Contribution with { Lineage = changedLineage },
+        };
+        var changedContextResult = SidecarProtocolStateMachine.Validate(
+            toolState with { HostActionContext = toolStart.HostActionContext },
+            toolStart with { HostActionContext = changedContext },
+            now);
+        Assert.False(changedContextResult.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ExchangeIdentityMismatch, changedContextResult.ErrorCode);
         var wrongToolResult = SidecarProtocolStateMachine.Validate(
             toolStarted.State!,
             new SidecarToolHandlerResult(
@@ -3423,6 +3441,39 @@ public sealed class SimpleKernelContractTests
 
     private static SidecarMessageHeader Header(long sequence = 1) =>
         new(1, sequence, DateTimeOffset.UtcNow.AddMinutes(1), new SidecarMessageSizeAuthority(128, 1024));
+
+    private static HostActionEntryRequestContext ToolContext(
+        Guid invocationId,
+        string toolName,
+        string inputSchemaHash,
+        DateTimeOffset deadline,
+        string subjectId) =>
+        new(
+            Guid.NewGuid(),
+            "opaque-tool-capability",
+            HostActionEntryIngress.Tool,
+            invocationId,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            new RequestPrincipal(subjectId),
+            ExtensionFeatureSet.Empty,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            deadline,
+            deadline.AddMinutes(1))
+        {
+            Contribution = new HostActionEntryContribution(
+                new HostActionEntryIngressBinding(HostActionEntryIngress.Tool, toolName),
+                new HostActionEntryLineage(
+                    new SharpClawActionKey("tool.entry"),
+                    1,
+                    "tool-descriptor",
+                    typeof(JsonElement).AssemblyQualifiedName!,
+                    1,
+                    inputSchemaHash,
+                    null,
+                    null)),
+        };
 
     private static DirectActionFixture CreateDirectActionFixture(
         DateTimeOffset now,

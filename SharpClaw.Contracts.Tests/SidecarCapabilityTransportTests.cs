@@ -185,6 +185,178 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void Tool_handler_start_round_trips_and_binds_the_host_entry_context()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("tool-user", Roles: new HashSet<string>(["reader"], StringComparer.Ordinal)),
+            HostActionEntryIngress.Tool,
+            lineage: new HostActionEntryLineage(
+                new SharpClawActionKey("tool.entry"),
+                1,
+                "tool-descriptor",
+                typeof(JsonElement).AssemblyQualifiedName!,
+                1,
+                "context-input-schema",
+                null,
+                null));
+        var limits = new SidecarPayloadLimits(1_048_576, 1_048_576, 1_048_576, 2_097_152, 512);
+        var header = new SidecarMessageHeader(
+            1,
+            1,
+            context.Deadline,
+            new SidecarMessageSizeAuthority(1024, limits.ActionInputBytes));
+        var start = new SidecarToolHandlerInvokeStart(
+            header,
+            context.InvocationId,
+            "clock_now",
+            "clock-handler",
+            JsonSerializer.SerializeToElement(new { value = 1 }),
+            new JsonSchemaReference("clock.input", 1, "context-input-schema"),
+            context.Caller,
+            context);
+
+        var encoded = SidecarCapabilityTransportCodec.Serialize(start);
+        var roundTrip = SidecarCapabilityTransportCodec.Deserialize<SidecarToolHandlerInvokeStart>(encoded);
+
+        Assert.Equal(encoded, SidecarCapabilityTransportCodec.Serialize(roundTrip));
+        Assert.True(roundTrip.IsWellFormed(fixture.Now));
+        Assert.Equal(context.CapabilityId, roundTrip.HostActionContext.CapabilityId);
+        Assert.Equal(context.CancellationId, roundTrip.HostActionContext.CancellationId);
+
+        var state = new SidecarProtocolState(
+            SidecarExchangeKind.ToolHandler,
+            Guid.Empty,
+            Guid.Empty,
+            SidecarProtocolPhase.Negotiated,
+            0,
+            context.Deadline,
+            1,
+            limits);
+        var accepted = SidecarProtocolStateMachine.Validate(state, roundTrip, fixture.Now);
+        Assert.True(accepted.Accepted, accepted.ErrorMessage);
+
+        var missingContext = roundTrip with { HostActionContext = null! };
+        Assert.False(missingContext.IsWellFormed(fixture.Now));
+        var malformedInput = roundTrip with { Input = default };
+        Assert.False(malformedInput.IsWellFormed(fixture.Now));
+        var changedSchema = roundTrip with
+        {
+            InputSchema = roundTrip.InputSchema with { ContentHash = "changed-schema" },
+        };
+        Assert.False(changedSchema.IsWellFormed(fixture.Now));
+        var wrongInvocation = roundTrip with
+        {
+            InvocationId = Guid.NewGuid(),
+        };
+        Assert.False(wrongInvocation.IsWellFormed(fixture.Now));
+        var wrongTool = roundTrip with
+        {
+            ToolName = "other-tool",
+        };
+        Assert.False(wrongTool.IsWellFormed(fixture.Now));
+        var wrongCaller = roundTrip with
+        {
+            Caller = new RequestPrincipal("other-user"),
+        };
+        Assert.False(wrongCaller.IsWellFormed(fixture.Now));
+        var wrongIngress = roundTrip with
+        {
+            HostActionContext = roundTrip.HostActionContext with
+            {
+                Ingress = HostActionEntryIngress.Cli,
+            },
+        };
+        Assert.False(wrongIngress.IsWellFormed(fixture.Now));
+        var wrongContribution = roundTrip with
+        {
+            HostActionContext = roundTrip.HostActionContext with
+            {
+                Contribution = roundTrip.HostActionContext.Contribution! with
+                {
+                    IngressBinding = new HostActionEntryIngressBinding(
+                        HostActionEntryIngress.Tool,
+                        "other-tool"),
+                },
+            },
+        };
+        Assert.False(wrongContribution.IsWellFormed(fixture.Now));
+
+        var changedDescriptor = roundTrip.HostActionContext with
+        {
+            Contribution = roundTrip.HostActionContext.Contribution! with
+            {
+                Lineage = roundTrip.HostActionContext.Contribution.Lineage with
+                {
+                    ActionKey = new SharpClawActionKey("other.action"),
+                },
+            },
+        };
+        var changedDescriptorResult = SidecarProtocolStateMachine.Validate(
+            accepted.State! with
+            {
+                Phase = SidecarProtocolPhase.Negotiated,
+                LastSequence = 0,
+                InvocationId = Guid.Empty,
+                HandlerId = null,
+                ToolName = null,
+            },
+            roundTrip with { HostActionContext = changedDescriptor },
+            fixture.Now);
+        Assert.False(changedDescriptorResult.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ExchangeIdentityMismatch, changedDescriptorResult.ErrorCode);
+
+        var changedContextResult = SidecarProtocolStateMachine.Validate(
+            accepted.State! with
+            {
+                Phase = SidecarProtocolPhase.Negotiated,
+                LastSequence = 0,
+                InvocationId = Guid.Empty,
+                HandlerId = null,
+                ToolName = null,
+            },
+            roundTrip with
+            {
+                Header = header with { Sequence = 1 },
+                HostActionContext = roundTrip.HostActionContext with { TraceId = Guid.NewGuid() },
+            },
+            fixture.Now);
+        Assert.False(changedContextResult.Accepted);
+        Assert.Equal(SidecarProtocolErrors.ExchangeIdentityMismatch, changedContextResult.ErrorCode);
+
+        var replay = SidecarProtocolStateMachine.Validate(
+            accepted.State! with
+            {
+                Phase = SidecarProtocolPhase.Negotiated,
+                LastSequence = 1,
+                InvocationId = Guid.Empty,
+                HandlerId = null,
+                ToolName = null,
+            },
+            roundTrip,
+            fixture.Now);
+        Assert.False(replay.Accepted);
+        Assert.Equal(SidecarProtocolErrors.InvalidSequence, replay.ErrorCode);
+
+        var expired = roundTrip.HostActionContext with
+        {
+            Deadline = fixture.Now.AddSeconds(-1),
+            ExpiresAt = fixture.Now,
+        };
+        var expiredResult = SidecarProtocolStateMachine.Validate(
+            state,
+            roundTrip with
+            {
+                Header = header with { Deadline = expired.Deadline },
+                HostActionContext = expired,
+            },
+            fixture.Now);
+        Assert.False(expiredResult.Accepted);
+        Assert.Equal(SidecarProtocolErrors.DeadlineExceeded, expiredResult.ErrorCode);
+    }
+
+    [Fact]
     public void All_ingress_carriers_round_trip_the_issued_context()
     {
         var fixture = CreateFixture();
