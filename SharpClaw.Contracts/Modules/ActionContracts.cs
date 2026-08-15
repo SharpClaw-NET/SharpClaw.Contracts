@@ -445,6 +445,53 @@ public sealed record HostActionEntryRequestContext(
         Contribution.IsWellFormed;
 }
 
+public enum HostActionEntryCarrierCompletionKind
+{
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+public sealed record HostActionEntryCarrierIdentity(
+    HostActionEntryIngress Ingress,
+    Guid InvocationId,
+    HostActionEntryIngressBinding Contribution)
+{
+    public bool IsWellFormed =>
+        Enum.IsDefined(Ingress) &&
+        InvocationId != Guid.Empty &&
+        Contribution is not null &&
+        Contribution.IsWellFormed &&
+        Contribution.Ingress == Ingress;
+}
+
+public sealed record HostActionEntryCarrierAuthority(
+    string ModuleId,
+    string GraphId,
+    Guid SessionId,
+    Guid RequestId,
+    Guid CancellationId,
+    Guid CapabilityId,
+    HostActionEntryCarrierIdentity Carrier,
+    long BindingGeneration,
+    DateTimeOffset IssuedAt,
+    DateTimeOffset ExpiresAt,
+    string CapabilityHandleHash)
+{
+    public bool IsValid =>
+        !string.IsNullOrWhiteSpace(ModuleId) &&
+        !string.IsNullOrWhiteSpace(GraphId) &&
+        SessionId != Guid.Empty &&
+        RequestId != Guid.Empty &&
+        CancellationId != Guid.Empty &&
+        CapabilityId != Guid.Empty &&
+        Carrier is not null &&
+        Carrier.IsWellFormed &&
+        BindingGeneration > 0 &&
+        ExpiresAt >= IssuedAt &&
+        !string.IsNullOrWhiteSpace(CapabilityHandleHash);
+}
+
 public sealed record HostActionEntryRequest<TAction, TResult>(
     ActionDescriptor<TAction, TResult> Descriptor,
     TAction Action,

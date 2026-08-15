@@ -181,6 +181,8 @@ public sealed class SidecarCapabilitySession
     private readonly Dictionary<Guid, SidecarCapabilityCallIdentity> _callIdentities = [];
     private readonly Dictionary<Guid, SidecarSerializedPayload?> _callPayloads = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _issuedEntryContexts = [];
+    private readonly Dictionary<Guid, HostActionEntryCarrierAuthority> _activeEntryCarriers = [];
+    private readonly HashSet<Guid> _completedEntryCarriers = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _callEntryContexts = [];
     private readonly HashSet<Guid> _completedCalls = [];
     private readonly HashSet<string> _nonces = new(StringComparer.Ordinal);
@@ -190,6 +192,7 @@ public sealed class SidecarCapabilitySession
     private long _lastSequence;
     private int _inFlight;
     private int _totalCalls;
+    private long _bindingGeneration = 1;
     private bool _disconnected;
 
     public SidecarCapabilitySession(
@@ -214,7 +217,34 @@ public sealed class SidecarCapabilitySession
             throw new ArgumentException(result.Message, nameof(binding));
     }
 
-    public SidecarCapabilitySessionBinding Binding { get; }
+    public SidecarCapabilitySessionBinding Binding { get; private set; }
+
+    public long BindingGeneration
+    {
+        get
+        {
+            lock (_sync)
+                return _bindingGeneration;
+        }
+    }
+
+    public int ActiveHostActionEntryCarrierCount
+    {
+        get
+        {
+            lock (_sync)
+                return _activeEntryCarriers.Count;
+        }
+    }
+
+    public int IssuedHostActionEntryContextCount
+    {
+        get
+        {
+            lock (_sync)
+                return _issuedEntryContexts.Count + _activeEntryCarriers.Count;
+        }
+    }
 
     public SidecarCapabilityValidationResult ValidateHostActionEntry<TAction, TResult>(
         HostActionEntryTransportRequest<TAction, TResult> request,
@@ -348,6 +378,186 @@ public sealed class SidecarCapabilitySession
                 Contribution = request.Contribution,
             };
             _issuedEntryContexts.Add(capabilityId, context);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult BeginHostActionEntryCarrier(
+        HostActionEntryRequestContext context,
+        HostActionEntryCarrierIdentity carrier,
+        DateTimeOffset now,
+        out HostActionEntryCarrierAuthority? authority)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(carrier);
+        authority = null;
+
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            if (!context.IsWellFormed(now) ||
+                !carrier.IsWellFormed ||
+                context.RequestId != Binding.RequestId ||
+                context.CancellationId != Binding.CancellationId ||
+                !MatchesCarrier(context, carrier) ||
+                !_issuedEntryContexts.TryGetValue(context.CapabilityId, out var issuedContext) ||
+                !HostActionEntryAuthorityValidator.SameContext(context, issuedContext))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The host action entry carrier does not match the issued context.");
+            }
+
+            authority = new HostActionEntryCarrierAuthority(
+                Binding.ModuleId,
+                Binding.GraphId,
+                Binding.SessionId,
+                Binding.RequestId,
+                Binding.CancellationId,
+                context.CapabilityId,
+                carrier,
+                _bindingGeneration,
+                now,
+                context.ExpiresAt,
+                HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(context.CapabilityHandle));
+            _issuedEntryContexts.Remove(context.CapabilityId);
+            _activeEntryCarriers.Add(context.CapabilityId, authority);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult CompleteHostActionEntryCarrier(
+        HostActionEntryCarrierAuthority authority,
+        HostActionEntryCarrierCompletionKind completion,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(authority);
+
+        lock (_sync)
+        {
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            if (!Enum.IsDefined(completion))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The carrier completion state is invalid.");
+
+            if (!_activeEntryCarriers.TryGetValue(authority.CapabilityId, out var activeAuthority))
+                return SidecarCapabilityValidationResult.Reject(
+                    _completedEntryCarriers.Contains(authority.CapabilityId)
+                        ? SidecarCapabilityErrors.Replay
+                        : SidecarCapabilityErrors.SpoofedIdentity,
+                    "The host action entry carrier is not active.");
+
+            if (!MatchesCarrierAuthority(authority, activeAuthority))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The host action entry carrier authority does not match the active carrier.");
+            }
+
+            if (activeAuthority.ExpiresAt <= now)
+            {
+                RemoveEntryCarrier(authority.CapabilityId);
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Expired,
+                    "The host action entry carrier has expired.");
+            }
+
+            if (_callEntryContexts.Values.Any(context =>
+                context.CapabilityId == authority.CapabilityId))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The host action entry carrier has an active HostEntry call.");
+            }
+
+            RemoveEntryCarrier(authority.CapabilityId);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public int SweepExpiredHostActionEntryCarriers(DateTimeOffset now)
+    {
+        lock (_sync)
+            return SweepExpiredEntryContexts(now);
+    }
+
+    public bool TryGetActiveHostActionEntryCarrier(
+        Guid capabilityId,
+        out HostActionEntryCarrierAuthority? authority)
+    {
+        lock (_sync)
+            return _activeEntryCarriers.TryGetValue(capabilityId, out authority);
+    }
+
+    public SidecarCapabilityValidationResult RotateBinding(
+        SidecarCapabilitySessionBinding replacement,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+
+        lock (_sync)
+        {
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            var identityMatches =
+                string.Equals(replacement.ModuleId, Binding.ModuleId, StringComparison.Ordinal) &&
+                string.Equals(replacement.GraphId, Binding.GraphId, StringComparison.Ordinal) &&
+                replacement.ProtocolVersion == Binding.ProtocolVersion &&
+                replacement.SessionId == Binding.SessionId &&
+                replacement.RequestId == Binding.RequestId &&
+                replacement.CancellationId == Binding.CancellationId;
+            if (!identityMatches)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The rotated binding does not preserve session identity.");
+
+            var validation = SidecarCapabilitySessionValidator.Validate(
+                replacement,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now);
+            if (!validation.Accepted)
+                return validation;
+
+            var requiredExpiry = _activeEntryCarriers.Count == 0
+                ? now
+                : _activeEntryCarriers.Values.Max(value => value.ExpiresAt);
+            if (replacement.ExpiresAt < requiredExpiry ||
+                _activeEntryCarriers.Count > 0 && !replacement.Grant.Allows(SidecarCapabilityKind.Action) ||
+                replacement.PayloadLimits.ActionInputBytes < Binding.PayloadLimits.ActionInputBytes ||
+                replacement.PayloadLimits.ProtocolMessageBytes < Binding.PayloadLimits.ProtocolMessageBytes ||
+                replacement.ConcurrencyLimits.MaximumInFlightCalls < Binding.ConcurrencyLimits.MaximumInFlightCalls ||
+                replacement.ConcurrencyLimits.MaximumCallsPerRequest < Binding.ConcurrencyLimits.MaximumCallsPerRequest)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The rotated binding would strand active carrier authority.");
+            }
+
+            Binding = replacement;
+            _bindingGeneration++;
             return SidecarCapabilityValidationResult.Accept();
         }
     }
@@ -508,14 +718,14 @@ public sealed class SidecarCapabilitySession
 
             if (hostContext is not null &&
                 (!hostContext.IsWellFormed(now) ||
-                 !_issuedEntryContexts.TryGetValue(hostContext.CapabilityId, out var issuedContext) ||
-                 !HostActionEntryAuthorityValidator.SameContext(hostContext, issuedContext) ||
+                 !_activeEntryCarriers.TryGetValue(hostContext.CapabilityId, out var activeCarrier) ||
+                 !MatchesCarrierContext(hostContext, activeCarrier) ||
                  hostContext.RequestId != Binding.RequestId ||
                  hostContext.CancellationId != Binding.CancellationId))
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
-                    "The host action entry context was not issued by this session.");
+                    "The host action entry context is not active for this carrier.");
             }
 
             if (!identity.IsValid ||
@@ -698,6 +908,85 @@ public sealed class SidecarCapabilitySession
         }
     }
 
+    private int SweepExpiredEntryContexts(DateTimeOffset now)
+    {
+        var removed = 0;
+        foreach (var capabilityId in _issuedEntryContexts
+            .Where(pair => pair.Value.ExpiresAt <= now)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _issuedEntryContexts.Remove(capabilityId);
+            _completedEntryCarriers.Add(capabilityId);
+            removed++;
+        }
+
+        foreach (var capabilityId in _activeEntryCarriers
+            .Where(pair => pair.Value.ExpiresAt <= now)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            RemoveEntryCarrier(capabilityId);
+            removed++;
+        }
+
+        return removed;
+    }
+
+    private void RemoveEntryCarrier(Guid capabilityId)
+    {
+        _issuedEntryContexts.Remove(capabilityId);
+        _activeEntryCarriers.Remove(capabilityId);
+        _completedEntryCarriers.Add(capabilityId);
+    }
+
+    private static bool MatchesCarrier(
+        HostActionEntryRequestContext context,
+        HostActionEntryCarrierIdentity carrier) =>
+        context.Ingress == carrier.Ingress &&
+        context.InvocationId == carrier.InvocationId &&
+        context.Contribution is not null &&
+        SameIngressBinding(context.Contribution.IngressBinding, carrier.Contribution);
+
+    private static bool MatchesCarrierContext(
+        HostActionEntryRequestContext context,
+        HostActionEntryCarrierAuthority authority) =>
+        authority.IsValid &&
+        authority.CapabilityId == context.CapabilityId &&
+        MatchesCarrier(context, authority.Carrier) &&
+        string.Equals(
+            authority.CapabilityHandleHash,
+            HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(context.CapabilityHandle),
+            StringComparison.OrdinalIgnoreCase);
+
+    private static bool MatchesCarrierAuthority(
+        HostActionEntryCarrierAuthority candidate,
+        HostActionEntryCarrierAuthority active) =>
+        candidate.IsValid &&
+        active.IsValid &&
+        string.Equals(candidate.ModuleId, active.ModuleId, StringComparison.Ordinal) &&
+        string.Equals(candidate.GraphId, active.GraphId, StringComparison.Ordinal) &&
+        candidate.SessionId == active.SessionId &&
+        candidate.RequestId == active.RequestId &&
+        candidate.CancellationId == active.CancellationId &&
+        candidate.CapabilityId == active.CapabilityId &&
+        candidate.BindingGeneration == active.BindingGeneration &&
+        candidate.IssuedAt == active.IssuedAt &&
+        candidate.ExpiresAt == active.ExpiresAt &&
+        string.Equals(candidate.CapabilityHandleHash, active.CapabilityHandleHash, StringComparison.OrdinalIgnoreCase) &&
+        candidate.Carrier.Ingress == active.Carrier.Ingress &&
+        candidate.Carrier.InvocationId == active.Carrier.InvocationId &&
+        SameIngressBinding(candidate.Carrier.Contribution, active.Carrier.Contribution);
+
+    private static bool SameIngressBinding(
+        HostActionEntryIngressBinding left,
+        HostActionEntryIngressBinding right) =>
+        left is not null &&
+        right is not null &&
+        left.Ingress == right.Ingress &&
+        string.Equals(left.PrimaryIdentity, right.PrimaryIdentity, StringComparison.Ordinal) &&
+        string.Equals(left.SecondaryIdentity, right.SecondaryIdentity, StringComparison.Ordinal);
+
     public void Disconnect()
     {
         lock (_sync)
@@ -708,6 +997,8 @@ public sealed class SidecarCapabilitySession
             _callPayloads.Clear();
             _callEntryContexts.Clear();
             _issuedEntryContexts.Clear();
+            _activeEntryCarriers.Clear();
+            _completedEntryCarriers.Clear();
             _terminalCalls.Clear();
             _terminalReceipts.Clear();
             _inFlight = 0;

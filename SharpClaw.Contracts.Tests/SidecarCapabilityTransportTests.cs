@@ -107,6 +107,7 @@ public sealed class SidecarCapabilityTransportTests
             ReplayNonce = "roles-entry",
         };
         var payload = Payload(typeof(string).AssemblyQualifiedName!, "input");
+        ActivateContext(fixture, context);
         Assert.True(fixture.Session.BeginCall(
             call,
             SidecarCapabilityKind.Action,
@@ -403,6 +404,7 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(start.IsWellFormed(fixture.Now));
 
         var actionPayload = Payload(typeof(string).AssemblyQualifiedName!, "input");
+        ActivateContext(fixture, context);
         Assert.True(fixture.Session.BeginCall(
             call,
             SidecarCapabilityKind.Action,
@@ -534,6 +536,215 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void Carrier_completion_revokes_cli_and_tool_contexts_and_rejects_replay()
+    {
+        var fixture = CreateFixture();
+        var cliContext = IssueContext(
+            fixture,
+            new RequestPrincipal("cli"),
+            HostActionEntryIngress.Cli);
+        var cliAuthority = ActivateContext(fixture, cliContext);
+
+        Assert.Equal(1, fixture.Session.ActiveHostActionEntryCarrierCount);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            cliAuthority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+        Assert.Equal(0, fixture.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            fixture.Session.CompleteHostActionEntryCarrier(
+                cliAuthority,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                fixture.Now).Code);
+
+        var delayed = fixture.Session.BeginCall(
+            fixture.Call with
+            {
+                Capability = SidecarCapabilityKind.Action,
+                CallId = Guid.NewGuid(),
+                ReplayNonce = "completed-carrier",
+            },
+            SidecarCapabilityKind.Action,
+            Payload("entry.input", "delayed"),
+            32,
+            fixture.Now,
+            cliContext);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, delayed.Code);
+
+        var toolContext = IssueContext(
+            fixture,
+            new RequestPrincipal("tool"),
+            HostActionEntryIngress.Tool);
+        var toolAuthority = ActivateContext(fixture, toolContext);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            toolAuthority,
+            HostActionEntryCarrierCompletionKind.Failed,
+            fixture.Now).Accepted);
+        Assert.Equal(0, fixture.Session.ActiveHostActionEntryCarrierCount);
+
+        var cancelledContext = IssueContext(
+            fixture,
+            new RequestPrincipal("cancelled"),
+            HostActionEntryIngress.Cli);
+        var cancelledAuthority = ActivateContext(fixture, cancelledContext);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            cancelledAuthority,
+            HostActionEntryCarrierCompletionKind.Cancelled,
+            fixture.Now).Accepted);
+        Assert.Equal(0, fixture.Session.IssuedHostActionEntryContextCount);
+    }
+
+    [Fact]
+    public void Carrier_completion_waits_for_the_active_host_entry_call()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("entry-user"),
+            HostActionEntryIngress.Cli);
+        var authority = ActivateContext(fixture, context);
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "active-entry",
+        };
+        var payload = Payload(typeof(string).AssemblyQualifiedName!, "input");
+        Assert.True(fixture.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            payload,
+            payload.ByteLength,
+            fixture.Now,
+            context).Accepted);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.CompleteHostActionEntryCarrier(
+                authority,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                fixture.Now).Code);
+        Assert.True(fixture.Session.CompleteCall(call.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            authority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public void Distinct_cli_and_tool_carriers_remain_isolated()
+    {
+        var fixture = CreateFixture();
+        var cliContext = IssueContext(
+            fixture,
+            new RequestPrincipal("cli"),
+            HostActionEntryIngress.Cli);
+        var toolContext = IssueContext(
+            fixture,
+            new RequestPrincipal("tool"),
+            HostActionEntryIngress.Tool);
+        var cliAuthority = ActivateContext(fixture, cliContext);
+        var toolAuthority = ActivateContext(fixture, toolContext);
+
+        Assert.NotEqual(cliAuthority.CapabilityId, toolAuthority.CapabilityId);
+        Assert.NotEqual(cliAuthority.Carrier.InvocationId, toolAuthority.Carrier.InvocationId);
+        Assert.Equal(2, fixture.Session.ActiveHostActionEntryCarrierCount);
+
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            cliAuthority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+        Assert.True(fixture.Session.TryGetActiveHostActionEntryCarrier(
+            toolAuthority.CapabilityId,
+            out var activeTool));
+        Assert.Equal(toolAuthority, activeTool);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            toolAuthority,
+            HostActionEntryCarrierCompletionKind.Cancelled,
+            fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public void Active_carrier_authority_survives_binding_rotation()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("rotating"),
+            HostActionEntryIngress.Tool);
+        var authority = ActivateContext(fixture, context);
+        var rotatedExpiry = fixture.Binding.ExpiresAt.AddMinutes(1);
+        var rotated = fixture.Binding with
+        {
+            ExpiresAt = rotatedExpiry,
+            Grant = fixture.Binding.Grant with { ExpiresAt = rotatedExpiry },
+            Authentication = fixture.Binding.Authentication with
+            {
+                Nonce = "rotation-nonce",
+                ExpiresAt = rotatedExpiry,
+                BindingHash = string.Empty,
+            },
+        };
+        rotated = rotated with
+        {
+            Authentication = rotated.Authentication with
+            {
+                BindingHash = SidecarCapabilitySessionValidator.ComputeBindingHash(rotated),
+            },
+        };
+        fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+
+        Assert.True(fixture.Session.RotateBinding(rotated, fixture.Now).Accepted);
+        Assert.Equal(2L, fixture.Session.BindingGeneration);
+        Assert.True(fixture.Session.TryGetActiveHostActionEntryCarrier(
+            authority.CapabilityId,
+            out var active));
+        Assert.Equal(authority, active);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            authority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public void Expired_carriers_are_swept_without_disconnect_and_cannot_replay()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("expired"),
+            HostActionEntryIngress.Cli);
+        var authority = ActivateContext(fixture, context);
+        var afterExpiry = context.ExpiresAt.AddSeconds(1);
+
+        Assert.Equal(1, fixture.Session.SweepExpiredHostActionEntryCarriers(afterExpiry));
+        Assert.Equal(0, fixture.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(0, fixture.Session.ActiveHostActionEntryCarrierCount);
+        Assert.False(fixture.Session.TryGetActiveHostActionEntryCarrier(
+            authority.CapabilityId,
+            out _));
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            fixture.Session.CompleteHostActionEntryCarrier(
+                authority,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                afterExpiry).Code);
+        Assert.True(fixture.Session.BeginCall(
+            fixture.Call with
+            {
+                Capability = SidecarCapabilityKind.Action,
+                CallId = Guid.NewGuid(),
+                ReplayNonce = "expired-carrier",
+            },
+            SidecarCapabilityKind.Action,
+            Payload("entry.input", "expired"),
+            32,
+            afterExpiry,
+            context).Code is SidecarCapabilityErrors.SpoofedIdentity or SidecarCapabilityErrors.Expired);
+    }
+
+    [Fact]
     public void Session_authentication_binds_the_proof_to_immutable_authority_and_rejects_nonce_replay()
     {
         var fixture = CreateFixture();
@@ -630,6 +841,7 @@ public sealed class SidecarCapabilityTransportTests
             Sequence = 1,
         };
         var firstPayload = Payload(typeof(string).AssemblyQualifiedName!, "first");
+        ActivateContext(fixture, contexts[0]);
         Assert.True(fixture.Session.BeginCall(
             firstCall,
             SidecarCapabilityKind.Action,
@@ -675,7 +887,7 @@ public sealed class SidecarCapabilityTransportTests
             firstPayload.ByteLength,
             fixture.Now,
             contexts[0]);
-        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, replay.Code);
+        Assert.Equal(SidecarCapabilityErrors.Replay, replay.Code);
 
         var wrongIngress = contexts[1] with { Ingress = HostActionEntryIngress.Tool };
         var wrongIngressResult = fixture.Session.BeginCall(
@@ -798,6 +1010,7 @@ public sealed class SidecarCapabilityTransportTests
             ReplayNonce = "entry-nonce",
             Sequence = 1,
         };
+        ActivateContext(fixture, context);
         Assert.True(fixture.Session.BeginCall(
             actionCall,
             SidecarCapabilityKind.Action,
@@ -948,6 +1161,7 @@ public sealed class SidecarCapabilityTransportTests
             Sequence = 1,
         };
         var payload = Payload(typeof(string).AssemblyQualifiedName!, "input");
+        ActivateContext(fixture, context);
         Assert.True(fixture.Session.BeginCall(
             call,
             SidecarCapabilityKind.Action,
@@ -1740,9 +1954,13 @@ public sealed class SidecarCapabilityTransportTests
             },
         };
         var nonces = new HashSet<string>(StringComparer.Ordinal);
+        var bindingHashes = new HashSet<string>(StringComparer.Ordinal)
+        {
+            binding.Authentication.BindingHash,
+        };
         var session = new SidecarCapabilitySession(
             binding,
-            authority => authority.BindingHash == binding.Authentication.BindingHash,
+            authority => bindingHashes.Contains(authority.BindingHash),
             nonces.Add,
             now);
         var call = new SidecarCapabilityCallIdentity(
@@ -1756,7 +1974,7 @@ public sealed class SidecarCapabilityTransportTests
             SidecarCapabilityKind.Storage,
             1,
             now.AddMinutes(1));
-        return new Fixture(now, binding, session, call, safeFailure, nonces);
+        return new Fixture(now, binding, session, call, safeFailure, nonces, bindingHashes);
     }
 
     private static HostActionEntryRequestContext IssueContext(
@@ -1796,6 +2014,24 @@ public sealed class SidecarCapabilityTransportTests
             out var context);
         Assert.True(result.Accepted, result.Message);
         return context!;
+    }
+
+    private static HostActionEntryCarrierAuthority ActivateContext(
+        Fixture fixture,
+        HostActionEntryRequestContext context)
+    {
+        var carrier = new HostActionEntryCarrierIdentity(
+            context.Ingress,
+            context.InvocationId,
+            context.Contribution!.IngressBinding);
+        var result = fixture.Session.BeginHostActionEntryCarrier(
+            context,
+            carrier,
+            fixture.Now,
+            out var authority);
+        Assert.True(result.Accepted, result.Message);
+        Assert.NotNull(authority);
+        return authority!;
     }
 
     private static SidecarSerializedPayload Payload<T>(string typeIdentity, T value)
@@ -1855,7 +2091,8 @@ public sealed class SidecarCapabilityTransportTests
         SidecarCapabilitySession Session,
         SidecarCapabilityCallIdentity Call,
         SidecarSafeFailureIdentity SafeFailure,
-        HashSet<string> Nonces);
+        HashSet<string> Nonces,
+        HashSet<string> BindingHashes);
 
     private sealed class SessionHostActionEntryProxy(
         SidecarCapabilitySession session,
