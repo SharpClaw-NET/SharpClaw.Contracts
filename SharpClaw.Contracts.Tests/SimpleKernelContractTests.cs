@@ -137,8 +137,12 @@ public sealed class SimpleKernelContractTests
                 context));
         var cancellation = new CancellationTokenSource().Token;
         var entry = new RecordingHostActionEntry();
+        var terminal = new RecordingHostActionEntryTerminal<string, string>();
 
-        var outcome = await entry.InvokeAsync(request, cancellation);
+        var outcome = await entry.InvokeAsync(
+            request,
+            terminal,
+            cancellation);
         var json = JsonSerializer.Serialize(request, JsonOptions);
 
         Assert.True(transport.Validate(now, authority =>
@@ -146,6 +150,8 @@ public sealed class SimpleKernelContractTests
         Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
         Assert.Same(request, entry.Request);
         Assert.Equal(cancellation, entry.CancellationToken);
+        Assert.Equal(request.Action, terminal.Context?.Action);
+        Assert.Equal(request.Descriptor.Key, terminal.Context?.ActionKey);
         Assert.DoesNotContain("Snapshot", json, StringComparison.Ordinal);
         Assert.DoesNotContain("ActionGrants", json, StringComparison.Ordinal);
         Assert.DoesNotContain("EventGrants", json, StringComparison.Ordinal);
@@ -402,12 +408,45 @@ public sealed class SimpleKernelContractTests
 
         public ValueTask<IActionOutcome<TResult>> InvokeAsync<TAction, TResult>(
             HostActionEntryRequest<TAction, TResult> request,
+            IHostActionEntryTerminal<TAction, TResult> terminal,
             CancellationToken cancellationToken = default)
         {
             Request = request;
             CancellationToken = cancellationToken;
+            terminal.InvokeAsync(
+                new ActionContext<TAction>(
+                    request.Context.InvocationId,
+                    null,
+                    request.Context.TraceId,
+                    request.Context.IdempotencyKey,
+                    0,
+                    1,
+                    request.Context.Deadline,
+                    request.Descriptor.Key,
+                    "demo",
+                    request.Context.Caller,
+                    request.Action,
+                    request.Context.Features,
+                    new ActionPipelineSnapshot("host-graph", [])))
+                .GetAwaiter()
+                .GetResult();
             return ValueTask.FromResult<IActionOutcome<TResult>>(
                 new RecordedOutcome<TResult>(ActionOutcomeKind.Completed));
+        }
+    }
+
+    private sealed class RecordingHostActionEntryTerminal<TAction, TResult>
+        : IHostActionEntryTerminal<TAction, TResult>
+    {
+        public Guid TerminalId { get; } = Guid.NewGuid();
+        public ActionContext<TAction>? Context { get; private set; }
+
+        public ValueTask<TResult> InvokeAsync(
+            ActionContext<TAction> context,
+            CancellationToken cancellationToken = default)
+        {
+            Context = context;
+            return ValueTask.FromResult(default(TResult)!);
         }
     }
 

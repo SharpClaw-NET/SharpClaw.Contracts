@@ -880,6 +880,16 @@ public static class HostActionEntryAuthorityValidator
             string.Equals(pair.First.Value.GetRawText(), pair.Second.Value.GetRawText(), StringComparison.Ordinal));
 }
 
+/// <summary>Read-only terminal callback for one host-owned typed action entry.</summary>
+public interface IHostActionEntryTerminal<TAction, TResult>
+{
+    Guid TerminalId { get; }
+
+    ValueTask<TResult> InvokeAsync(
+        ActionContext<TAction> context,
+        CancellationToken cancellationToken = default);
+}
+
 /// <summary>Host-owned entry for typed module action calls.</summary>
 /// <remarks>
 /// Implementations resolve the authorized descriptor and pipeline snapshot from host state.
@@ -890,6 +900,7 @@ public interface IHostActionEntry
 {
     ValueTask<IActionOutcome<TResult>> InvokeAsync<TAction, TResult>(
         HostActionEntryRequest<TAction, TResult> request,
+        IHostActionEntryTerminal<TAction, TResult> terminal,
         CancellationToken cancellationToken = default);
 }
 

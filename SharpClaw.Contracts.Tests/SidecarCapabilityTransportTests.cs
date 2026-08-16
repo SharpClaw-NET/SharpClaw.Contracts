@@ -1594,6 +1594,25 @@ public sealed class SidecarCapabilityTransportTests
                 fixture.Binding,
                 fixture.Session).Code);
 
+        var terminalCaller = new RequestPrincipal("terminal-caller", Roles: new HashSet<string>(["reader"]));
+        var terminalFeatures = new ExtensionFeatureSet([]);
+        var terminalContext = new SidecarActionTerminalExecutionContext(
+            request.Call,
+            request.Invocation,
+            descriptor,
+            replacement,
+            snapshot,
+            Guid.NewGuid(),
+            null,
+            0,
+            1,
+            terminalCaller,
+            terminalFeatures,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            request.Cancellation,
+            receipt,
+            request.Deadline);
         var terminalRequest = new SidecarActionTerminalTransportRequest(
             request.Call,
             request.Invocation,
@@ -1625,15 +1644,33 @@ public sealed class SidecarCapabilityTransportTests
                 request.Deadline,
                 fixture.Now.AddMinutes(-1),
                 request.Deadline,
-                "host-proof"),
+                "host-proof")
+            {
+                SnapshotContentHash = SidecarCapabilityTransportCodec.ComputeSha256(
+                    SidecarCapabilityTransportCodec.Serialize(snapshot)),
+                Caller = terminalCaller,
+                Features = terminalFeatures,
+                TraceId = terminalContext.TraceId,
+                IdempotencyKey = terminalContext.IdempotencyKey,
+                InvocationId = terminalContext.InvocationId,
+                ParentInvocationId = terminalContext.ParentInvocationId,
+                Depth = terminalContext.Depth,
+                Attempt = terminalContext.Attempt,
+            },
             receipt,
             request.Cancellation,
-            request.Deadline);
+            request.Deadline)
+        {
+            Context = terminalContext,
+        };
         var terminalResponse = new SidecarActionTerminalTransportResponse(
             resultIdentity,
             new SidecarTerminalExecutionResult(outcomePayload, null, true),
             receipt,
-            fixture.SafeFailure);
+            fixture.SafeFailure)
+        {
+            TerminalId = terminalRequest.TerminalId,
+        };
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
             request,
             terminalRequest,
@@ -2062,7 +2099,14 @@ public sealed class SidecarCapabilityTransportTests
             Payload(typeof(string).AssemblyQualifiedName!, "input"),
             new SidecarCancellationIdentity(call.CancellationId, "host-cancel", call.Deadline),
             call.Deadline,
-            context);
+            context,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.ResultTypeIdentity,
+                descriptor.ResultSchemaVersion,
+                descriptor.DescriptorHash));
         var transport = new RecordingSidecarTransport(fixture.SafeFailure);
 
         var response = await transport.InvokeActionAsync(request);
@@ -2120,12 +2164,411 @@ public sealed class SidecarCapabilityTransportTests
         var transport = new RecordingSidecarTransport(fixture.SafeFailure);
         var proxy = new TransportHostActionEntryProxy(transport, call);
 
-        var outcome = await proxy.InvokeAsync(moduleRequest);
+        var outcome = await proxy.InvokeAsync(
+            moduleRequest,
+            new RecordingHostActionEntryTerminal<string, string>());
 
         Assert.Equal(ActionOutcomeKind.Cancelled, outcome.Kind);
         Assert.Equal(1, transport.ActionCalls);
         Assert.Equal(SidecarActionInvocationKind.HostEntry, transport.Request!.Invocation);
         Assert.Null(transport.Request.Snapshot);
+    }
+
+    [Fact]
+    public void Host_entry_accepts_each_ingress_with_one_descriptor_bound_terminal()
+    {
+        var fixture = CreateFixture(maxCalls: 8);
+        var ingresses = Enum.GetValues<HostActionEntryIngress>();
+
+        for (var index = 0; index < ingresses.Length; index++)
+        {
+            var ingress = ingresses[index];
+            var call = fixture.Call with
+            {
+                Capability = SidecarCapabilityKind.Action,
+                CallId = Guid.NewGuid(),
+                ReplayNonce = $"ingress-terminal-{index}",
+                Sequence = index + 1,
+            };
+            var key = new SharpClawActionKey($"module.{ingress.ToString().ToLowerInvariant()}");
+            var descriptor = new SidecarActionDescriptorIdentity(
+                key,
+                1,
+                "module",
+                typeof(string).AssemblyQualifiedName!,
+                $"{key.Value}.input",
+                1,
+                typeof(string).AssemblyQualifiedName!,
+                $"{key.Value}.result",
+                1,
+                $"{key.Value}.descriptor");
+            var action = Payload(descriptor.InputTypeIdentity, $"input-{index}");
+            var context = IssueContext(
+                fixture,
+                new RequestPrincipal($"caller-{index}"),
+                ingress,
+                actionDeadline: call.Deadline,
+                lineage: new HostActionEntryLineage(
+                    descriptor.Key,
+                    descriptor.Version,
+                    descriptor.DescriptorHash,
+                    descriptor.InputTypeIdentity,
+                    descriptor.InputSchemaVersion,
+                    descriptor.InputSchemaHash,
+                    null,
+                    null));
+            var request = SidecarActionCapabilityRequest.HostEntry(
+                call,
+                descriptor,
+                action,
+                new SidecarCancellationIdentity(call.CancellationId, $"cancel-{index}", call.Deadline),
+                call.Deadline,
+                context,
+                new SidecarActionTerminalRegistration(
+                    Guid.NewGuid(),
+                    descriptor.InputTypeIdentity,
+                    descriptor.InputSchemaVersion,
+                    descriptor.ResultTypeIdentity,
+                    descriptor.ResultSchemaVersion,
+                    descriptor.DescriptorHash));
+
+            Assert.True(SidecarCapabilityTransportValidation.ValidateActionRequest(
+                request,
+                fixture.Binding,
+                fixture.Now).Accepted);
+            var authority = ActivateContext(fixture, context);
+            Assert.True(fixture.Session.BeginCall(
+                call,
+                SidecarCapabilityKind.Action,
+                action,
+                action.ByteLength,
+                fixture.Now,
+                context).Accepted);
+            Assert.True(fixture.Session.CompleteCall(call.CallId, 0).Accepted);
+            Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+                authority,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                fixture.Now).Accepted);
+        }
+    }
+
+    [Fact]
+    public void Host_entry_terminal_rejects_missing_and_changed_authority()
+    {
+        var fixture = CreateFixture();
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "terminal-authority",
+        };
+        var descriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("module.terminal"),
+            1,
+            "module",
+            typeof(string).AssemblyQualifiedName!,
+            "terminal.input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "terminal.result",
+            1,
+            "terminal.descriptor");
+        var action = Payload(descriptor.InputTypeIdentity, "original");
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("terminal-caller", Roles: new HashSet<string>(["reader"])),
+            HostActionEntryIngress.Tool,
+            actionDeadline: call.Deadline,
+            lineage: new HostActionEntryLineage(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                null,
+                null));
+        var request = SidecarCapabilityTransportValidationRequest(
+            call,
+            descriptor,
+            action,
+            context);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidPayload,
+            SidecarCapabilityTransportValidation.ValidateActionRequest(
+                request with { Terminal = null },
+                fixture.Binding,
+                fixture.Now).Code);
+
+        var terminalRequest = CreateTerminalRequest(
+            fixture,
+            request,
+            new ActionPipelineSnapshot("host-graph", []));
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+            request,
+            terminalRequest,
+            fixture.Binding,
+            fixture.Now,
+            authority => authority.Proof == "host-proof").Accepted);
+        var carrierAuthority = ActivateContext(fixture, context);
+        Assert.True(fixture.Session.BeginCall(
+            request.Call,
+            SidecarCapabilityKind.Action,
+            request.Action,
+            request.Action.ByteLength,
+            fixture.Now,
+            context).Accepted);
+        Assert.True(fixture.Session.RecordTerminal(
+            request.Call.CallId,
+            terminalRequest.Authority.AuthorityId,
+            terminalRequest.Receipt).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.TerminalAlreadyCalled,
+            fixture.Session.RecordTerminal(
+                request.Call.CallId,
+                terminalRequest.Authority.AuthorityId,
+                terminalRequest.Receipt).Code);
+        Assert.True(fixture.Session.CompleteCall(request.Call.CallId, 1).Accepted);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            carrierAuthority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with
+                {
+                    Context = terminalRequest.Context! with
+                    {
+                        Caller = new RequestPrincipal("forged-caller", Roles: new HashSet<string>(["reader"])),
+                    },
+                },
+                fixture.Binding,
+                fixture.Now,
+                authority => authority.Proof == "host-proof").Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with
+                {
+                    Context = terminalRequest.Context! with
+                    {
+                        Snapshot = new ActionPipelineSnapshot("forged-graph", []),
+                    },
+                },
+                fixture.Binding,
+                fixture.Now,
+                authority => authority.Proof == "host-proof").Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with
+                {
+                    EffectiveAction = Payload(descriptor.InputTypeIdentity, "changed"),
+                },
+                fixture.Binding,
+                fixture.Now,
+                authority => authority.Proof == "host-proof").Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with
+                {
+                    Descriptor = descriptor with { Key = new SharpClawActionKey("module.other") },
+                },
+                fixture.Binding,
+                fixture.Now,
+                authority => authority.Proof == "host-proof").Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with
+                {
+                    Cancellation = terminalRequest.Cancellation with
+                    {
+                        CancellationId = Guid.NewGuid(),
+                    },
+                },
+                fixture.Binding,
+                fixture.Now,
+                authority => authority.Proof == "host-proof").Code);
+    }
+
+    [Fact]
+    public void Nested_host_entry_requires_a_fresh_carrier_authority()
+    {
+        var fixture = CreateFixture(maxCalls: 3);
+        var rootContext = IssueContext(
+            fixture,
+            new RequestPrincipal("root"),
+            HostActionEntryIngress.Cli);
+        var nestedContext = IssueContext(
+            fixture,
+            new RequestPrincipal("nested"),
+            HostActionEntryIngress.CrossModule);
+        var rootAuthority = ActivateContext(fixture, rootContext);
+        var nestedAuthority = ActivateContext(fixture, nestedContext);
+        var rootCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "root-action",
+            Sequence = 1,
+        };
+        var nestedCall = rootCall with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "nested-action",
+            Sequence = 2,
+        };
+        var payload = Payload(typeof(string).AssemblyQualifiedName!, "nested");
+
+        Assert.True(fixture.Session.BeginCall(
+            rootCall,
+            SidecarCapabilityKind.Action,
+            payload,
+            payload.ByteLength,
+            fixture.Now,
+            rootContext).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            fixture.Session.BeginCall(
+                nestedCall,
+                SidecarCapabilityKind.Action,
+                payload,
+                payload.ByteLength,
+                fixture.Now,
+                rootContext).Code);
+        Assert.True(fixture.Session.BeginCall(
+            nestedCall,
+            SidecarCapabilityKind.Action,
+            payload,
+            payload.ByteLength,
+            fixture.Now,
+            nestedContext).Accepted);
+        Assert.True(fixture.Session.CompleteCall(rootCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(nestedCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            rootAuthority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            nestedAuthority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+    }
+
+    private static SidecarActionCapabilityRequest SidecarCapabilityTransportValidationRequest(
+        SidecarCapabilityCallIdentity call,
+        SidecarActionDescriptorIdentity descriptor,
+        SidecarSerializedPayload action,
+        HostActionEntryRequestContext context) =>
+        SidecarActionCapabilityRequest.HostEntry(
+            call,
+            descriptor,
+            action,
+            new SidecarCancellationIdentity(call.CancellationId, "entry-cancel", call.Deadline),
+            call.Deadline,
+            context,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.ResultTypeIdentity,
+                descriptor.ResultSchemaVersion,
+                descriptor.DescriptorHash));
+
+    private static SidecarActionTerminalTransportRequest CreateTerminalRequest(
+        Fixture fixture,
+        SidecarActionCapabilityRequest request,
+        ActionPipelineSnapshot snapshot)
+    {
+        var effectiveAction = request.Action;
+        var receipt = new SidecarTerminalReceipt(
+            "host-entry-receipt",
+            request.Descriptor.Key,
+            request.Descriptor.Version,
+            request.Call.CallId,
+            1,
+            "host-entry-scope",
+            effectiveAction.ContentHash);
+        var hostContext = request.HostContext ?? throw new InvalidOperationException();
+        var terminalContext = new SidecarActionTerminalExecutionContext(
+            request.Call,
+            request.Invocation,
+            request.Descriptor,
+            effectiveAction,
+            snapshot,
+            hostContext.InvocationId,
+            null,
+            0,
+            1,
+            hostContext.Caller,
+            hostContext.Features,
+            hostContext.TraceId,
+            hostContext.IdempotencyKey,
+            request.Cancellation,
+            receipt,
+            request.Deadline);
+        var authority = new SidecarHostTerminalAuthority(
+            Guid.NewGuid(),
+            fixture.Binding.SessionId,
+            fixture.Binding.RequestId,
+            fixture.Binding.CancellationId,
+            request.Call.CallId,
+            fixture.Binding.ModuleId,
+            fixture.Binding.GraphId,
+            request.Invocation,
+            request.Descriptor.Key,
+            request.Descriptor.Version,
+            request.Descriptor.DescriptorHash,
+            effectiveAction.TypeIdentity,
+            effectiveAction.SchemaVersion,
+            effectiveAction.ContentHash,
+            effectiveAction.ByteLength,
+            receipt.ReceiptId,
+            receipt.ActionKey,
+            receipt.ActionVersion,
+            receipt.CallId,
+            receipt.Attempt,
+            receipt.IdempotencyScope,
+            receipt.ContentHash,
+            request.Deadline,
+            fixture.Now.AddMinutes(-1),
+            request.Deadline,
+            "host-proof")
+        {
+            TerminalId = request.Terminal?.TerminalId ?? Guid.Empty,
+            SnapshotContentHash = SidecarCapabilityTransportCodec.ComputeSha256(
+                SidecarCapabilityTransportCodec.Serialize(snapshot)),
+            Caller = terminalContext.Caller,
+            Features = terminalContext.Features,
+            TraceId = terminalContext.TraceId,
+            IdempotencyKey = terminalContext.IdempotencyKey,
+            InvocationId = terminalContext.InvocationId,
+            ParentInvocationId = terminalContext.ParentInvocationId,
+            Depth = terminalContext.Depth,
+            Attempt = terminalContext.Attempt,
+        };
+        return new SidecarActionTerminalTransportRequest(
+            request.Call,
+            request.Invocation,
+            request.Descriptor,
+            effectiveAction,
+            authority,
+            receipt,
+            request.Cancellation,
+            request.Deadline)
+        {
+            Context = terminalContext,
+            TerminalId = request.Terminal?.TerminalId ?? Guid.Empty,
+        };
     }
 
     private static Fixture CreateFixture(
@@ -2415,6 +2858,7 @@ public sealed class SidecarCapabilityTransportTests
     {
         public async ValueTask<IActionOutcome<TResult>> InvokeAsync<TAction, TResult>(
             HostActionEntryRequest<TAction, TResult> request,
+            IHostActionEntryTerminal<TAction, TResult> terminal,
             CancellationToken cancellationToken = default)
         {
             var inputSchema = request.Descriptor.InputSchema ?? throw new InvalidOperationException();
@@ -2444,10 +2888,28 @@ public sealed class SidecarCapabilityTransportTests
                 action,
                 new SidecarCancellationIdentity(call.CancellationId, "proxy-cancel", call.Deadline),
                 request.Deadline,
-                request.Context);
+                request.Context,
+                new SidecarActionTerminalRegistration(
+                    terminal.TerminalId,
+                    descriptor.InputTypeIdentity,
+                    descriptor.InputSchemaVersion,
+                    descriptor.ResultTypeIdentity,
+                    descriptor.ResultSchemaVersion,
+                    descriptor.DescriptorHash));
             var response = await transport.InvokeActionAsync(sidecarRequest, cancellationToken);
             return new RecordedOutcome<TResult>(response.Outcome.Kind);
         }
+    }
+
+    private sealed class RecordingHostActionEntryTerminal<TAction, TResult>
+        : IHostActionEntryTerminal<TAction, TResult>
+    {
+        public Guid TerminalId { get; } = Guid.NewGuid();
+
+        public ValueTask<TResult> InvokeAsync(
+            ActionContext<TAction> context,
+            CancellationToken cancellationToken = default) =>
+            ValueTask.FromResult(default(TResult)!);
     }
 
     private sealed record RecordedOutcome<TResult>(ActionOutcomeKind Kind) : IActionOutcome<TResult>

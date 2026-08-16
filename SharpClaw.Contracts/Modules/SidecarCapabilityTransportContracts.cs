@@ -1324,6 +1324,23 @@ public sealed record SidecarTerminalReceipt(
     string IdempotencyScope,
     string ContentHash);
 
+public sealed record SidecarActionTerminalRegistration(
+    Guid TerminalId,
+    string ActionTypeIdentity,
+    int ActionSchemaVersion,
+    string ResultTypeIdentity,
+    int ResultSchemaVersion,
+    string DescriptorHash)
+{
+    public bool IsWellFormed =>
+        TerminalId != Guid.Empty &&
+        !string.IsNullOrWhiteSpace(ActionTypeIdentity) &&
+        ActionSchemaVersion >= 1 &&
+        !string.IsNullOrWhiteSpace(ResultTypeIdentity) &&
+        ResultSchemaVersion >= 1 &&
+        !string.IsNullOrWhiteSpace(DescriptorHash);
+}
+
 public sealed record SidecarTerminalContinuationRequest(
     Guid ContinuationRequestId,
     bool Proceed,
@@ -1358,6 +1375,7 @@ public sealed record SidecarActionCapabilityRequest(
     DateTimeOffset Deadline)
 {
     public HostActionEntryRequestContext? HostContext { get; init; }
+    public SidecarActionTerminalRegistration? Terminal { get; init; }
 
     public static SidecarActionCapabilityRequest HostEntry(
         SidecarCapabilityCallIdentity call,
@@ -1365,7 +1383,8 @@ public sealed record SidecarActionCapabilityRequest(
         SidecarSerializedPayload action,
         SidecarCancellationIdentity cancellation,
         DateTimeOffset deadline,
-        HostActionEntryRequestContext hostContext) =>
+        HostActionEntryRequestContext hostContext,
+        SidecarActionTerminalRegistration terminal) =>
         new(
             call,
             SidecarActionInvocationKind.HostEntry,
@@ -1377,6 +1396,7 @@ public sealed record SidecarActionCapabilityRequest(
             deadline)
         {
             HostContext = hostContext,
+            Terminal = terminal,
         };
 }
 
@@ -1421,7 +1441,59 @@ public sealed record SidecarHostTerminalAuthority(
     DateTimeOffset Deadline,
     DateTimeOffset IssuedAt,
     DateTimeOffset ExpiresAt,
-    string Proof);
+    string Proof)
+{
+    public Guid TerminalId { get; init; }
+    public string SnapshotContentHash { get; init; } = string.Empty;
+    public RequestPrincipal? Caller { get; init; }
+    public ExtensionFeatureSet? Features { get; init; }
+    public Guid TraceId { get; init; }
+    public Guid IdempotencyKey { get; init; }
+    public Guid InvocationId { get; init; }
+    public Guid? ParentInvocationId { get; init; }
+    public int Depth { get; init; }
+    public int Attempt { get; init; }
+}
+
+public sealed record SidecarActionTerminalExecutionContext(
+    SidecarCapabilityCallIdentity Call,
+    SidecarActionInvocationKind Invocation,
+    SidecarActionDescriptorIdentity Descriptor,
+    SidecarSerializedPayload EffectiveAction,
+    ActionPipelineSnapshot Snapshot,
+    Guid InvocationId,
+    Guid? ParentInvocationId,
+    int Depth,
+    int Attempt,
+    RequestPrincipal Caller,
+    ExtensionFeatureSet Features,
+    Guid TraceId,
+    Guid IdempotencyKey,
+    SidecarCancellationIdentity Cancellation,
+    SidecarTerminalReceipt Receipt,
+    DateTimeOffset Deadline)
+{
+    public bool IsWellFormed =>
+        Call is not null &&
+        Call.IsValid &&
+        Enum.IsDefined(Invocation) &&
+        Descriptor is not null &&
+        EffectiveAction is not null &&
+        Snapshot is not null &&
+        !string.IsNullOrWhiteSpace(Snapshot.ContractHash) &&
+        InvocationId != Guid.Empty &&
+        Depth >= 0 &&
+        Attempt >= 1 &&
+        Caller is not null &&
+        !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
+        Features is not null &&
+        Features.Items is not null &&
+        TraceId != Guid.Empty &&
+        IdempotencyKey != Guid.Empty &&
+        Cancellation is not null &&
+        Receipt is not null &&
+        Deadline > DateTimeOffset.MinValue;
+}
 
 public sealed record SidecarActionTerminalTransportRequest(
     SidecarCapabilityCallIdentity Call,
@@ -1431,7 +1503,11 @@ public sealed record SidecarActionTerminalTransportRequest(
     SidecarHostTerminalAuthority Authority,
     SidecarTerminalReceipt Receipt,
     SidecarCancellationIdentity Cancellation,
-    DateTimeOffset Deadline);
+    DateTimeOffset Deadline)
+{
+    public SidecarActionTerminalExecutionContext? Context { get; init; }
+    public Guid TerminalId { get; init; }
+}
 
 public sealed record SidecarTerminalExecutionResult(
     SidecarSerializedPayload? Result,
@@ -1442,7 +1518,10 @@ public sealed record SidecarActionTerminalTransportResponse(
     SidecarActionResultIdentity? ResultIdentity,
     SidecarTerminalExecutionResult Execution,
     SidecarTerminalReceipt Receipt,
-    SidecarSafeFailureIdentity SafeFailure);
+    SidecarSafeFailureIdentity SafeFailure)
+{
+    public Guid TerminalId { get; init; }
+}
 
 public static class SidecarCapabilityTransportValidation
 {
@@ -1654,8 +1733,10 @@ public static class SidecarCapabilityTransportValidation
             hostEntry &&
             (request.Snapshot is not null ||
              request.HostContext is null ||
-             !request.HostContext.IsWellFormed(now)) ||
-            !hostEntry && request.HostContext is not null)
+             !request.HostContext.IsWellFormed(now) ||
+             request.Terminal is null ||
+             !request.Terminal.IsWellFormed) ||
+            !hostEntry && (request.HostContext is not null || request.Terminal is not null))
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidPayload,
@@ -1687,6 +1768,21 @@ public static class SidecarCapabilityTransportValidation
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.SpoofedIdentity,
                 "The host action entry context does not bind to the descriptor and payload.");
+        }
+
+        if (hostEntry &&
+            (request.Terminal!.ActionTypeIdentity != request.Descriptor.InputTypeIdentity ||
+             request.Terminal.ActionSchemaVersion != request.Descriptor.InputSchemaVersion ||
+             request.Terminal.ResultTypeIdentity != request.Descriptor.ResultTypeIdentity ||
+             request.Terminal.ResultSchemaVersion != request.Descriptor.ResultSchemaVersion ||
+             !string.Equals(
+                 request.Terminal.DescriptorHash,
+                 request.Descriptor.DescriptorHash,
+                 StringComparison.Ordinal)))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The host action terminal does not bind to the descriptor.");
         }
 
         if (request.Continuation is not null &&
@@ -1830,6 +1926,17 @@ public static class SidecarCapabilityTransportValidation
             request.Descriptor != initiatingRequest.Descriptor ||
             request.Cancellation != initiatingRequest.Cancellation ||
             request.Deadline != initiatingRequest.Deadline ||
+            initiatingRequest.Invocation == SidecarActionInvocationKind.HostEntry &&
+            (initiatingRequest.Terminal is null ||
+             !initiatingRequest.Terminal.IsWellFormed ||
+             !string.Equals(initiatingRequest.Terminal.ActionTypeIdentity, initiatingRequest.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
+             initiatingRequest.Terminal.ActionSchemaVersion != initiatingRequest.Descriptor.InputSchemaVersion ||
+             !string.Equals(initiatingRequest.Terminal.ResultTypeIdentity, initiatingRequest.Descriptor.ResultTypeIdentity, StringComparison.Ordinal) ||
+             initiatingRequest.Terminal.ResultSchemaVersion != initiatingRequest.Descriptor.ResultSchemaVersion ||
+             !string.Equals(initiatingRequest.Terminal.DescriptorHash, initiatingRequest.Descriptor.DescriptorHash, StringComparison.Ordinal) ||
+             request.TerminalId != initiatingRequest.Terminal.TerminalId) ||
+            initiatingRequest.Invocation != SidecarActionInvocationKind.HostEntry &&
+            request.TerminalId != Guid.Empty ||
             !ValidateHostTerminalAuthority(
                 request,
                 binding,
@@ -1849,6 +1956,15 @@ public static class SidecarCapabilityTransportValidation
             !IsValidDescriptor(request.Descriptor) ||
             request.EffectiveAction is null ||
             request.Receipt is null ||
+            request.Context is null ||
+            !request.Context.IsWellFormed ||
+            request.Context.Call != request.Call ||
+            request.Context.Invocation != request.Invocation ||
+            request.Context.Descriptor != request.Descriptor ||
+            !SamePayload(request.Context.EffectiveAction, request.EffectiveAction) ||
+            request.Context.Cancellation != request.Cancellation ||
+            request.Context.Receipt != request.Receipt ||
+            request.Context.Deadline != request.Deadline ||
             !string.Equals(request.EffectiveAction.TypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
             request.EffectiveAction.SchemaVersion != request.Descriptor.InputSchemaVersion ||
             request.Receipt.CallId != request.Call.CallId ||
@@ -1879,7 +1995,8 @@ public static class SidecarCapabilityTransportValidation
         ArgumentNullException.ThrowIfNull(response);
         ArgumentNullException.ThrowIfNull(binding);
 
-        if (response.Execution is null ||
+        if (response.TerminalId != request.TerminalId ||
+            response.Execution is null ||
             !response.Execution.Completed ||
             response.Receipt != request.Receipt ||
             response.SafeFailure is null ||
@@ -2055,8 +2172,12 @@ public static class SidecarCapabilityTransportValidation
         Func<SidecarHostTerminalAuthority, bool> authenticate)
     {
         var authority = request.Authority;
+        var context = request.Context;
         return authority is not null &&
+            context is not null &&
+            context.IsWellFormed &&
             authority.AuthorityId != Guid.Empty &&
+            authority.TerminalId == request.TerminalId &&
             authority.SessionId == binding.SessionId &&
             authority.RequestId == binding.RequestId &&
             authority.CancellationId == binding.CancellationId &&
@@ -2067,7 +2188,20 @@ public static class SidecarCapabilityTransportValidation
             authority.ActionKey == request.Descriptor.Key &&
             authority.ActionVersion == request.Descriptor.Version &&
             string.Equals(authority.DescriptorHash, request.Descriptor.DescriptorHash, StringComparison.Ordinal) &&
+            string.Equals(
+                authority.SnapshotContentHash,
+                ComputeSnapshotHash(context.Snapshot),
+                StringComparison.OrdinalIgnoreCase) &&
+            SamePrincipal(authority.Caller, context.Caller) &&
+            SameFeatures(authority.Features, context.Features) &&
+            authority.TraceId == context.TraceId &&
+            authority.IdempotencyKey == context.IdempotencyKey &&
+            authority.InvocationId == context.InvocationId &&
+            authority.ParentInvocationId == context.ParentInvocationId &&
+            authority.Depth == context.Depth &&
+            authority.Attempt == context.Attempt &&
             request.EffectiveAction is not null &&
+            SamePayload(context.EffectiveAction, request.EffectiveAction) &&
             string.Equals(request.EffectiveAction.TypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) &&
             request.EffectiveAction.SchemaVersion == request.Descriptor.InputSchemaVersion &&
             string.Equals(authority.EffectiveActionTypeIdentity, request.EffectiveAction.TypeIdentity, StringComparison.Ordinal) &&
@@ -2110,6 +2244,44 @@ public static class SidecarCapabilityTransportValidation
         left.Attempt == right.Attempt &&
         string.Equals(left.IdempotencyScope, right.IdempotencyScope, StringComparison.Ordinal) &&
         string.Equals(left.ContentHash, right.ContentHash, StringComparison.OrdinalIgnoreCase);
+
+    private static bool SamePayload(
+        SidecarSerializedPayload left,
+        SidecarSerializedPayload right) =>
+        left is not null &&
+        right is not null &&
+        string.Equals(left.TypeIdentity, right.TypeIdentity, StringComparison.Ordinal) &&
+        left.SchemaVersion == right.SchemaVersion &&
+        string.Equals(left.ContentHash, right.ContentHash, StringComparison.OrdinalIgnoreCase) &&
+        left.ByteLength == right.ByteLength;
+
+    private static bool SamePrincipal(
+        RequestPrincipal? left,
+        RequestPrincipal right) =>
+        left is not null &&
+        right is not null &&
+        string.Equals(
+            SidecarCapabilityTransportCodec.ComputeSha256(
+                SidecarCapabilityTransportCodec.Serialize(left)),
+            SidecarCapabilityTransportCodec.ComputeSha256(
+                SidecarCapabilityTransportCodec.Serialize(right)),
+            StringComparison.OrdinalIgnoreCase);
+
+    private static bool SameFeatures(
+        ExtensionFeatureSet? left,
+        ExtensionFeatureSet right) =>
+        left is not null &&
+        right is not null &&
+        string.Equals(
+            SidecarCapabilityTransportCodec.ComputeSha256(
+                SidecarCapabilityTransportCodec.Serialize(left)),
+            SidecarCapabilityTransportCodec.ComputeSha256(
+                SidecarCapabilityTransportCodec.Serialize(right)),
+            StringComparison.OrdinalIgnoreCase);
+
+    private static string ComputeSnapshotHash(ActionPipelineSnapshot snapshot) =>
+        SidecarCapabilityTransportCodec.ComputeSha256(
+            SidecarCapabilityTransportCodec.Serialize(snapshot));
 
     private static bool SameSafeFailure(
         SidecarSafeFailureIdentity left,
