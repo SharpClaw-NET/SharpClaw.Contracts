@@ -193,7 +193,10 @@ public sealed record ActionContext<TAction>(
     RequestPrincipal Caller,
     TAction Action,
     ExtensionFeatureSet Features,
-    ActionPipelineSnapshot Snapshot);
+    ActionPipelineSnapshot Snapshot)
+{
+    public IHostActionEntry? HostActionEntry { get; init; }
+}
 
 public sealed record HostActionEntryValidationResult(
     bool Accepted,
@@ -283,6 +286,9 @@ public sealed record HostActionEntryContextRequest(
     DateTimeOffset ExpiresAt)
 {
     public HostActionEntryContribution? Contribution { get; init; }
+    public Guid? ParentInvocationId { get; init; }
+    public int Depth { get; init; }
+    public int Attempt { get; init; } = 1;
 
     public bool IsWellFormed(DateTimeOffset now) =>
         Enum.IsDefined(Ingress) &&
@@ -295,6 +301,8 @@ public sealed record HostActionEntryContextRequest(
         Features.Items is not null &&
         TraceId != Guid.Empty &&
         IdempotencyKey != Guid.Empty &&
+        Depth >= 0 &&
+        Attempt >= 1 &&
         Deadline > now &&
         ExpiresAt >= Deadline &&
         Contribution is not null &&
@@ -425,6 +433,9 @@ public sealed record HostActionEntryRequestContext(
     DateTimeOffset ExpiresAt)
 {
     public HostActionEntryContribution? Contribution { get; init; }
+    public Guid? ParentInvocationId { get; init; }
+    public int Depth { get; init; }
+    public int Attempt { get; init; } = 1;
 
     public bool IsWellFormed(DateTimeOffset now) =>
         CapabilityId != Guid.Empty &&
@@ -439,6 +450,8 @@ public sealed record HostActionEntryRequestContext(
         Features.Items is not null &&
         TraceId != Guid.Empty &&
         IdempotencyKey != Guid.Empty &&
+        Depth >= 0 &&
+        Attempt >= 1 &&
         Deadline > now &&
         ExpiresAt >= Deadline &&
         Contribution is not null &&
@@ -509,6 +522,25 @@ public sealed record HostActionEntryRequest<TAction, TResult>(
         !string.IsNullOrWhiteSpace(Descriptor.Key.Value) &&
         Context is not null &&
         Context.IsWellFormed(now);
+}
+
+public sealed record HostActionEntryNestedRequest<TParentAction, TAction, TResult>(
+    SharpClawActionKey ActionKey,
+    int ActionVersion,
+    TAction Action,
+    ActionContext<TParentAction> ParentContext)
+{
+    public bool IsWellFormed(DateTimeOffset now) =>
+        !string.IsNullOrWhiteSpace(ActionKey.Value) &&
+        ActionVersion >= 1 &&
+        ParentContext is not null &&
+        ParentContext.HostActionEntry is not null &&
+        ParentContext.InvocationId != Guid.Empty &&
+        ParentContext.TraceId != Guid.Empty &&
+        ParentContext.IdempotencyKey != Guid.Empty &&
+        ParentContext.Depth >= 0 &&
+        ParentContext.Attempt >= 1 &&
+        ParentContext.Deadline > now;
 }
 
 /// <summary>Host-only transport envelope after authority issuance.</summary>
@@ -664,6 +696,9 @@ public static class HostActionEntryAuthorityValidator
         SameFeatures(left.Features, right.Features) &&
         left.TraceId == right.TraceId &&
         left.IdempotencyKey == right.IdempotencyKey &&
+        left.ParentInvocationId == right.ParentInvocationId &&
+        left.Depth == right.Depth &&
+        left.Attempt == right.Attempt &&
         left.Deadline == right.Deadline &&
         left.ExpiresAt == right.ExpiresAt &&
         SameContribution(left.Contribution, right.Contribution, includePayload: true);
@@ -681,6 +716,9 @@ public static class HostActionEntryAuthorityValidator
         SameFeatures(left.Features, right.Features) &&
         left.TraceId == right.TraceId &&
         left.IdempotencyKey == right.IdempotencyKey &&
+        left.ParentInvocationId == right.ParentInvocationId &&
+        left.Depth == right.Depth &&
+        left.Attempt == right.Attempt &&
         left.Deadline == right.Deadline &&
         left.ExpiresAt == right.ExpiresAt &&
         SameContribution(left.Contribution, right.Contribution, includePayload: false);
@@ -902,6 +940,11 @@ public interface IHostActionEntry
         HostActionEntryRequest<TAction, TResult> request,
         IHostActionEntryTerminal<TAction, TResult> terminal,
         CancellationToken cancellationToken = default);
+
+    ValueTask<IActionOutcome<TResult>> InvokeNestedAsync<TParentAction, TAction, TResult>(
+        HostActionEntryNestedRequest<TParentAction, TAction, TResult> request,
+        IHostActionEntryTerminal<TAction, TResult> terminal,
+        CancellationToken cancellationToken = default);
 }
 
 public interface IActionDispatcher
@@ -909,14 +952,14 @@ public interface IActionDispatcher
     ValueTask<IActionOutcome<TResult>> RunAsync<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
-        Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         CancellationToken ct);
 
     ValueTask<TResult> RunRequiredAsync<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
-        Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         CancellationToken ct);
 }

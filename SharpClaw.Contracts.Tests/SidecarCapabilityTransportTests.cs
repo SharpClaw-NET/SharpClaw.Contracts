@@ -1613,50 +1613,55 @@ public sealed class SidecarCapabilityTransportTests
             request.Cancellation,
             receipt,
             request.Deadline);
+        var terminalAuthority = new SidecarHostTerminalAuthority(
+            Guid.NewGuid(),
+            fixture.Binding.SessionId,
+            fixture.Binding.RequestId,
+            fixture.Binding.CancellationId,
+            request.Call.CallId,
+            fixture.Binding.ModuleId,
+            fixture.Binding.GraphId,
+            request.Invocation,
+            descriptor.Key,
+            descriptor.Version,
+            descriptor.DescriptorHash,
+            replacement.TypeIdentity,
+            replacement.SchemaVersion,
+            replacement.ContentHash,
+            replacement.ByteLength,
+            receipt.ReceiptId,
+            receipt.ActionKey,
+            receipt.ActionVersion,
+            receipt.CallId,
+            receipt.Attempt,
+            receipt.IdempotencyScope,
+            receipt.ContentHash,
+            request.Deadline,
+            fixture.Now.AddMinutes(-1),
+            request.Deadline,
+            "host-proof")
+        {
+            SnapshotContentHash = SidecarCapabilityTransportCodec.ComputeSha256(
+                SidecarCapabilityTransportCodec.Serialize(snapshot)),
+            Caller = terminalCaller,
+            Features = terminalFeatures,
+            TraceId = terminalContext.TraceId,
+            IdempotencyKey = terminalContext.IdempotencyKey,
+            InvocationId = terminalContext.InvocationId,
+            ParentInvocationId = terminalContext.ParentInvocationId,
+            Depth = terminalContext.Depth,
+            Attempt = terminalContext.Attempt,
+        };
+        terminalAuthority = terminalAuthority with
+        {
+            CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(terminalAuthority),
+        };
         var terminalRequest = new SidecarActionTerminalTransportRequest(
             request.Call,
             request.Invocation,
             descriptor,
             replacement,
-            new SidecarHostTerminalAuthority(
-                Guid.NewGuid(),
-                fixture.Binding.SessionId,
-                fixture.Binding.RequestId,
-                fixture.Binding.CancellationId,
-                request.Call.CallId,
-                fixture.Binding.ModuleId,
-                fixture.Binding.GraphId,
-                request.Invocation,
-                descriptor.Key,
-                descriptor.Version,
-                descriptor.DescriptorHash,
-                replacement.TypeIdentity,
-                replacement.SchemaVersion,
-                replacement.ContentHash,
-                replacement.ByteLength,
-                receipt.ReceiptId,
-                receipt.ActionKey,
-                receipt.ActionVersion,
-                receipt.CallId,
-                receipt.Attempt,
-                receipt.IdempotencyScope,
-                receipt.ContentHash,
-                request.Deadline,
-                fixture.Now.AddMinutes(-1),
-                request.Deadline,
-                "host-proof")
-            {
-                SnapshotContentHash = SidecarCapabilityTransportCodec.ComputeSha256(
-                    SidecarCapabilityTransportCodec.Serialize(snapshot)),
-                Caller = terminalCaller,
-                Features = terminalFeatures,
-                TraceId = terminalContext.TraceId,
-                IdempotencyKey = terminalContext.IdempotencyKey,
-                InvocationId = terminalContext.InvocationId,
-                ParentInvocationId = terminalContext.ParentInvocationId,
-                Depth = terminalContext.Depth,
-                Attempt = terminalContext.Attempt,
-            },
+            terminalAuthority,
             receipt,
             request.Cancellation,
             request.Deadline)
@@ -1676,7 +1681,8 @@ public sealed class SidecarCapabilityTransportTests
             terminalRequest,
             fixture.Binding,
             fixture.Now,
-            authority => authority.Proof == "host-proof").Accepted);
+            (authority, bindingHash) => authority.Proof == "host-proof" &&
+                bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Accepted);
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(terminalRequest, terminalResponse, fixture.Binding).Accepted);
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
             terminalRequest,
@@ -1697,7 +1703,7 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 fixture.Binding,
                 fixture.Now,
-                _ => true).Code);
+                (_, _) => true).Code);
 
         Assert.Equal(
             SidecarCapabilityErrors.InvalidPayload,
@@ -1726,7 +1732,7 @@ public sealed class SidecarCapabilityTransportTests
                 terminalRequest with { Receipt = receipt with { ReceiptId = "forged-receipt" } },
                 fixture.Binding,
                 fixture.Now,
-                _ => true).Code);
+                (_, _) => true).Code);
 
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
@@ -1735,7 +1741,7 @@ public sealed class SidecarCapabilityTransportTests
                 terminalRequest with { EffectiveAction = replacement with { TypeIdentity = "other.input" } },
                 fixture.Binding,
                 fixture.Now,
-                _ => true).Code);
+                (_, _) => true).Code);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
@@ -1743,7 +1749,7 @@ public sealed class SidecarCapabilityTransportTests
                 terminalRequest with { EffectiveAction = replacement with { SchemaVersion = 2 } },
                 fixture.Binding,
                 fixture.Now,
-                _ => true).Code);
+                (_, _) => true).Code);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
@@ -1751,7 +1757,7 @@ public sealed class SidecarCapabilityTransportTests
                 terminalRequest with { Receipt = receipt with { Attempt = 2 } },
                 fixture.Binding,
                 fixture.Now,
-                _ => true).Code);
+                (_, _) => true).Code);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
@@ -1759,7 +1765,7 @@ public sealed class SidecarCapabilityTransportTests
                 terminalRequest with { Receipt = receipt with { IdempotencyScope = "other.scope" } },
                 fixture.Binding,
                 fixture.Now,
-                _ => true).Code);
+                (_, _) => true).Code);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
@@ -1767,7 +1773,7 @@ public sealed class SidecarCapabilityTransportTests
                 terminalRequest with { Receipt = receipt with { ContentHash = "other-receipt-hash" } },
                 fixture.Binding,
                 fixture.Now,
-                _ => true).Code);
+                (_, _) => true).Code);
 
         Assert.Equal(
             SidecarCapabilityErrors.InvalidPayload,
@@ -2310,7 +2316,8 @@ public sealed class SidecarCapabilityTransportTests
             terminalRequest,
             fixture.Binding,
             fixture.Now,
-            authority => authority.Proof == "host-proof").Accepted);
+            (authority, bindingHash) => authority.Proof == "host-proof" &&
+                bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Accepted);
         var carrierAuthority = ActivateContext(fixture, context);
         Assert.True(fixture.Session.BeginCall(
             request.Call,
@@ -2347,7 +2354,8 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 fixture.Binding,
                 fixture.Now,
-                authority => authority.Proof == "host-proof").Code);
+                (authority, bindingHash) => authority.Proof == "host-proof" &&
+                    bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Code);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
@@ -2361,7 +2369,8 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 fixture.Binding,
                 fixture.Now,
-                authority => authority.Proof == "host-proof").Code);
+                (authority, bindingHash) => authority.Proof == "host-proof" &&
+                    bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Code);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
@@ -2372,7 +2381,8 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 fixture.Binding,
                 fixture.Now,
-                authority => authority.Proof == "host-proof").Code);
+                (authority, bindingHash) => authority.Proof == "host-proof" &&
+                    bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Code);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
@@ -2383,7 +2393,8 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 fixture.Binding,
                 fixture.Now,
-                authority => authority.Proof == "host-proof").Code);
+                (authority, bindingHash) => authority.Proof == "host-proof" &&
+                    bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Code);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
@@ -2397,7 +2408,23 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 fixture.Binding,
                 fixture.Now,
-                authority => authority.Proof == "host-proof").Code);
+                (authority, bindingHash) => authority.Proof == "host-proof" &&
+                    bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Code);
+        var coherentCaller = new RequestPrincipal(
+            "coherent-forgery",
+            Roles: new HashSet<string>(["reader"]));
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                request,
+                terminalRequest with
+                {
+                    Context = terminalRequest.Context! with { Caller = coherentCaller },
+                    Authority = terminalRequest.Authority with { Caller = coherentCaller },
+                },
+                fixture.Binding,
+                fixture.Now,
+                (_, _) => true).Code);
     }
 
     [Fact]
@@ -2506,9 +2533,9 @@ public sealed class SidecarCapabilityTransportTests
             effectiveAction,
             snapshot,
             hostContext.InvocationId,
-            null,
-            0,
-            1,
+            hostContext.ParentInvocationId,
+            hostContext.Depth,
+            hostContext.Attempt,
             hostContext.Caller,
             hostContext.Features,
             hostContext.TraceId,
@@ -2555,6 +2582,10 @@ public sealed class SidecarCapabilityTransportTests
             ParentInvocationId = terminalContext.ParentInvocationId,
             Depth = terminalContext.Depth,
             Attempt = terminalContext.Attempt,
+        };
+        authority = authority with
+        {
+            CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority),
         };
         return new SidecarActionTerminalTransportRequest(
             request.Call,
@@ -2899,6 +2930,13 @@ public sealed class SidecarCapabilityTransportTests
             var response = await transport.InvokeActionAsync(sidecarRequest, cancellationToken);
             return new RecordedOutcome<TResult>(response.Outcome.Kind);
         }
+
+        public ValueTask<IActionOutcome<TResult>> InvokeNestedAsync<TParentAction, TAction, TResult>(
+            HostActionEntryNestedRequest<TParentAction, TAction, TResult> request,
+            IHostActionEntryTerminal<TAction, TResult> terminal,
+            CancellationToken cancellationToken = default) =>
+            ValueTask.FromException<IActionOutcome<TResult>>(
+                new NotSupportedException("The transport proxy test does not dispatch nested entries."));
     }
 
     private sealed class RecordingHostActionEntryTerminal<TAction, TResult>

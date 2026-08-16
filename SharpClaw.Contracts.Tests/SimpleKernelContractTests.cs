@@ -159,6 +159,50 @@ public sealed class SimpleKernelContractTests
     }
 
     [Fact]
+    public async Task NestedHostActionEntryUsesFreshChildAuthorityAndParentLineage()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var entry = new RecordingHostActionEntry();
+        var parent = new ActionContext<string>(
+            Guid.NewGuid(),
+            null,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            2,
+            3,
+            now.AddMinutes(1),
+            new SharpClawActionKey("demo.parent"),
+            "demo",
+            new RequestPrincipal("caller"),
+            "parent",
+            ExtensionFeatureSet.Empty,
+            new ActionPipelineSnapshot("host-graph", []))
+        {
+            HostActionEntry = entry,
+        };
+        var nested = new HostActionEntryNestedRequest<string, int, string>(
+            new SharpClawActionKey("demo.child"),
+            1,
+            42,
+            parent);
+        var terminal = new RecordingHostActionEntryTerminal<int, string>();
+
+        Assert.True(nested.IsWellFormed(now));
+        var outcome = await entry.InvokeNestedAsync(nested, terminal);
+
+        Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
+        Assert.NotNull(terminal.Context);
+        Assert.Equal(parent.InvocationId, terminal.Context!.ParentInvocationId);
+        Assert.Equal(parent.Depth + 1, terminal.Context.Depth);
+        Assert.Equal(parent.Attempt, terminal.Context.Attempt);
+        Assert.Equal(parent.TraceId, terminal.Context.TraceId);
+        Assert.Equal(parent.IdempotencyKey, terminal.Context.IdempotencyKey);
+        Assert.Equal(nested.ActionKey, terminal.Context.ActionKey);
+        Assert.NotSame(entry, terminal.Context.HostActionEntry);
+        Assert.Same(entry.NestedEntry, terminal.Context.HostActionEntry);
+    }
+
+    [Fact]
     public void HostActionEntryRejectsForgedCallerFeaturesRequestAndPayloadAuthority()
     {
         var now = DateTimeOffset.UtcNow;
@@ -405,6 +449,7 @@ public sealed class SimpleKernelContractTests
     {
         public object? Request { get; private set; }
         public CancellationToken CancellationToken { get; private set; }
+        public IHostActionEntry? NestedEntry { get; private set; }
 
         public ValueTask<IActionOutcome<TResult>> InvokeAsync<TAction, TResult>(
             HostActionEntryRequest<TAction, TResult> request,
@@ -416,18 +461,53 @@ public sealed class SimpleKernelContractTests
             terminal.InvokeAsync(
                 new ActionContext<TAction>(
                     request.Context.InvocationId,
-                    null,
+                    request.Context.ParentInvocationId,
                     request.Context.TraceId,
                     request.Context.IdempotencyKey,
-                    0,
-                    1,
+                    request.Context.Depth,
+                    request.Context.Attempt,
                     request.Context.Deadline,
                     request.Descriptor.Key,
                     "demo",
                     request.Context.Caller,
                     request.Action,
                     request.Context.Features,
-                    new ActionPipelineSnapshot("host-graph", [])))
+                    new ActionPipelineSnapshot("host-graph", []))
+                {
+                    HostActionEntry = this,
+                })
+                .GetAwaiter()
+                .GetResult();
+            return ValueTask.FromResult<IActionOutcome<TResult>>(
+                new RecordedOutcome<TResult>(ActionOutcomeKind.Completed));
+        }
+
+        public ValueTask<IActionOutcome<TResult>> InvokeNestedAsync<TParentAction, TAction, TResult>(
+            HostActionEntryNestedRequest<TParentAction, TAction, TResult> request,
+            IHostActionEntryTerminal<TAction, TResult> terminal,
+            CancellationToken cancellationToken = default)
+        {
+            Request = request;
+            CancellationToken = cancellationToken;
+            NestedEntry = new RecordingHostActionEntry();
+            terminal.InvokeAsync(
+                new ActionContext<TAction>(
+                    Guid.NewGuid(),
+                    request.ParentContext.InvocationId,
+                    request.ParentContext.TraceId,
+                    request.ParentContext.IdempotencyKey,
+                    request.ParentContext.Depth + 1,
+                    request.ParentContext.Attempt,
+                    request.ParentContext.Deadline,
+                    request.ActionKey,
+                    "nested",
+                    request.ParentContext.Caller,
+                    request.Action,
+                    request.ParentContext.Features,
+                    request.ParentContext.Snapshot)
+                {
+                    HostActionEntry = NestedEntry,
+                })
                 .GetAwaiter()
                 .GetResult();
             return ValueTask.FromResult<IActionOutcome<TResult>>(
