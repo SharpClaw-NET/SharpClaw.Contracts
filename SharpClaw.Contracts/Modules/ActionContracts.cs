@@ -380,6 +380,9 @@ public sealed record HostActionEntryAuthority(
 {
     public HostActionEntryIngress Ingress { get; init; }
     public Guid InvocationId { get; init; }
+    public Guid? ParentInvocationId { get; init; }
+    public int Depth { get; init; }
+    public int Attempt { get; init; } = 1;
     public Guid CapabilityId { get; init; }
     public string CapabilityHandleHash { get; init; } = string.Empty;
 
@@ -412,6 +415,8 @@ public sealed record HostActionEntryAuthority(
         ActionByteLength > 0 &&
         Enum.IsDefined(Ingress) &&
         InvocationId != Guid.Empty &&
+        Depth >= 0 &&
+        Attempt >= 1 &&
         CapabilityId != Guid.Empty &&
         !string.IsNullOrWhiteSpace(CapabilityHandleHash) &&
         !string.IsNullOrWhiteSpace(Proof);
@@ -762,6 +767,9 @@ public static class HostActionEntryAuthorityValidator
         HostActionEntryRequestContext context) =>
         authority.Ingress == context.Ingress &&
         authority.InvocationId == context.InvocationId &&
+        authority.ParentInvocationId == context.ParentInvocationId &&
+        authority.Depth == context.Depth &&
+        authority.Attempt == context.Attempt &&
         authority.RequestId == context.RequestId &&
         authority.CancellationId == context.CancellationId &&
         SamePrincipal(authority.Caller, context.Caller) &&
@@ -871,6 +879,9 @@ public static class HostActionEntryAuthorityValidator
             authority.ExpiresAt,
             authority.Ingress,
             authority.InvocationId,
+            authority.ParentInvocationId,
+            authority.Depth,
+            authority.Attempt,
             authority.CapabilityId,
             authority.CapabilityHandleHash,
         };

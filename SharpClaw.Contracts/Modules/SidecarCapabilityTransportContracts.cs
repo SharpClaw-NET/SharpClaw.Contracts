@@ -719,6 +719,9 @@ public sealed class SidecarCapabilitySession
             {
                 Ingress = request.Context.Ingress,
                 InvocationId = request.Context.InvocationId,
+                ParentInvocationId = request.Context.ParentInvocationId,
+                Depth = request.Context.Depth,
+                Attempt = request.Context.Attempt,
                 CapabilityId = request.Context.CapabilityId,
                 CapabilityHandleHash = HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(
                     request.Context.CapabilityHandle),

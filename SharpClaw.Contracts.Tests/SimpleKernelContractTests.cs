@@ -273,6 +273,18 @@ public sealed class SimpleKernelContractTests
         }).Validate(now, HostProof).Accepted);
         Assert.False((transport with
         {
+            Authority = authority with { ParentInvocationId = Guid.NewGuid() },
+        }).Validate(now, HostProof).Accepted);
+        Assert.False((transport with
+        {
+            Authority = authority with { Depth = 98 },
+        }).Validate(now, HostProof).Accepted);
+        Assert.False((transport with
+        {
+            Authority = authority with { Attempt = 77 },
+        }).Validate(now, HostProof).Accepted);
+        Assert.False((transport with
+        {
             Authority = authority with { Proof = "forged-proof" },
         }).Validate(now, HostProof).Accepted);
         var changedSchemaAuthority = authority with
