@@ -2492,6 +2492,70 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void Run_and_run_required_reject_nested_carriers()
+    {
+        var fixture = CreateFixture();
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "non-host-nested",
+        };
+        var descriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("module.run"),
+            1,
+            "module",
+            typeof(string).AssemblyQualifiedName!,
+            "run-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "run-result",
+            1,
+            "run-descriptor");
+        var action = Payload(descriptor.InputTypeIdentity, "run");
+        var carrier = new SidecarNestedHostActionEntryCarrier(
+            Guid.NewGuid(),
+            "nested-carrier",
+            Guid.NewGuid(),
+            call.CallId,
+            Guid.NewGuid(),
+            descriptor.Key,
+            descriptor.Version,
+            descriptor.DescriptorHash,
+            action.ContentHash,
+            action.ByteLength,
+            1,
+            fixture.Now.AddMinutes(1));
+
+        foreach (var invocation in new[]
+        {
+            SidecarActionInvocationKind.Run,
+            SidecarActionInvocationKind.RunRequired,
+        })
+        {
+            var request = new SidecarActionCapabilityRequest(
+                call,
+                invocation,
+                descriptor,
+                action,
+                new ActionPipelineSnapshot("host-graph", []),
+                new SidecarCancellationIdentity(call.CancellationId, "cancel", call.Deadline),
+                null,
+                call.Deadline)
+            {
+                NestedCarrier = carrier,
+            };
+
+            Assert.Equal(
+                SidecarCapabilityErrors.InvalidPayload,
+                SidecarCapabilityTransportValidation.ValidateActionRequest(
+                    request,
+                    fixture.Binding,
+                    fixture.Now).Code);
+        }
+    }
+
+    [Fact]
     public void Session_issues_and_consumes_one_nested_carrier_through_action_call()
     {
         var fixture = CreateFixture(maxInFlight: 3, maxCalls: 4);
@@ -2746,7 +2810,7 @@ public sealed class SidecarCapabilityTransportTests
                 "parent-input",
                 null,
                 null));
-        ActivateContext(fixture, rootContext);
+        var rootAuthority = ActivateContext(fixture, rootContext);
         var parentCall = fixture.Call with
         {
             Capability = SidecarCapabilityKind.Action,
@@ -2800,6 +2864,25 @@ public sealed class SidecarCapabilityTransportTests
             contribution,
             fixture.Now,
             out var carrier).Accepted);
+        var request = SidecarActionCapabilityRequest.HostEntryNested(
+            childCall,
+            descriptor,
+            action,
+            new SidecarCancellationIdentity(childCall.CancellationId, "child-expiry-cancel", childCall.Deadline),
+            childCall.Deadline,
+            carrier!,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.ResultTypeIdentity,
+                descriptor.ResultSchemaVersion,
+                descriptor.DescriptorHash));
+        Assert.True(fixture.Session.BeginActionCall(
+            request,
+            action.ByteLength,
+            fixture.Now,
+            out _).Accepted);
         var rotated = CreateRotatedBinding(fixture, "nested-rotation");
         fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
         Assert.Equal(
@@ -2809,6 +2892,15 @@ public sealed class SidecarCapabilityTransportTests
             1,
             fixture.Session.SweepExpiredHostActionEntryCarriers(fixture.Now.AddSeconds(2)));
         Assert.Equal(1, fixture.Session.ActiveHostActionEntryCarrierCount);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.CompleteCall(parentCall.CallId, 0).Code);
+        Assert.True(fixture.Session.CompleteCall(childCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            rootAuthority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now.AddSeconds(2)).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.Replay,
             fixture.Session.BeginNestedHostActionEntryCall(

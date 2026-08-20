@@ -1271,6 +1271,7 @@ public sealed class SidecarCapabilitySession
                 RevokeNestedCarriersForParent(callId, DateTimeOffset.UtcNow);
                 if (_nestedCarrierIds.Remove(completedContext.CapabilityId))
                     RemoveEntryCarrier(completedContext.CapabilityId, DateTimeOffset.UtcNow);
+                _nestedCarrierParents.Remove(completedContext.CapabilityId);
             }
 
             _calls.Remove(callId);
@@ -1349,7 +1350,8 @@ public sealed class SidecarCapabilitySession
         }
 
         _consumedEntryCarriers.Remove(capabilityId);
-        _nestedCarrierParents.Remove(capabilityId);
+        if (!_callEntryContexts.Values.Any(context => context.CapabilityId == capabilityId))
+            _nestedCarrierParents.Remove(capabilityId);
     }
 
     private void RecordCarrierTombstone(
@@ -2137,7 +2139,10 @@ public static class SidecarCapabilityTransportValidation
              request.NestedCarrier is not null && !request.NestedCarrier.IsWellFormed ||
              request.Terminal is null ||
              !request.Terminal.IsWellFormed) ||
-            !hostEntry && (request.HostContext is not null || request.Terminal is not null))
+             !hostEntry &&
+             (request.HostContext is not null ||
+              request.Terminal is not null ||
+              request.NestedCarrier is not null))
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidPayload,
