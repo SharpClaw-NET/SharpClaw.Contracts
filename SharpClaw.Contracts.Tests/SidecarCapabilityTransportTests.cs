@@ -2912,6 +2912,295 @@ public sealed class SidecarCapabilityTransportTests
                 out _).Code);
     }
 
+    [Fact]
+    public void Host_terminal_relay_issues_one_fresh_child_carrier_and_blocks_parent_completion()
+    {
+        var fixture = CreateFixture(maxInFlight: 3, maxCalls: 4);
+        var rootDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("parent.relay"),
+            1,
+            "parent",
+            typeof(string).AssemblyQualifiedName!,
+            "parent-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "parent-result",
+            1,
+            "parent-relay-descriptor");
+        var childDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("child.relay"),
+            1,
+            "child",
+            typeof(string).AssemblyQualifiedName!,
+            "child-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "child-result",
+            1,
+            "child-relay-descriptor");
+        var rootAction = Payload(rootDescriptor.InputTypeIdentity, "parent");
+        var childAction = Payload(childDescriptor.InputTypeIdentity, "child");
+        var rootContext = IssueContext(
+            fixture,
+            new RequestPrincipal("relay-caller", Roles: new HashSet<string>(["operator"])),
+            HostActionEntryIngress.Cli,
+            lineage: new HostActionEntryLineage(
+                rootDescriptor.Key,
+                rootDescriptor.Version,
+                rootDescriptor.DescriptorHash,
+                rootDescriptor.InputTypeIdentity,
+                rootDescriptor.InputSchemaVersion,
+                rootDescriptor.InputSchemaHash,
+                null,
+                null));
+        var rootAuthority = ActivateContext(fixture, rootContext);
+        var parentCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "relay-parent",
+            Sequence = 1,
+        };
+        var contribution = new HostActionEntryContribution(
+            new HostActionEntryIngressBinding(
+                HostActionEntryIngress.CrossModule,
+                "module-a",
+                "module-b"),
+            new HostActionEntryLineage(
+                childDescriptor.Key,
+                childDescriptor.Version,
+                childDescriptor.DescriptorHash,
+                childDescriptor.InputTypeIdentity,
+                childDescriptor.InputSchemaVersion,
+                childDescriptor.InputSchemaHash,
+                null,
+                null));
+        var nestedRequest = new SidecarNestedHostActionEntryRequest(
+            childDescriptor,
+            childAction,
+            contribution,
+            fixture.Now.AddSeconds(20),
+            fixture.Now.AddSeconds(20));
+        var rootRequest = SidecarActionCapabilityRequest.HostEntry(
+            parentCall,
+            rootDescriptor,
+            rootAction,
+            new SidecarCancellationIdentity(parentCall.CancellationId, "relay-cancel", parentCall.Deadline),
+            parentCall.Deadline,
+            rootContext,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                rootDescriptor.InputTypeIdentity,
+                rootDescriptor.InputSchemaVersion,
+                rootDescriptor.ResultTypeIdentity,
+                rootDescriptor.ResultSchemaVersion,
+                rootDescriptor.DescriptorHash)) with
+        {
+            NestedCarrierRequest = nestedRequest,
+        };
+
+        Assert.True(fixture.Session.BeginActionCall(
+            rootRequest,
+            rootAction.ByteLength,
+            fixture.Now,
+            out _).Accepted);
+
+        var receipt = new SidecarTerminalReceipt(
+            "relay-receipt",
+            rootDescriptor.Key,
+            rootDescriptor.Version,
+            parentCall.CallId,
+            1,
+            "relay-scope",
+            rootAction.ContentHash);
+        Assert.True(fixture.Session.RecordTerminal(parentCall.CallId, Guid.NewGuid(), receipt).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.CompleteCall(parentCall.CallId, 1).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.IssueNestedHostActionEntryRelay(
+                parentCall with { CallId = Guid.NewGuid(), ReplayNonce = "wrong-parent" },
+                nestedRequest,
+                fixture.Now,
+                out _).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.IssueNestedHostActionEntryRelay(
+                parentCall,
+                nestedRequest with { Action = Payload(childDescriptor.InputTypeIdentity, "changed") },
+                fixture.Now,
+                out _).Code);
+
+        Assert.True(fixture.Session.IssueNestedHostActionEntryRelay(
+            parentCall,
+            nestedRequest,
+            fixture.Now,
+            out var relay).Accepted);
+        Assert.NotNull(relay);
+        Assert.True(relay!.IsWellFormed);
+        Assert.Equal(parentCall.CallId, relay.Carrier.ParentCallId);
+        Assert.Equal(relay.Call.CallId, relay.Carrier.CallId);
+
+        var terminalRequest = CreateTerminalRequest(
+            fixture,
+            rootRequest,
+            new ActionPipelineSnapshot("relay-graph", [])) with
+        {
+            NestedCarrierRelay = relay,
+        };
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+            rootRequest,
+            terminalRequest,
+            fixture.Binding,
+            fixture.Now,
+            (authority, bindingHash) => authority.Proof == "host-proof" &&
+                bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                rootRequest,
+                terminalRequest with
+                {
+                    NestedCarrierRelay = relay! with
+                    {
+                        Carrier = relay!.Carrier with { ActionContentHash = "changed" },
+                    },
+                },
+                fixture.Binding,
+                fixture.Now,
+                (_, _) => true).Code);
+
+        var childRequest = SidecarActionCapabilityRequest.HostEntryNested(
+            relay.Call,
+            childDescriptor,
+            childAction,
+            new SidecarCancellationIdentity(
+                relay.Call.CancellationId,
+                "relay-child-cancel",
+                relay.Call.Deadline),
+            relay.Call.Deadline,
+            relay.Carrier,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                childDescriptor.InputTypeIdentity,
+                childDescriptor.InputSchemaVersion,
+                childDescriptor.ResultTypeIdentity,
+                childDescriptor.ResultSchemaVersion,
+                childDescriptor.DescriptorHash));
+        Assert.True(fixture.Session.BeginActionCall(
+            childRequest,
+            childAction.ByteLength,
+            fixture.Now,
+            out var childContext).Accepted);
+        Assert.Equal(rootContext.InvocationId, childContext!.ParentInvocationId);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.CompleteCall(parentCall.CallId, 1).Code);
+        Assert.True(fixture.Session.CompleteCall(relay.Call.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 1).Accepted);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            rootAuthority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.IssueNestedHostActionEntryRelay(
+                parentCall,
+                nestedRequest,
+                fixture.Now,
+                out _).Code);
+    }
+
+    [Fact]
+    public void Host_terminal_relay_requires_terminal_authority_and_revokes_pending_request()
+    {
+        var fixture = CreateFixture();
+        var descriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("parent.revoke"),
+            1,
+            "parent",
+            typeof(string).AssemblyQualifiedName!,
+            "parent-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "parent-result",
+            1,
+            "parent-revoke-descriptor");
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("revoke-caller"),
+            HostActionEntryIngress.Endpoint,
+            lineage: new HostActionEntryLineage(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                null,
+                null));
+        ActivateContext(fixture, context);
+        var parentCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "relay-revoke-parent",
+            Sequence = 1,
+        };
+        var action = Payload(descriptor.InputTypeIdentity, "parent");
+        var child = new SidecarNestedHostActionEntryRequest(
+            descriptor,
+            action,
+            new HostActionEntryContribution(
+                new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "module-a", "module-b"),
+                new HostActionEntryLineage(
+                    descriptor.Key,
+                    descriptor.Version,
+                    descriptor.DescriptorHash,
+                    descriptor.InputTypeIdentity,
+                    descriptor.InputSchemaVersion,
+                    descriptor.InputSchemaHash,
+                    null,
+                    null)),
+            fixture.Now.AddSeconds(20),
+            fixture.Now.AddSeconds(20));
+        var request = SidecarActionCapabilityRequest.HostEntry(
+            parentCall,
+            descriptor,
+            action,
+            new SidecarCancellationIdentity(parentCall.CancellationId, "revoke-cancel", parentCall.Deadline),
+            parentCall.Deadline,
+            context,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.ResultTypeIdentity,
+                descriptor.ResultSchemaVersion,
+                descriptor.DescriptorHash)) with
+        {
+            NestedCarrierRequest = child,
+        };
+        Assert.True(fixture.Session.BeginActionCall(request, action.ByteLength, fixture.Now, out _).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.IssueNestedHostActionEntryRelay(parentCall, child, fixture.Now, out _).Code);
+        Assert.True(fixture.Session.RevokeNestedHostActionEntryRelay(parentCall.CallId, fixture.Now).Accepted);
+        var receipt = new SidecarTerminalReceipt(
+            "revoke-receipt",
+            descriptor.Key,
+            descriptor.Version,
+            parentCall.CallId,
+            1,
+            "revoke-scope",
+            action.ContentHash);
+        Assert.True(fixture.Session.RecordTerminal(parentCall.CallId, Guid.NewGuid(), receipt).Accepted);
+        Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 1).Accepted);
+    }
+
     private static SidecarActionCapabilityRequest SidecarCapabilityTransportValidationRequest(
         SidecarCapabilityCallIdentity call,
         SidecarActionDescriptorIdentity descriptor,
