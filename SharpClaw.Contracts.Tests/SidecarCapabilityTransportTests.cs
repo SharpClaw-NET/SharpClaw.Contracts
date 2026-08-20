@@ -3054,20 +3054,16 @@ public sealed class SidecarCapabilityTransportTests
         {
             NestedCarrierRequest = nestedRequest,
         };
-        terminalRequest = terminalRequest with
+        var relayAuthority = terminalRequest.Authority with
         {
-            Authority = terminalRequest.Authority with
-            {
-                NestedCarrierRelay = relay,
-            },
+            NestedCarrierRelay = relay,
+            Proof = "relay-proof",
         };
-        terminalRequest = terminalRequest with
+        relayAuthority = relayAuthority with
         {
-            Authority = terminalRequest.Authority with
-            {
-                CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
-                    terminalRequest.Authority),
-            },
+            CanonicalBindingHash =
+                SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                    relayAuthority),
         };
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
             rootRequest,
@@ -3076,19 +3072,32 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Now,
             (authority, bindingHash) => authority.Proof == "host-proof" &&
                 bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Accepted);
+        var parentResult = Payload(rootDescriptor.ResultTypeIdentity, "parent-result");
         var terminalResponse = new SidecarActionTerminalTransportResponse(
-            null,
-            new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
+            new SidecarActionResultIdentity(
+                Guid.NewGuid(),
+                parentCall.CallId,
+                rootDescriptor.Key,
+                rootDescriptor.Version,
+                rootDescriptor.ResultTypeIdentity,
+                parentResult.ContentHash),
+            new SidecarTerminalExecutionResult(parentResult, null, true),
             terminalRequest.Receipt,
             fixture.SafeFailure)
         {
             TerminalId = terminalRequest.TerminalId,
             NestedCarrierRelay = relay,
+            NestedCarrierAuthority = relayAuthority,
+            NestedCarrierOutcome = new(
+                SidecarNestedHostActionEntryRelayOutcomeKind.Issued,
+                null),
         };
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
             terminalRequest,
             terminalResponse,
-            fixture.Binding).Accepted);
+            fixture.Binding,
+            (authority, bindingHash) => authority.Proof == "relay-proof" &&
+                bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.InvalidResponse,
             SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
@@ -3100,7 +3109,34 @@ public sealed class SidecarCapabilityTransportTests
                         Carrier = relay!.Carrier with { ActionContentHash = "changed" },
                     },
                 },
-                fixture.Binding).Code);
+                fixture.Binding,
+                (_, _) => true).Code);
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            terminalResponse with
+            {
+                NestedCarrierRelay = null,
+                NestedCarrierAuthority = null,
+                NestedCarrierOutcome = new(
+                    SidecarNestedHostActionEntryRelayOutcomeKind.Failed,
+                    fixture.SafeFailure),
+                ResultIdentity = null,
+                Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
+            },
+            fixture.Binding).Accepted);
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            terminalResponse with
+            {
+                NestedCarrierRelay = null,
+                NestedCarrierAuthority = null,
+                NestedCarrierOutcome = new(
+                    SidecarNestedHostActionEntryRelayOutcomeKind.Cancelled,
+                    fixture.SafeFailure),
+                ResultIdentity = null,
+                Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
+            },
+            fixture.Binding).Accepted);
 
         var childRequest = SidecarActionCapabilityRequest.HostEntryNested(
             relay.Call,
@@ -3862,46 +3898,68 @@ public sealed class SidecarCapabilityTransportTests
             CancellationToken ct = default)
         {
             NestedRequests++;
-            var nestedRequest = request.NestedCarrierRequest ?? throw new InvalidOperationException();
+            var wireRequest = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportRequest>(
+                SidecarCapabilityTransportCodec.Serialize(request));
+            var nestedRequest = wireRequest.NestedCarrierRequest ?? throw new InvalidOperationException();
             var issue = fixture.Session.IssueNestedHostActionEntryRelay(
-                request.Call,
+                wireRequest.Call,
                 nestedRequest,
                 fixture.Now,
                 out var relay);
             Assert.True(issue.Accepted, issue.Message);
             Assert.NotNull(relay);
-            var boundRequest = request with
+            var relayAuthority = wireRequest.Authority with
             {
-                Authority = request.Authority with { NestedCarrierRelay = relay },
+                NestedCarrierRelay = relay,
+                Proof = "relay-proof",
             };
-            boundRequest = boundRequest with
+            relayAuthority = relayAuthority with
             {
-                Authority = boundRequest.Authority with
-                {
-                    CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
-                        boundRequest.Authority),
-                },
+                CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                    relayAuthority),
             };
             Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
                 parentRequest,
-                boundRequest,
+                wireRequest,
                 fixture.Binding,
                 fixture.Now,
                 (_, _) => true).Accepted);
+            var result = Payload(wireRequest.Descriptor.ResultTypeIdentity, "parent-result");
             var response = new SidecarActionTerminalTransportResponse(
-                null,
-                new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
-                boundRequest.Receipt,
+                new SidecarActionResultIdentity(
+                    Guid.NewGuid(),
+                    wireRequest.Call.CallId,
+                    wireRequest.Descriptor.Key,
+                    wireRequest.Descriptor.Version,
+                    wireRequest.Descriptor.ResultTypeIdentity,
+                    result.ContentHash),
+                new SidecarTerminalExecutionResult(result, null, true),
+                wireRequest.Receipt,
                 fixture.SafeFailure)
             {
-                TerminalId = boundRequest.TerminalId,
+                TerminalId = wireRequest.TerminalId,
                 NestedCarrierRelay = relay,
+                NestedCarrierAuthority = relayAuthority,
+                NestedCarrierOutcome = new(
+                    SidecarNestedHostActionEntryRelayOutcomeKind.Issued,
+                    null),
             };
-            Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
-                boundRequest,
-                response,
-                fixture.Binding).Accepted);
-            return ValueTask.FromResult(response);
+            var wireResponse = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+                SidecarCapabilityTransportCodec.Serialize(response));
+            Assert.Equal(wireRequest.TerminalId, wireResponse.TerminalId);
+            Assert.Equal(wireRequest.Receipt, wireResponse.Receipt);
+            Assert.Equal(response.NestedCarrierRelay!.Carrier.CarrierId, wireResponse.NestedCarrierRelay!.Carrier.CarrierId);
+            Assert.Equal(response.NestedCarrierAuthority!.AuthorityId, wireResponse.NestedCarrierAuthority!.AuthorityId);
+            Assert.Equal(response.NestedCarrierOutcome!.Kind, wireResponse.NestedCarrierOutcome!.Kind);
+            var responseValidation = SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                wireRequest,
+                wireResponse,
+                fixture.Binding,
+                (authority, bindingHash) => authority.Proof == "relay-proof" &&
+                    bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority));
+            Assert.True(responseValidation.Accepted, $"{responseValidation.Code}: {responseValidation.Message}");
+            Assert.Null(request.Authority.NestedCarrierRelay);
+            return ValueTask.FromResult(wireResponse);
         }
 
         public SidecarActionTerminalTransportRequest CreateNestedTerminalRequest(

@@ -1895,6 +1895,24 @@ public sealed record SidecarNestedHostActionEntryRelay(
         Carrier.CallId == Call.CallId;
 }
 
+public enum SidecarNestedHostActionEntryRelayOutcomeKind
+{
+    Issued = 0,
+    Failed = 1,
+    Cancelled = 2,
+}
+
+public sealed record SidecarNestedHostActionEntryRelayOutcome(
+    SidecarNestedHostActionEntryRelayOutcomeKind Kind,
+    SidecarSafeFailureIdentity? Failure)
+{
+    public bool IsWellFormed =>
+        Enum.IsDefined(Kind) &&
+        (Kind == SidecarNestedHostActionEntryRelayOutcomeKind.Issued
+            ? Failure is null
+            : Failure is not null && Failure.IsValid);
+}
+
 public sealed record SidecarTerminalContinuationResponse(
     Guid ContinuationRequestId,
     bool Accepted,
@@ -2085,6 +2103,8 @@ public sealed record SidecarActionTerminalTransportResponse(
 {
     public Guid TerminalId { get; init; }
     public SidecarNestedHostActionEntryRelay? NestedCarrierRelay { get; init; }
+    public SidecarHostTerminalAuthority? NestedCarrierAuthority { get; init; }
+    public SidecarNestedHostActionEntryRelayOutcome? NestedCarrierOutcome { get; init; }
 }
 
 public static class SidecarCapabilityTransportValidation
@@ -2587,18 +2607,30 @@ public static class SidecarCapabilityTransportValidation
     public static SidecarCapabilityValidationResult ValidateActionTerminalResponse(
         SidecarActionTerminalTransportRequest request,
         SidecarActionTerminalTransportResponse response,
-        SidecarCapabilitySessionBinding binding)
+        SidecarCapabilitySessionBinding binding,
+        Func<SidecarHostTerminalAuthority, string, bool>? authenticateNestedCarrierAuthority = null)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(response);
         ArgumentNullException.ThrowIfNull(binding);
 
         var nestedRelayValid = request.NestedCarrierRequest is null
-            ? response.NestedCarrierRelay is null
-            : response.NestedCarrierRelay is not null &&
-              MatchesNestedRelay(request, response.NestedCarrierRelay) &&
-              request.Authority.NestedCarrierRelay is not null &&
-              SameNestedRelay(request.Authority.NestedCarrierRelay, response.NestedCarrierRelay);
+            ? response.NestedCarrierRelay is null &&
+              response.NestedCarrierAuthority is null &&
+              response.NestedCarrierOutcome is null
+            : response.NestedCarrierOutcome is not null &&
+              response.NestedCarrierOutcome.IsWellFormed &&
+              (response.NestedCarrierOutcome.Kind == SidecarNestedHostActionEntryRelayOutcomeKind.Issued
+                  ? response.NestedCarrierRelay is not null &&
+                    response.NestedCarrierAuthority is not null &&
+                    MatchesNestedRelay(request, response.NestedCarrierRelay) &&
+                    SameNestedCarrierAuthorityBinding(request, response.NestedCarrierRelay, response.NestedCarrierAuthority) &&
+                    authenticateNestedCarrierAuthority is not null &&
+                    authenticateNestedCarrierAuthority(
+                        response.NestedCarrierAuthority,
+                        ComputeTerminalAuthorityBindingHash(response.NestedCarrierAuthority))
+                  : response.NestedCarrierRelay is null &&
+                    response.NestedCarrierAuthority is null);
 
         if (!nestedRelayValid ||
             response.TerminalId != request.TerminalId ||
@@ -2998,6 +3030,60 @@ public static class SidecarCapabilityTransportValidation
         SidecarNestedHostActionEntryRelay left,
         SidecarNestedHostActionEntryRelay right) =>
         left == right;
+
+    private static bool SameNestedCarrierAuthorityBinding(
+        SidecarActionTerminalTransportRequest request,
+        SidecarNestedHostActionEntryRelay relay,
+        SidecarHostTerminalAuthority authority)
+    {
+        var expected = request.Authority with
+        {
+            NestedCarrierRelay = relay,
+        };
+        expected = expected with
+        {
+            CanonicalBindingHash = ComputeTerminalAuthorityBindingHash(expected),
+        };
+        return expected.AuthorityId == authority.AuthorityId &&
+            expected.SessionId == authority.SessionId &&
+            expected.RequestId == authority.RequestId &&
+            expected.CancellationId == authority.CancellationId &&
+            expected.CallId == authority.CallId &&
+            string.Equals(expected.ModuleId, authority.ModuleId, StringComparison.Ordinal) &&
+            string.Equals(expected.GraphId, authority.GraphId, StringComparison.Ordinal) &&
+            expected.Invocation == authority.Invocation &&
+            expected.ActionKey == authority.ActionKey &&
+            expected.ActionVersion == authority.ActionVersion &&
+            string.Equals(expected.DescriptorHash, authority.DescriptorHash, StringComparison.Ordinal) &&
+            string.Equals(expected.EffectiveActionTypeIdentity, authority.EffectiveActionTypeIdentity, StringComparison.Ordinal) &&
+            expected.EffectiveActionSchemaVersion == authority.EffectiveActionSchemaVersion &&
+            string.Equals(expected.EffectiveActionContentHash, authority.EffectiveActionContentHash, StringComparison.OrdinalIgnoreCase) &&
+            expected.EffectiveActionByteLength == authority.EffectiveActionByteLength &&
+            string.Equals(expected.ReceiptId, authority.ReceiptId, StringComparison.Ordinal) &&
+            expected.ReceiptActionKey == authority.ReceiptActionKey &&
+            expected.ReceiptActionVersion == authority.ReceiptActionVersion &&
+            expected.ReceiptCallId == authority.ReceiptCallId &&
+            expected.ReceiptAttempt == authority.ReceiptAttempt &&
+            string.Equals(expected.ReceiptIdempotencyScope, authority.ReceiptIdempotencyScope, StringComparison.Ordinal) &&
+            string.Equals(expected.ReceiptContentHash, authority.ReceiptContentHash, StringComparison.OrdinalIgnoreCase) &&
+            expected.Deadline == authority.Deadline &&
+            expected.IssuedAt == authority.IssuedAt &&
+            expected.ExpiresAt == authority.ExpiresAt &&
+            expected.TerminalId == authority.TerminalId &&
+            string.Equals(expected.CanonicalBindingHash, authority.CanonicalBindingHash, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(expected.SnapshotContentHash, authority.SnapshotContentHash, StringComparison.OrdinalIgnoreCase) &&
+            SamePrincipal(expected.Caller, authority.Caller) &&
+            SameFeatures(expected.Features, authority.Features) &&
+            expected.TraceId == authority.TraceId &&
+            expected.IdempotencyKey == authority.IdempotencyKey &&
+            expected.InvocationId == authority.InvocationId &&
+            expected.ParentInvocationId == authority.ParentInvocationId &&
+            expected.Depth == authority.Depth &&
+            expected.Attempt == authority.Attempt &&
+            expected.NestedCarrierRelay is not null &&
+            authority.NestedCarrierRelay is not null &&
+            SameNestedRelay(expected.NestedCarrierRelay, authority.NestedCarrierRelay);
+    }
 
     private static bool SameReceipt(
         SidecarTerminalReceipt left,
