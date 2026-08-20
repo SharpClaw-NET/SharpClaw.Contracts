@@ -2977,9 +2977,9 @@ public sealed class SidecarCapabilityTransportTests
                 null,
                 null));
         var nestedRequest = new SidecarNestedHostActionEntryRequest(
-            childDescriptor,
+            childDescriptor.Key,
+            childDescriptor.Version,
             childAction,
-            contribution,
             fixture.Now.AddSeconds(20),
             fixture.Now.AddSeconds(25));
         var rootRequest = SidecarActionCapabilityRequest.HostEntry(
@@ -3017,11 +3017,15 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Session.IssueNestedHostActionEntryRelay(
                 parentCall with { CallId = Guid.NewGuid(), ReplayNonce = "wrong-parent" },
                 nestedRequest,
+                childDescriptor,
+                contribution,
                 fixture.Now,
                 out _).Code);
         Assert.True(fixture.Session.IssueNestedHostActionEntryRelay(
             parentCall,
             nestedRequest,
+            childDescriptor,
+            contribution,
             fixture.Now,
             out var relay).Accepted);
         Assert.NotNull(relay);
@@ -3197,26 +3201,17 @@ public sealed class SidecarCapabilityTransportTests
                 (_, _) => true).Accepted);
         }
 
-        var descriptorSubstitution = nestedRequest with
+        var descriptorKeySubstitution = nestedRequest with
         {
-            Descriptor = nestedRequest.Descriptor with
-            {
-                Key = new SharpClawActionKey("nested.other"),
-            },
+            ActionKey = new SharpClawActionKey("nested.other"),
+        };
+        var descriptorVersionSubstitution = nestedRequest with
+        {
+            ActionVersion = nestedRequest.ActionVersion + 1,
         };
         var payloadSubstitution = nestedRequest with
         {
             Action = Payload(nestedRequest.Action.TypeIdentity, "changed-nested-payload"),
-        };
-        var contributionSubstitution = nestedRequest with
-        {
-            Contribution = nestedRequest.Contribution with
-            {
-                Lineage = nestedRequest.Contribution.Lineage with
-                {
-                    DescriptorHash = "changed-contribution",
-                },
-            },
         };
         var deadlineSubstitution = nestedRequest with
         {
@@ -3228,9 +3223,9 @@ public sealed class SidecarCapabilityTransportTests
         };
         foreach (var substitutedRequest in new[]
         {
-            descriptorSubstitution,
+            descriptorKeySubstitution,
+            descriptorVersionSubstitution,
             payloadSubstitution,
-            contributionSubstitution,
             deadlineSubstitution,
             expirySubstitution,
         })
@@ -3335,14 +3330,16 @@ public sealed class SidecarCapabilityTransportTests
 
         var grandchildAction = Payload(childDescriptor.InputTypeIdentity, "grandchild");
         var grandchildRequest = new SidecarNestedHostActionEntryRequest(
-            childDescriptor,
+            childDescriptor.Key,
+            childDescriptor.Version,
             grandchildAction,
-            contribution,
             fixture.Now.AddSeconds(20),
             fixture.Now.AddSeconds(20));
         Assert.True(fixture.Session.IssueNestedHostActionEntryRelay(
             relay.Call,
             grandchildRequest,
+            childDescriptor,
+            contribution,
             fixture.Now,
             out var grandchildRelay).Accepted);
         Assert.NotNull(grandchildRelay);
@@ -3398,8 +3395,177 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Session.IssueNestedHostActionEntryRelay(
                 parentCall,
                 nestedRequest,
+                childDescriptor,
+                contribution,
                 fixture.Now,
                 out _).Code);
+    }
+
+    [Fact]
+    public void Nested_host_entry_resolution_binds_the_host_resolved_child_descriptor()
+    {
+        var fixture = CreateFixture(maxInFlight: 3, maxCalls: 4);
+        var parentDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("parent.resolve"),
+            1,
+            "parent",
+            typeof(int).AssemblyQualifiedName!,
+            "parent-resolve-input",
+            2,
+            typeof(bool).AssemblyQualifiedName!,
+            "parent-resolve-result",
+            3,
+            "parent-resolve-descriptor");
+        var childDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("child.resolve"),
+            2,
+            "child",
+            typeof(Guid).AssemblyQualifiedName!,
+            "child-resolve-input",
+            4,
+            typeof(DateTime).AssemblyQualifiedName!,
+            "child-resolve-result",
+            5,
+            "child-resolve-descriptor");
+        var parentAction = Payload(parentDescriptor.InputTypeIdentity, 7) with
+        {
+            SchemaVersion = parentDescriptor.InputSchemaVersion,
+        };
+        var childAction = Payload(childDescriptor.InputTypeIdentity, Guid.NewGuid()) with
+        {
+            SchemaVersion = childDescriptor.InputSchemaVersion,
+        };
+        var parentContext = IssueContext(
+            fixture,
+            new RequestPrincipal("resolution-caller"),
+            HostActionEntryIngress.Endpoint,
+            lineage: new HostActionEntryLineage(
+                parentDescriptor.Key,
+                parentDescriptor.Version,
+                parentDescriptor.DescriptorHash,
+                parentDescriptor.InputTypeIdentity,
+                parentDescriptor.InputSchemaVersion,
+                parentDescriptor.InputSchemaHash,
+                null,
+                null));
+        ActivateContext(fixture, parentContext);
+        var parentCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "resolve-parent",
+            Sequence = 1,
+        };
+        var parentRequest = SidecarActionCapabilityRequest.HostEntry(
+            parentCall,
+            parentDescriptor,
+            parentAction,
+            new SidecarCancellationIdentity(parentCall.CancellationId, "resolve-cancel", parentCall.Deadline),
+            parentCall.Deadline,
+            parentContext,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                parentDescriptor.InputTypeIdentity,
+                parentDescriptor.InputSchemaVersion,
+                parentDescriptor.ResultTypeIdentity,
+                parentDescriptor.ResultSchemaVersion,
+                parentDescriptor.DescriptorHash));
+        var parentBegin = fixture.Session.BeginActionCall(
+            SidecarCapabilityTransportCodec.Deserialize<SidecarActionCapabilityRequest>(
+                SidecarCapabilityTransportCodec.Serialize(parentRequest)),
+            parentAction.ByteLength,
+            fixture.Now,
+            out _);
+        Assert.True(parentBegin.Accepted, $"{parentBegin.Code}: {parentBegin.Message}");
+        Assert.True(fixture.Session.RecordTerminal(
+            parentCall.CallId,
+            Guid.NewGuid(),
+            new SidecarTerminalReceipt(
+                "resolve-receipt",
+                parentDescriptor.Key,
+                parentDescriptor.Version,
+                parentCall.CallId,
+                1,
+                "resolve-scope",
+                parentAction.ContentHash)).Accepted);
+
+        var contribution = new HostActionEntryContribution(
+            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "parent", "child"),
+            new HostActionEntryLineage(
+                childDescriptor.Key,
+                childDescriptor.Version,
+                childDescriptor.DescriptorHash,
+                childDescriptor.InputTypeIdentity,
+                childDescriptor.InputSchemaVersion,
+                childDescriptor.InputSchemaHash,
+                null,
+                null));
+        var nestedRequest = new SidecarNestedHostActionEntryRequest(
+            childDescriptor.Key,
+            childDescriptor.Version,
+            childAction,
+            fixture.Now.AddSeconds(20),
+            fixture.Now.AddSeconds(25));
+        var wireRequest = SidecarCapabilityTransportCodec.Deserialize<SidecarNestedHostActionEntryRequest>(
+            SidecarCapabilityTransportCodec.Serialize(nestedRequest));
+
+        var wrongDescriptor = childDescriptor with
+        {
+            DescriptorHash = "child-resolve-wrong-descriptor",
+        };
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.IssueNestedHostActionEntryRelay(
+                parentCall,
+                wireRequest,
+                wrongDescriptor,
+                contribution,
+                fixture.Now,
+                out _).Code);
+
+        var wrongSchemaDescriptor = childDescriptor with
+        {
+            InputSchemaHash = "child-resolve-wrong-schema",
+        };
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.IssueNestedHostActionEntryRelay(
+                parentCall,
+                wireRequest,
+                wrongSchemaDescriptor,
+                contribution,
+                fixture.Now,
+                out _).Code);
+
+        var wrongContribution = contribution with
+        {
+            Lineage = contribution.Lineage with
+            {
+                DescriptorHash = "child-resolve-wrong-lineage",
+            },
+        };
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.IssueNestedHostActionEntryRelay(
+                parentCall,
+                wireRequest,
+                childDescriptor,
+                wrongContribution,
+                fixture.Now,
+                out _).Code);
+
+        Assert.True(fixture.Session.IssueNestedHostActionEntryRelay(
+            parentCall,
+            wireRequest,
+            childDescriptor,
+            contribution,
+            fixture.Now,
+            out var relay).Accepted);
+        Assert.NotNull(relay);
+        Assert.Equal(childDescriptor.Key, relay!.Carrier.ActionKey);
+        Assert.Equal(childDescriptor.Version, relay.Carrier.ActionVersion);
+        Assert.Equal(childDescriptor.DescriptorHash, relay.Carrier.DescriptorHash);
+        Assert.Equal(childAction.ContentHash, relay.Carrier.ActionContentHash);
     }
 
     [Fact]
@@ -3440,19 +3606,9 @@ public sealed class SidecarCapabilityTransportTests
         };
         var action = Payload(descriptor.InputTypeIdentity, "parent");
         var child = new SidecarNestedHostActionEntryRequest(
-            descriptor,
+            descriptor.Key,
+            descriptor.Version,
             action,
-            new HostActionEntryContribution(
-                new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "module-a", "module-b"),
-                new HostActionEntryLineage(
-                    descriptor.Key,
-                    descriptor.Version,
-                    descriptor.DescriptorHash,
-                    descriptor.InputTypeIdentity,
-                    descriptor.InputSchemaVersion,
-                    descriptor.InputSchemaHash,
-                    null,
-                    null)),
             fixture.Now.AddSeconds(20),
             fixture.Now.AddSeconds(20));
         var request = SidecarActionCapabilityRequest.HostEntry(
@@ -3472,7 +3628,23 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(fixture.Session.BeginActionCall(request, action.ByteLength, fixture.Now, out _).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.InvalidBinding,
-            fixture.Session.IssueNestedHostActionEntryRelay(parentCall, child, fixture.Now, out _).Code);
+            fixture.Session.IssueNestedHostActionEntryRelay(
+                parentCall,
+                child,
+                descriptor,
+                new HostActionEntryContribution(
+                    new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "module-a", "module-b"),
+                    new HostActionEntryLineage(
+                        descriptor.Key,
+                        descriptor.Version,
+                        descriptor.DescriptorHash,
+                        descriptor.InputTypeIdentity,
+                        descriptor.InputSchemaVersion,
+                        descriptor.InputSchemaHash,
+                        null,
+                        null)),
+                fixture.Now,
+                out _).Code);
         Assert.Equal(
             SidecarCapabilityErrors.Duplicate,
             fixture.Session.RevokeNestedHostActionEntryRelay(parentCall.CallId, fixture.Now).Code);
@@ -3573,17 +3745,22 @@ public sealed class SidecarCapabilityTransportTests
                 null,
                 null));
         var nestedRequest = new SidecarNestedHostActionEntryRequest(
-            childDescriptor,
+            childDescriptor.Key,
+            childDescriptor.Version,
             childAction,
-            contribution,
             fixture.Now.AddSeconds(20),
             fixture.Now.AddSeconds(20));
         var terminalRequest = CreateTerminalRequest(
             fixture,
             rootRequest,
             new ActionPipelineSnapshot("runtime-graph", []));
-        var transport = new RuntimeNestedTransport(fixture, rootRequest, terminalRequest);
-        var entry = new RuntimeNestedHostActionEntryProxy(transport, childDescriptor, contribution);
+        var transport = new RuntimeNestedTransport(
+            fixture,
+            rootRequest,
+            terminalRequest,
+            childDescriptor,
+            contribution);
+        var entry = new RuntimeNestedHostActionEntryProxy(transport, childDescriptor);
         var parentContext = new ActionContext<string>(
             rootContext.InvocationId,
             rootContext.ParentInvocationId,
@@ -3998,7 +4175,9 @@ public sealed class SidecarCapabilityTransportTests
     private sealed class RuntimeNestedTransport(
         Fixture fixture,
         SidecarActionCapabilityRequest parentRequest,
-        SidecarActionTerminalTransportRequest terminalRequest) : ISidecarCapabilityTransport
+        SidecarActionTerminalTransportRequest terminalRequest,
+        SidecarActionDescriptorIdentity resolvedDescriptor,
+        HostActionEntryContribution resolvedContribution) : ISidecarCapabilityTransport
     {
         public int NestedRequests { get; private set; }
         public int ActionCalls { get; private set; }
@@ -4063,6 +4242,8 @@ public sealed class SidecarCapabilityTransportTests
             var issue = fixture.Session.IssueNestedHostActionEntryRelay(
                 wireRequest.Call,
                 nestedRequest,
+                resolvedDescriptor,
+                resolvedContribution,
                 fixture.Now,
                 out var relay);
             Assert.True(issue.Accepted, issue.Message);
@@ -4131,8 +4312,7 @@ public sealed class SidecarCapabilityTransportTests
 
     private sealed class RuntimeNestedHostActionEntryProxy(
         RuntimeNestedTransport transport,
-        SidecarActionDescriptorIdentity descriptor,
-        HostActionEntryContribution contribution) : IHostActionEntry
+        SidecarActionDescriptorIdentity descriptor) : IHostActionEntry
     {
         public ValueTask<IActionOutcome<TResult>> InvokeAsync<TAction, TResult>(
             HostActionEntryRequest<TAction, TResult> request,
@@ -4148,9 +4328,9 @@ public sealed class SidecarCapabilityTransportTests
         {
             var action = Payload(descriptor.InputTypeIdentity, request.Action);
             var nestedRequest = new SidecarNestedHostActionEntryRequest(
-                descriptor,
+                descriptor.Key,
+                descriptor.Version,
                 action,
-                contribution,
                 request.ParentContext.Deadline,
                 request.ParentContext.Deadline);
             var terminalResponse = await transport.InvokeActionTerminalAsync(

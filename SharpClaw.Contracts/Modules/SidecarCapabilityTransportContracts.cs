@@ -667,6 +667,8 @@ public sealed class SidecarCapabilitySession
     public SidecarCapabilityValidationResult IssueNestedHostActionEntryRelay(
         SidecarCapabilityCallIdentity parentCall,
         SidecarNestedHostActionEntryRequest request,
+        SidecarActionDescriptorIdentity resolvedDescriptor,
+        HostActionEntryContribution resolvedContribution,
         DateTimeOffset now,
         out SidecarNestedHostActionEntryRelay? relay)
     {
@@ -688,7 +690,13 @@ public sealed class SidecarCapabilitySession
                     "A nested host action relay requires an active parent terminal call.");
             }
 
-            if (!request.IsWellFormed ||
+            var resolution = SidecarCapabilityTransportValidation.ValidateResolvedNestedHostActionEntryRequest(
+                request,
+                resolvedDescriptor,
+                resolvedContribution,
+                Binding,
+                now);
+            if (!resolution.Accepted ||
                 request.Deadline > parentCall.Deadline ||
                 request.ExpiresAt > parentCall.Deadline)
             {
@@ -707,9 +715,9 @@ public sealed class SidecarCapabilitySession
             var result = IssueNestedHostActionEntryCarrier(
                 parentCall,
                 nestedCall,
-                request.Descriptor,
+                resolvedDescriptor,
                 request.Action,
-                request.Contribution,
+                resolvedContribution,
                 now,
                 out var carrier);
             if (!result.Accepted || carrier is null)
@@ -1864,21 +1872,17 @@ public sealed record SidecarNestedHostActionEntryCarrier(
 }
 
 public sealed record SidecarNestedHostActionEntryRequest(
-    SidecarActionDescriptorIdentity Descriptor,
+    SharpClawActionKey ActionKey,
+    int ActionVersion,
     SidecarSerializedPayload Action,
-    HostActionEntryContribution Contribution,
     DateTimeOffset Deadline,
     DateTimeOffset ExpiresAt)
 {
     public bool IsWellFormed =>
-        Descriptor is not null &&
-        !string.IsNullOrWhiteSpace(Descriptor.Key.Value) &&
-        Descriptor.Version >= 1 &&
-        !string.IsNullOrWhiteSpace(Descriptor.DescriptorHash) &&
+        !string.IsNullOrWhiteSpace(ActionKey.Value) &&
+        ActionVersion >= 1 &&
         Action is not null &&
         Action.IsValid &&
-        Contribution is not null &&
-        Contribution.IsWellFormed &&
         Deadline > DateTimeOffset.MinValue &&
         ExpiresAt >= Deadline;
 }
@@ -2286,6 +2290,47 @@ public static class SidecarCapabilityTransportValidation
         }
 
         return SidecarCapabilityValidationResult.Accept();
+    }
+
+    public static SidecarCapabilityValidationResult ValidateResolvedNestedHostActionEntryRequest(
+        SidecarNestedHostActionEntryRequest request,
+        SidecarActionDescriptorIdentity resolvedDescriptor,
+        HostActionEntryContribution resolvedContribution,
+        SidecarCapabilitySessionBinding binding,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(resolvedDescriptor);
+        ArgumentNullException.ThrowIfNull(resolvedContribution);
+        ArgumentNullException.ThrowIfNull(binding);
+
+        if (!request.IsWellFormed ||
+            !IsValidDescriptor(resolvedDescriptor) ||
+            !resolvedContribution.IsWellFormed ||
+            request.Deadline <= now ||
+            request.ExpiresAt < request.Deadline ||
+            request.ExpiresAt > binding.ExpiresAt ||
+            request.ActionKey != resolvedDescriptor.Key ||
+            request.ActionVersion != resolvedDescriptor.Version ||
+            !string.Equals(request.Action.TypeIdentity, resolvedDescriptor.InputTypeIdentity, StringComparison.Ordinal) ||
+            request.Action.SchemaVersion != resolvedDescriptor.InputSchemaVersion ||
+            resolvedContribution.Lineage.IsPayloadBound ||
+            resolvedContribution.Lineage.ActionKey != resolvedDescriptor.Key ||
+            resolvedContribution.Lineage.ActionVersion != resolvedDescriptor.Version ||
+            !string.Equals(resolvedContribution.Lineage.DescriptorHash, resolvedDescriptor.DescriptorHash, StringComparison.Ordinal) ||
+            !string.Equals(resolvedContribution.Lineage.InputTypeIdentity, resolvedDescriptor.InputTypeIdentity, StringComparison.Ordinal) ||
+            resolvedContribution.Lineage.InputSchemaVersion != resolvedDescriptor.InputSchemaVersion ||
+            !string.Equals(resolvedContribution.Lineage.InputSchemaHash, resolvedDescriptor.InputSchemaHash, StringComparison.Ordinal))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The resolved nested host action descriptor is not authorized for the request.");
+        }
+
+        return ValidateSerializedPayload(
+            request.Action,
+            required: true,
+            binding.PayloadLimits.ActionInputBytes);
     }
 
     public static SidecarCapabilityValidationResult ValidateActionRequest(
@@ -3027,14 +3072,8 @@ public static class SidecarCapabilityTransportValidation
         nestedRequest.IsWellFormed &&
         nestedRequest.Deadline <= terminalRequest.Deadline &&
         nestedRequest.ExpiresAt <= terminalRequest.Deadline &&
-        IsValidDescriptor(nestedRequest.Descriptor) &&
-        string.Equals(nestedRequest.Action.TypeIdentity, nestedRequest.Descriptor.InputTypeIdentity, StringComparison.Ordinal) &&
-        nestedRequest.Action.SchemaVersion == nestedRequest.Descriptor.InputSchemaVersion &&
-        nestedRequest.Contribution.IsWellFormed &&
-        nestedRequest.Contribution.Lineage.ActionKey == nestedRequest.Descriptor.Key &&
-        nestedRequest.Contribution.Lineage.ActionVersion == nestedRequest.Descriptor.Version &&
-        string.Equals(nestedRequest.Contribution.Lineage.DescriptorHash, nestedRequest.Descriptor.DescriptorHash, StringComparison.Ordinal) &&
-        !nestedRequest.Contribution.Lineage.IsPayloadBound &&
+        nestedRequest.ActionKey.Value is not null &&
+        nestedRequest.ActionVersion >= 1 &&
         ValidateSerializedPayload(nestedRequest.Action, true, binding.PayloadLimits.ActionInputBytes).Accepted &&
         initiatingRequest.Invocation == SidecarActionInvocationKind.HostEntry;
 
@@ -3052,9 +3091,8 @@ public static class SidecarCapabilityTransportValidation
         string.Equals(relay.Call.ModuleId, request.Call.ModuleId, StringComparison.Ordinal) &&
         string.Equals(relay.Call.GraphId, request.Call.GraphId, StringComparison.Ordinal) &&
         relay.Call.Deadline == request.NestedCarrierRequest.Deadline &&
-        relay.Carrier.ActionKey == request.NestedCarrierRequest.Descriptor.Key &&
-        relay.Carrier.ActionVersion == request.NestedCarrierRequest.Descriptor.Version &&
-        string.Equals(relay.Carrier.DescriptorHash, request.NestedCarrierRequest.Descriptor.DescriptorHash, StringComparison.Ordinal) &&
+        relay.Carrier.ActionKey == request.NestedCarrierRequest.ActionKey &&
+        relay.Carrier.ActionVersion == request.NestedCarrierRequest.ActionVersion &&
         string.Equals(relay.Carrier.ActionContentHash, request.NestedCarrierRequest.Action.ContentHash, StringComparison.OrdinalIgnoreCase) &&
         relay.Carrier.ActionByteLength == request.NestedCarrierRequest.Action.ByteLength &&
         relay.Carrier.ExpiresAt == new[]
