@@ -2781,6 +2781,7 @@ public sealed class SidecarCapabilityTransportTests
             SidecarCapabilityErrors.SpoofedIdentity,
             fixture.Session.BeginActionCall(changed, changed.Action.ByteLength, fixture.Now, out _).Code);
 
+        Assert.True(fixture.Session.RevokeNestedHostActionEntryRelay(parentCall.CallId, fixture.Now).Accepted);
         Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 0).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.Replay,
@@ -2994,10 +2995,7 @@ public sealed class SidecarCapabilityTransportTests
                 rootDescriptor.InputSchemaVersion,
                 rootDescriptor.ResultTypeIdentity,
                 rootDescriptor.ResultSchemaVersion,
-                rootDescriptor.DescriptorHash)) with
-        {
-            NestedCarrierRequest = nestedRequest,
-        };
+                rootDescriptor.DescriptorHash));
 
         Assert.True(fixture.Session.BeginActionCall(
             rootRequest,
@@ -3016,22 +3014,11 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(fixture.Session.RecordTerminal(parentCall.CallId, Guid.NewGuid(), receipt).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.InvalidBinding,
-            fixture.Session.CompleteCall(parentCall.CallId, 1).Code);
-        Assert.Equal(
-            SidecarCapabilityErrors.SpoofedIdentity,
             fixture.Session.IssueNestedHostActionEntryRelay(
                 parentCall with { CallId = Guid.NewGuid(), ReplayNonce = "wrong-parent" },
                 nestedRequest,
                 fixture.Now,
                 out _).Code);
-        Assert.Equal(
-            SidecarCapabilityErrors.SpoofedIdentity,
-            fixture.Session.IssueNestedHostActionEntryRelay(
-                parentCall,
-                nestedRequest with { Action = Payload(childDescriptor.InputTypeIdentity, "changed") },
-                fixture.Now,
-                out _).Code);
-
         Assert.True(fixture.Session.IssueNestedHostActionEntryRelay(
             parentCall,
             nestedRequest,
@@ -3041,13 +3028,31 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(relay!.IsWellFormed);
         Assert.Equal(parentCall.CallId, relay.Carrier.ParentCallId);
         Assert.Equal(relay.Call.CallId, relay.Carrier.CallId);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.CompleteCall(parentCall.CallId, 1).Code);
 
         var terminalRequest = CreateTerminalRequest(
             fixture,
             rootRequest,
             new ActionPipelineSnapshot("relay-graph", [])) with
         {
-            NestedCarrierRelay = relay,
+            NestedCarrierRequest = nestedRequest,
+        };
+        terminalRequest = terminalRequest with
+        {
+            Authority = terminalRequest.Authority with
+            {
+                NestedCarrierRelay = relay,
+            },
+        };
+        terminalRequest = terminalRequest with
+        {
+            Authority = terminalRequest.Authority with
+            {
+                CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                    terminalRequest.Authority),
+            },
         };
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
             rootRequest,
@@ -3056,20 +3061,31 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Now,
             (authority, bindingHash) => authority.Proof == "host-proof" &&
                 bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Accepted);
+        var terminalResponse = new SidecarActionTerminalTransportResponse(
+            null,
+            new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
+            terminalRequest.Receipt,
+            fixture.SafeFailure)
+        {
+            TerminalId = terminalRequest.TerminalId,
+            NestedCarrierRelay = relay,
+        };
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            terminalResponse,
+            fixture.Binding).Accepted);
         Assert.Equal(
-            SidecarCapabilityErrors.SpoofedIdentity,
-            SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
-                rootRequest,
-                terminalRequest with
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                terminalResponse with
                 {
                     NestedCarrierRelay = relay! with
                     {
                         Carrier = relay!.Carrier with { ActionContentHash = "changed" },
                     },
                 },
-                fixture.Binding,
-                fixture.Now,
-                (_, _) => true).Code);
+                fixture.Binding).Code);
 
         var childRequest = SidecarActionCapabilityRequest.HostEntryNested(
             relay.Call,
@@ -3106,7 +3122,7 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Now).Accepted);
 
         Assert.Equal(
-            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityErrors.InvalidBinding,
             fixture.Session.IssueNestedHostActionEntryRelay(
                 parentCall,
                 nestedRequest,
@@ -3180,15 +3196,14 @@ public sealed class SidecarCapabilityTransportTests
                 descriptor.InputSchemaVersion,
                 descriptor.ResultTypeIdentity,
                 descriptor.ResultSchemaVersion,
-                descriptor.DescriptorHash)) with
-        {
-            NestedCarrierRequest = child,
-        };
+                descriptor.DescriptorHash));
         Assert.True(fixture.Session.BeginActionCall(request, action.ByteLength, fixture.Now, out _).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.InvalidBinding,
             fixture.Session.IssueNestedHostActionEntryRelay(parentCall, child, fixture.Now, out _).Code);
-        Assert.True(fixture.Session.RevokeNestedHostActionEntryRelay(parentCall.CallId, fixture.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Duplicate,
+            fixture.Session.RevokeNestedHostActionEntryRelay(parentCall.CallId, fixture.Now).Code);
         var receipt = new SidecarTerminalReceipt(
             "revoke-receipt",
             descriptor.Key,
@@ -3199,6 +3214,159 @@ public sealed class SidecarCapabilityTransportTests
             action.ContentHash);
         Assert.True(fixture.Session.RecordTerminal(parentCall.CallId, Guid.NewGuid(), receipt).Accepted);
         Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
+    public async Task Public_host_entry_requests_nested_carrier_during_terminal_execution()
+    {
+        var fixture = CreateFixture(maxInFlight: 4, maxCalls: 8);
+        var rootDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("root.runtime"),
+            1,
+            "kernel",
+            typeof(string).AssemblyQualifiedName!,
+            "root-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "root-result",
+            1,
+            "root-runtime-descriptor");
+        var childDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("child.runtime"),
+            1,
+            "module",
+            typeof(string).AssemblyQualifiedName!,
+            "child-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "child-result",
+            1,
+            "child-runtime-descriptor");
+        var rootAction = Payload(rootDescriptor.InputTypeIdentity, "root");
+        var childAction = Payload(childDescriptor.InputTypeIdentity, "child");
+        var rootContext = IssueContext(
+            fixture,
+            new RequestPrincipal("runtime-caller"),
+            HostActionEntryIngress.Tool,
+            lineage: new HostActionEntryLineage(
+                rootDescriptor.Key,
+                rootDescriptor.Version,
+                rootDescriptor.DescriptorHash,
+                rootDescriptor.InputTypeIdentity,
+                rootDescriptor.InputSchemaVersion,
+                rootDescriptor.InputSchemaHash,
+                null,
+                null));
+        var rootAuthority = ActivateContext(fixture, rootContext);
+        var parentCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "runtime-parent",
+            Sequence = 1,
+        };
+        var rootRequest = SidecarActionCapabilityRequest.HostEntry(
+            parentCall,
+            rootDescriptor,
+            rootAction,
+            new SidecarCancellationIdentity(parentCall.CancellationId, "runtime-cancel", parentCall.Deadline),
+            parentCall.Deadline,
+            rootContext,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                rootDescriptor.InputTypeIdentity,
+                rootDescriptor.InputSchemaVersion,
+                rootDescriptor.ResultTypeIdentity,
+                rootDescriptor.ResultSchemaVersion,
+                rootDescriptor.DescriptorHash));
+        Assert.True(fixture.Session.BeginActionCall(rootRequest, rootAction.ByteLength, fixture.Now, out _).Accepted);
+        var rootReceipt = new SidecarTerminalReceipt(
+            "runtime-parent-receipt",
+            rootDescriptor.Key,
+            rootDescriptor.Version,
+            parentCall.CallId,
+            1,
+            "runtime-scope",
+            rootAction.ContentHash);
+        Assert.True(fixture.Session.RecordTerminal(parentCall.CallId, Guid.NewGuid(), rootReceipt).Accepted);
+        var contribution = new HostActionEntryContribution(
+            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "module-a", "module-b"),
+            new HostActionEntryLineage(
+                childDescriptor.Key,
+                childDescriptor.Version,
+                childDescriptor.DescriptorHash,
+                childDescriptor.InputTypeIdentity,
+                childDescriptor.InputSchemaVersion,
+                childDescriptor.InputSchemaHash,
+                null,
+                null));
+        var nestedRequest = new SidecarNestedHostActionEntryRequest(
+            childDescriptor,
+            childAction,
+            contribution,
+            fixture.Now.AddSeconds(20),
+            fixture.Now.AddSeconds(20));
+        var terminalRequest = CreateTerminalRequest(
+            fixture,
+            rootRequest,
+            new ActionPipelineSnapshot("runtime-graph", []));
+        var transport = new RuntimeNestedTransport(fixture, rootRequest, terminalRequest);
+        var entry = new RuntimeNestedHostActionEntryProxy(transport, childDescriptor, contribution);
+        var parentContext = new ActionContext<string>(
+            rootContext.InvocationId,
+            rootContext.ParentInvocationId,
+            rootContext.TraceId,
+            rootContext.IdempotencyKey,
+            rootContext.Depth,
+            rootContext.Attempt,
+            rootContext.Deadline,
+            rootDescriptor.Key,
+            fixture.Binding.ModuleId,
+            rootContext.Caller,
+            "root",
+            rootContext.Features,
+            new ActionPipelineSnapshot("runtime-graph", []))
+        {
+            HostActionEntry = entry,
+        };
+        var nested = new HostActionEntryNestedRequest<string, string, string>(
+            childDescriptor.Key,
+            childDescriptor.Version,
+            "child",
+            parentContext);
+
+        var outcome = await entry.InvokeNestedAsync(
+            nested,
+            new RecordingHostActionEntryTerminal<string, string>());
+
+        Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
+        Assert.Equal(1, transport.NestedRequests);
+        Assert.Equal(1, transport.ActionCalls);
+        var unrelatedCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Storage,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "runtime-unrelated",
+            Sequence = 3,
+        };
+        Assert.True(fixture.Session.BeginCall(
+            unrelatedCall,
+            SidecarCapabilityKind.Storage,
+            null,
+            0,
+            fixture.Now).Accepted);
+        Assert.True(fixture.Session.CompleteCall(unrelatedCall.CallId, 0).Accepted);
+        var secondOutcome = await entry.InvokeNestedAsync(
+            nested,
+            new RecordingHostActionEntryTerminal<string, string>());
+        Assert.Equal(ActionOutcomeKind.Completed, secondOutcome.Kind);
+        Assert.Equal(2, transport.NestedRequests);
+        Assert.Equal(2, transport.ActionCalls);
+        Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 1).Accepted);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            rootAuthority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
     }
 
     private static SidecarActionCapabilityRequest SidecarCapabilityTransportValidationRequest(
@@ -3552,6 +3720,162 @@ public sealed class SidecarCapabilityTransportTests
 
             TransportValidated = true;
             return ValueTask.FromResult<IActionOutcome<string>>(new RecordedOutcome<string>(ActionOutcomeKind.Completed));
+        }
+    }
+
+    private sealed class RuntimeNestedTransport(
+        Fixture fixture,
+        SidecarActionCapabilityRequest parentRequest,
+        SidecarActionTerminalTransportRequest terminalRequest) : ISidecarCapabilityTransport
+    {
+        public int NestedRequests { get; private set; }
+        public int ActionCalls { get; private set; }
+
+        public ValueTask<SidecarStorageCapabilityResponse> InvokeStorageAsync(
+            SidecarStorageCapabilityRequest request,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public ValueTask<SidecarActionCapabilityResponse> InvokeActionAsync(
+            SidecarActionCapabilityRequest request,
+            CancellationToken ct = default)
+        {
+            ActionCalls++;
+            var begin = fixture.Session.BeginActionCall(
+                request,
+                request.Action.ByteLength,
+                fixture.Now,
+                out _);
+            Assert.True(begin.Accepted, begin.Message);
+            var receipt = new SidecarTerminalReceipt(
+                "runtime-child-receipt",
+                request.Descriptor.Key,
+                request.Descriptor.Version,
+                request.Call.CallId,
+                1,
+                "runtime-child-scope",
+                request.Action.ContentHash);
+            Assert.True(fixture.Session.RecordTerminal(request.Call.CallId, Guid.NewGuid(), receipt).Accepted);
+            Assert.True(fixture.Session.CompleteCall(request.Call.CallId, 1).Accepted);
+            var result = Payload(request.Descriptor.ResultTypeIdentity, "child-result");
+            return ValueTask.FromResult(new SidecarActionCapabilityResponse(
+                new SidecarActionResultIdentity(
+                    Guid.NewGuid(),
+                    request.Call.CallId,
+                    request.Descriptor.Key,
+                    request.Descriptor.Version,
+                    request.Descriptor.ResultTypeIdentity,
+                    result.ContentHash),
+                new SidecarActionOutcomeEnvelope(
+                    ActionOutcomeKind.Completed,
+                    result,
+                    null,
+                    null,
+                    null,
+                    receipt,
+                    fixture.SafeFailure,
+                    1),
+                null,
+                fixture.SafeFailure,
+                true));
+        }
+
+        public ValueTask<SidecarActionTerminalTransportResponse> InvokeActionTerminalAsync(
+            SidecarActionTerminalTransportRequest request,
+            CancellationToken ct = default)
+        {
+            NestedRequests++;
+            var nestedRequest = request.NestedCarrierRequest ?? throw new InvalidOperationException();
+            var issue = fixture.Session.IssueNestedHostActionEntryRelay(
+                request.Call,
+                nestedRequest,
+                fixture.Now,
+                out var relay);
+            Assert.True(issue.Accepted, issue.Message);
+            Assert.NotNull(relay);
+            var boundRequest = request with
+            {
+                Authority = request.Authority with { NestedCarrierRelay = relay },
+            };
+            boundRequest = boundRequest with
+            {
+                Authority = boundRequest.Authority with
+                {
+                    CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                        boundRequest.Authority),
+                },
+            };
+            Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+                parentRequest,
+                boundRequest,
+                fixture.Binding,
+                fixture.Now,
+                (_, _) => true).Accepted);
+            var response = new SidecarActionTerminalTransportResponse(
+                null,
+                new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
+                boundRequest.Receipt,
+                fixture.SafeFailure)
+            {
+                TerminalId = boundRequest.TerminalId,
+                NestedCarrierRelay = relay,
+            };
+            Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                boundRequest,
+                response,
+                fixture.Binding).Accepted);
+            return ValueTask.FromResult(response);
+        }
+
+        public SidecarActionTerminalTransportRequest CreateNestedTerminalRequest(
+            SidecarNestedHostActionEntryRequest nestedRequest) =>
+            terminalRequest with { NestedCarrierRequest = nestedRequest };
+    }
+
+    private sealed class RuntimeNestedHostActionEntryProxy(
+        RuntimeNestedTransport transport,
+        SidecarActionDescriptorIdentity descriptor,
+        HostActionEntryContribution contribution) : IHostActionEntry
+    {
+        public ValueTask<IActionOutcome<TResult>> InvokeAsync<TAction, TResult>(
+            HostActionEntryRequest<TAction, TResult> request,
+            IHostActionEntryTerminal<TAction, TResult> terminal,
+            CancellationToken cancellationToken = default) =>
+            ValueTask.FromException<IActionOutcome<TResult>>(
+                new NotSupportedException("The runtime nested test uses the nested entry only."));
+
+        public async ValueTask<IActionOutcome<TResult>> InvokeNestedAsync<TParentAction, TAction, TResult>(
+            HostActionEntryNestedRequest<TParentAction, TAction, TResult> request,
+            IHostActionEntryTerminal<TAction, TResult> terminal,
+            CancellationToken cancellationToken = default)
+        {
+            var action = Payload(descriptor.InputTypeIdentity, request.Action);
+            var nestedRequest = new SidecarNestedHostActionEntryRequest(
+                descriptor,
+                action,
+                contribution,
+                request.ParentContext.Deadline,
+                request.ParentContext.Deadline);
+            var terminalResponse = await transport.InvokeActionTerminalAsync(
+                transport.CreateNestedTerminalRequest(nestedRequest),
+                cancellationToken);
+            var relay = terminalResponse.NestedCarrierRelay ?? throw new InvalidOperationException();
+            var childRequest = SidecarActionCapabilityRequest.HostEntryNested(
+                relay.Call,
+                descriptor,
+                action,
+                new SidecarCancellationIdentity(relay.Call.CancellationId, "runtime-child-cancel", relay.Call.Deadline),
+                relay.Call.Deadline,
+                relay.Carrier,
+                new SidecarActionTerminalRegistration(
+                    Guid.NewGuid(),
+                    descriptor.InputTypeIdentity,
+                    descriptor.InputSchemaVersion,
+                    descriptor.ResultTypeIdentity,
+                    descriptor.ResultSchemaVersion,
+                    descriptor.DescriptorHash));
+            var response = await transport.InvokeActionAsync(childRequest, cancellationToken);
+            return new RecordedOutcome<TResult>(response.Outcome.Kind);
         }
     }
 
