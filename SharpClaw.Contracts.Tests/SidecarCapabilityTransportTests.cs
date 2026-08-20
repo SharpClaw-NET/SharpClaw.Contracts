@@ -2981,7 +2981,7 @@ public sealed class SidecarCapabilityTransportTests
             childAction,
             contribution,
             fixture.Now.AddSeconds(20),
-            fixture.Now.AddSeconds(20));
+            fixture.Now.AddSeconds(25));
         var rootRequest = SidecarActionCapabilityRequest.HostEntry(
             parentCall,
             rootDescriptor,

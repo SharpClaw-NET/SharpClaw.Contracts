@@ -2635,7 +2635,7 @@ public static class SidecarCapabilityTransportValidation
                   ComputeTerminalAuthorityBindingHash(nestedAuthority)) &&
               (nestedKind == SidecarNestedHostActionEntryRelayOutcomeKind.Issued
                   ? response.NestedCarrierRelay is not null &&
-                    MatchesNestedRelay(request, response.NestedCarrierRelay) &&
+                    MatchesNestedRelay(request, response.NestedCarrierRelay, binding) &&
                     nestedOutcome.Failure is null
                   : response.NestedCarrierRelay is null &&
                     nestedOutcome.Failure is not null &&
@@ -3040,8 +3040,10 @@ public static class SidecarCapabilityTransportValidation
 
     private static bool MatchesNestedRelay(
         SidecarActionTerminalTransportRequest request,
-        SidecarNestedHostActionEntryRelay relay) =>
+        SidecarNestedHostActionEntryRelay relay,
+        SidecarCapabilitySessionBinding binding) =>
         request.NestedCarrierRequest is not null &&
+        request.Context is not null &&
         relay.IsWellFormed &&
         relay.Carrier.ParentCallId == request.Call.CallId &&
         relay.Call.SessionId == request.Call.SessionId &&
@@ -3055,7 +3057,13 @@ public static class SidecarCapabilityTransportValidation
         string.Equals(relay.Carrier.DescriptorHash, request.NestedCarrierRequest.Descriptor.DescriptorHash, StringComparison.Ordinal) &&
         string.Equals(relay.Carrier.ActionContentHash, request.NestedCarrierRequest.Action.ContentHash, StringComparison.OrdinalIgnoreCase) &&
         relay.Carrier.ActionByteLength == request.NestedCarrierRequest.Action.ByteLength &&
-        relay.Carrier.ExpiresAt == request.NestedCarrierRequest.ExpiresAt &&
+        relay.Carrier.ExpiresAt == new[]
+        {
+            request.NestedCarrierRequest.Deadline,
+            request.Call.Deadline,
+            request.Authority.ExpiresAt,
+            binding.ExpiresAt,
+        }.Min() &&
         relay.Call.CallId == relay.Carrier.CallId;
 
     private static bool SameNestedRelay(
