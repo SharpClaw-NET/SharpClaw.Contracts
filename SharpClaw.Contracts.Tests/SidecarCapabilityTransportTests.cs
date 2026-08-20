@@ -2491,6 +2491,335 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Now).Accepted);
     }
 
+    [Fact]
+    public void Session_issues_and_consumes_one_nested_carrier_through_action_call()
+    {
+        var fixture = CreateFixture(maxInFlight: 3, maxCalls: 4);
+        var rootLineage = new HostActionEntryLineage(
+            new SharpClawActionKey("parent.action"),
+            1,
+            "parent-descriptor",
+            typeof(string).AssemblyQualifiedName!,
+            1,
+            "parent-input",
+            null,
+            null);
+        var rootContext = IssueContext(
+            fixture,
+            new RequestPrincipal("parent-caller", Roles: new HashSet<string>(["reader"])),
+            HostActionEntryIngress.Cli,
+            lineage: rootLineage);
+        var rootAuthority = ActivateContext(fixture, rootContext);
+        var parentCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "parent-call",
+            Sequence = 1,
+        };
+        var parentPayload = Payload(typeof(string).AssemblyQualifiedName!, "parent");
+        Assert.True(fixture.Session.BeginCall(
+            parentCall,
+            SidecarCapabilityKind.Action,
+            parentPayload,
+            parentPayload.ByteLength,
+            fixture.Now,
+            rootContext).Accepted);
+
+        var childDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("child.action"),
+            1,
+            "child",
+            typeof(string).AssemblyQualifiedName!,
+            "child-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "child-result",
+            1,
+            "child-descriptor");
+        var childAction = Payload(typeof(string).AssemblyQualifiedName!, "child");
+        var contribution = new HostActionEntryContribution(
+            new HostActionEntryIngressBinding(
+                HostActionEntryIngress.CrossModule,
+                "module-a",
+                "target-module"),
+            new HostActionEntryLineage(
+                childDescriptor.Key,
+                childDescriptor.Version,
+                childDescriptor.DescriptorHash,
+                childDescriptor.InputTypeIdentity,
+                childDescriptor.InputSchemaVersion,
+                childDescriptor.InputSchemaHash,
+                null,
+                null));
+        var childCall = parentCall with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "child-call",
+            Sequence = 2,
+            Deadline = fixture.Now.AddSeconds(30),
+        };
+        var issued = fixture.Session.IssueNestedHostActionEntryCarrier(
+            parentCall,
+            childCall,
+            childDescriptor,
+            childAction,
+            contribution,
+            fixture.Now,
+            out var carrier);
+
+        Assert.True(issued.Accepted, issued.Message);
+        Assert.NotNull(carrier);
+        Assert.True(carrier!.IsWellFormed);
+        Assert.Equal(parentCall.CallId, carrier.ParentCallId);
+        Assert.Equal(childCall.CallId, carrier.CallId);
+        var roundTrip = SidecarCapabilityTransportCodec.Deserialize<SidecarNestedHostActionEntryCarrier>(
+            SidecarCapabilityTransportCodec.Serialize(carrier));
+        Assert.Equal(carrier, roundTrip);
+
+        var request = SidecarActionCapabilityRequest.HostEntryNested(
+            childCall,
+            childDescriptor,
+            childAction,
+            new SidecarCancellationIdentity(
+                childCall.CancellationId,
+                "child-cancellation",
+                childCall.Deadline),
+            childCall.Deadline,
+            carrier,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                childDescriptor.InputTypeIdentity,
+                childDescriptor.InputSchemaVersion,
+                childDescriptor.ResultTypeIdentity,
+                childDescriptor.ResultSchemaVersion,
+                childDescriptor.DescriptorHash));
+        var begun = fixture.Session.BeginActionCall(
+            request,
+            childAction.ByteLength,
+            fixture.Now,
+            out var childContext);
+
+        Assert.True(begun.Accepted, begun.Message);
+        Assert.NotNull(childContext);
+        Assert.Equal(rootContext.InvocationId, childContext!.ParentInvocationId);
+        Assert.Equal(rootContext.Depth + 1, childContext.Depth);
+        Assert.Equal(rootContext.Attempt, childContext.Attempt);
+        Assert.Equal(rootContext.TraceId, childContext.TraceId);
+        Assert.Equal(rootContext.IdempotencyKey, childContext.IdempotencyKey);
+        Assert.Equal(rootContext.Caller.SubjectId, childContext.Caller.SubjectId);
+        Assert.Equal(carrier.CarrierId, childContext.CapabilityId);
+        Assert.Null(request.HostContext);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.CompleteCall(parentCall.CallId, 0).Code);
+        Assert.True(fixture.Session.CompleteCall(childCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            rootAuthority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            fixture.Now).Accepted);
+
+        var replay = fixture.Session.BeginActionCall(
+            request,
+            childAction.ByteLength,
+            fixture.Now,
+            out _);
+        Assert.Equal(SidecarCapabilityErrors.Replay, replay.Code);
+    }
+
+    [Fact]
+    public void Nested_carrier_rejects_changed_payload_and_releases_on_parent_completion()
+    {
+        var fixture = CreateFixture(maxInFlight: 2, maxCalls: 4);
+        var rootContext = IssueContext(
+            fixture,
+            new RequestPrincipal("parent-caller"),
+            HostActionEntryIngress.Cli,
+            lineage: new HostActionEntryLineage(
+                new SharpClawActionKey("parent.action"),
+                1,
+                "parent-descriptor",
+                typeof(string).AssemblyQualifiedName!,
+                1,
+                "parent-input",
+                null,
+                null));
+        ActivateContext(fixture, rootContext);
+        var parentCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "parent-release",
+            Sequence = 1,
+        };
+        var parentPayload = Payload(typeof(string).AssemblyQualifiedName!, "parent");
+        Assert.True(fixture.Session.BeginCall(
+            parentCall,
+            SidecarCapabilityKind.Action,
+            parentPayload,
+            parentPayload.ByteLength,
+            fixture.Now,
+            rootContext).Accepted);
+        var descriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("child.release"),
+            1,
+            "child",
+            typeof(string).AssemblyQualifiedName!,
+            "child-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "child-result",
+            1,
+            "child-release-descriptor");
+        var action = Payload(typeof(string).AssemblyQualifiedName!, "child");
+        var contribution = new HostActionEntryContribution(
+            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "module-a", "target-module"),
+            new HostActionEntryLineage(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                null,
+                null));
+        var childCall = parentCall with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "child-release",
+            Sequence = 2,
+        };
+        Assert.True(fixture.Session.IssueNestedHostActionEntryCarrier(
+            parentCall,
+            childCall,
+            descriptor,
+            action,
+            contribution,
+            fixture.Now,
+            out var carrier).Accepted);
+
+        var changed = SidecarActionCapabilityRequest.HostEntryNested(
+            childCall,
+            descriptor,
+            Payload(typeof(string).AssemblyQualifiedName!, "changed"),
+            new SidecarCancellationIdentity(childCall.CancellationId, "cancel", childCall.Deadline),
+            childCall.Deadline,
+            carrier!,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.ResultTypeIdentity,
+                descriptor.ResultSchemaVersion,
+                descriptor.DescriptorHash));
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.BeginActionCall(changed, changed.Action.ByteLength, fixture.Now, out _).Code);
+
+        Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            fixture.Session.BeginNestedHostActionEntryCall(
+                carrier!,
+                childCall,
+                action,
+                action.ByteLength,
+                fixture.Now,
+                out _).Code);
+    }
+
+    [Fact]
+    public void Nested_carrier_rotation_and_expiry_revoke_unused_authority()
+    {
+        var fixture = CreateFixture(maxInFlight: 2, maxCalls: 4);
+        var rootContext = IssueContext(
+            fixture,
+            new RequestPrincipal("parent-caller"),
+            HostActionEntryIngress.Cli,
+            lineage: new HostActionEntryLineage(
+                new SharpClawActionKey("parent.action"),
+                1,
+                "parent-descriptor",
+                typeof(string).AssemblyQualifiedName!,
+                1,
+                "parent-input",
+                null,
+                null));
+        ActivateContext(fixture, rootContext);
+        var parentCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "parent-expiry",
+            Sequence = 1,
+        };
+        var parentPayload = Payload(typeof(string).AssemblyQualifiedName!, "parent");
+        Assert.True(fixture.Session.BeginCall(
+            parentCall,
+            SidecarCapabilityKind.Action,
+            parentPayload,
+            parentPayload.ByteLength,
+            fixture.Now,
+            rootContext).Accepted);
+        var descriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("child.expiry"),
+            1,
+            "child",
+            typeof(string).AssemblyQualifiedName!,
+            "child-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "child-result",
+            1,
+            "child-expiry-descriptor");
+        var action = Payload(typeof(string).AssemblyQualifiedName!, "child");
+        var contribution = new HostActionEntryContribution(
+            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "module-a", "target-module"),
+            new HostActionEntryLineage(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                null,
+                null));
+        var childCall = parentCall with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "child-expiry",
+            Sequence = 2,
+            Deadline = fixture.Now.AddSeconds(1),
+        };
+        Assert.True(fixture.Session.IssueNestedHostActionEntryCarrier(
+            parentCall,
+            childCall,
+            descriptor,
+            action,
+            contribution,
+            fixture.Now,
+            out var carrier).Accepted);
+        var rotated = CreateRotatedBinding(fixture, "nested-rotation");
+        fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.RotateBinding(rotated, fixture.Now).Code);
+        Assert.Equal(
+            1,
+            fixture.Session.SweepExpiredHostActionEntryCarriers(fixture.Now.AddSeconds(2)));
+        Assert.Equal(1, fixture.Session.ActiveHostActionEntryCarrierCount);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            fixture.Session.BeginNestedHostActionEntryCall(
+                carrier!,
+                childCall,
+                action,
+                action.ByteLength,
+                fixture.Now.AddSeconds(2),
+                out _).Code);
+    }
+
     private static SidecarActionCapabilityRequest SidecarCapabilityTransportValidationRequest(
         SidecarCapabilityCallIdentity call,
         SidecarActionDescriptorIdentity descriptor,

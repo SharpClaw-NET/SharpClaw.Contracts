@@ -182,6 +182,9 @@ public sealed class SidecarCapabilitySession
     private readonly Dictionary<Guid, SidecarSerializedPayload?> _callPayloads = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _issuedEntryContexts = [];
     private readonly Dictionary<Guid, HostActionEntryCarrierAuthority> _activeEntryCarriers = [];
+    private readonly Dictionary<Guid, NestedCarrierState> _nestedCarrierStates = [];
+    private readonly HashSet<Guid> _nestedCarrierIds = [];
+    private readonly Dictionary<Guid, Guid> _nestedCarrierParents = [];
     private readonly Dictionary<Guid, CarrierReplayTombstone> _completedEntryCarriers = [];
     private readonly HashSet<Guid> _consumedEntryCarriers = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _callEntryContexts = [];
@@ -199,6 +202,15 @@ public sealed class SidecarCapabilitySession
     private sealed record CarrierReplayTombstone(
         long BindingGeneration,
         DateTimeOffset RetainUntil);
+
+    private sealed record NestedCarrierState(
+        SidecarNestedHostActionEntryCarrier Carrier,
+        SidecarCapabilityCallIdentity ParentCall,
+        SidecarCapabilityCallIdentity Call,
+        SidecarActionDescriptorIdentity Descriptor,
+        SidecarSerializedPayload Action,
+        HostActionEntryRequestContext Context,
+        HostActionEntryCarrierAuthority Authority);
 
     private static readonly TimeSpan CarrierReplayRetention = TimeSpan.FromMinutes(5);
 
@@ -462,6 +474,294 @@ public sealed class SidecarCapabilitySession
         }
     }
 
+    public SidecarCapabilityValidationResult IssueNestedHostActionEntryCarrier(
+        SidecarCapabilityCallIdentity parentCall,
+        SidecarCapabilityCallIdentity nestedCall,
+        SidecarActionDescriptorIdentity descriptor,
+        SidecarSerializedPayload action,
+        HostActionEntryContribution contribution,
+        DateTimeOffset now,
+        out SidecarNestedHostActionEntryCarrier? carrier)
+    {
+        carrier = null;
+
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            if (!_calls.TryGetValue(parentCall.CallId, out var parentCapability) ||
+                parentCapability != SidecarCapabilityKind.Action ||
+                !_callIdentities.TryGetValue(parentCall.CallId, out var activeParentCall) ||
+                activeParentCall != parentCall ||
+                !_callEntryContexts.TryGetValue(parentCall.CallId, out var parentContext) ||
+                !_activeEntryCarriers.TryGetValue(parentContext.CapabilityId, out var parentCarrier) ||
+                !MatchesCarrierContext(parentContext, parentCarrier))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The nested host action parent call is not active and authenticated.");
+            }
+
+            if (!nestedCall.IsValid ||
+                nestedCall.Capability != SidecarCapabilityKind.Action ||
+                nestedCall.SessionId != Binding.SessionId ||
+                nestedCall.RequestId != Binding.RequestId ||
+                nestedCall.CancellationId != Binding.CancellationId ||
+                !string.Equals(nestedCall.ModuleId, Binding.ModuleId, StringComparison.Ordinal) ||
+                !string.Equals(nestedCall.GraphId, Binding.GraphId, StringComparison.Ordinal) ||
+                nestedCall.Sequence != _lastSequence + 1 ||
+                nestedCall.Deadline > parentCall.Deadline ||
+                nestedCall.Deadline > parentContext.Deadline ||
+                nestedCall.Deadline <= now ||
+                _totalCalls + _nestedCarrierStates.Count >= Binding.ConcurrencyLimits.MaximumCallsPerRequest ||
+                _inFlight + _nestedCarrierStates.Count >= Binding.ConcurrencyLimits.MaximumInFlightCalls ||
+                _nestedCarrierStates.Values.Any(state =>
+                    string.Equals(state.Call.ReplayNonce, nestedCall.ReplayNonce, StringComparison.Ordinal)))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The nested host action call is outside the parent authority.");
+            }
+
+            var payloadResult = SidecarCapabilityTransportValidation.ValidateSerializedPayload(
+                action,
+                required: true,
+                Binding.PayloadLimits.ActionInputBytes);
+            if (!payloadResult.Accepted)
+                return payloadResult;
+
+            if (descriptor is null ||
+                descriptor.Key.Value is null ||
+                string.IsNullOrWhiteSpace(descriptor.Key.Value) ||
+                descriptor.Version < 1 ||
+                string.IsNullOrWhiteSpace(descriptor.Category) ||
+                string.IsNullOrWhiteSpace(descriptor.InputTypeIdentity) ||
+                descriptor.InputSchemaVersion < 1 ||
+                string.IsNullOrWhiteSpace(descriptor.InputSchemaHash) ||
+                string.IsNullOrWhiteSpace(descriptor.ResultTypeIdentity) ||
+                descriptor.ResultSchemaVersion < 1 ||
+                string.IsNullOrWhiteSpace(descriptor.ResultSchemaHash) ||
+                string.IsNullOrWhiteSpace(descriptor.DescriptorHash) ||
+                !string.Equals(action.TypeIdentity, descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
+                action.SchemaVersion != descriptor.InputSchemaVersion ||
+                !contribution.IsWellFormed ||
+                !string.Equals(contribution.Lineage.ActionKey.Value, descriptor.Key.Value, StringComparison.Ordinal) ||
+                contribution.Lineage.ActionVersion != descriptor.Version ||
+                !string.Equals(contribution.Lineage.DescriptorHash, descriptor.DescriptorHash, StringComparison.Ordinal) ||
+                !string.Equals(contribution.Lineage.InputTypeIdentity, descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
+                contribution.Lineage.InputSchemaVersion != descriptor.InputSchemaVersion ||
+                !string.Equals(contribution.Lineage.InputSchemaHash, descriptor.InputSchemaHash, StringComparison.Ordinal))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The nested host action descriptor is not authorized by its contribution.");
+            }
+
+            var expiresAt = new[]
+            {
+                nestedCall.Deadline,
+                parentCall.Deadline,
+                parentContext.ExpiresAt,
+                Binding.ExpiresAt,
+            }.Min();
+            if (expiresAt <= now || parentContext.Depth == int.MaxValue)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Expired,
+                    "The nested host action carrier has no valid lifetime.");
+            }
+
+            var capabilityId = Guid.NewGuid();
+            var handle = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+            var boundContribution = contribution with
+            {
+                Lineage = contribution.Lineage with
+                {
+                    PayloadContentHash = action.ContentHash,
+                    PayloadByteLength = action.ByteLength,
+                },
+            };
+            var childContext = new HostActionEntryRequestContext(
+                capabilityId,
+                handle,
+                boundContribution.IngressBinding.Ingress,
+                Guid.NewGuid(),
+                Binding.RequestId,
+                Binding.CancellationId,
+                parentContext.Caller,
+                parentContext.Features,
+                parentContext.TraceId,
+                parentContext.IdempotencyKey,
+                expiresAt,
+                expiresAt)
+            {
+                Contribution = boundContribution,
+                ParentInvocationId = parentContext.InvocationId,
+                Depth = parentContext.Depth + 1,
+                Attempt = parentContext.Attempt,
+            };
+            var carrierIdentity = new HostActionEntryCarrierIdentity(
+                childContext.Ingress,
+                childContext.InvocationId,
+                boundContribution.IngressBinding);
+            var carrierAuthority = new HostActionEntryCarrierAuthority(
+                Binding.ModuleId,
+                Binding.GraphId,
+                Binding.SessionId,
+                Binding.RequestId,
+                Binding.CancellationId,
+                capabilityId,
+                carrierIdentity,
+                _bindingGeneration,
+                now,
+                expiresAt,
+                HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(handle));
+            carrier = new SidecarNestedHostActionEntryCarrier(
+                capabilityId,
+                handle,
+                parentCall.CallId,
+                nestedCall.CallId,
+                childContext.InvocationId,
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                action.ContentHash,
+                action.ByteLength,
+                _bindingGeneration,
+                expiresAt);
+            _activeEntryCarriers.Add(capabilityId, carrierAuthority);
+            _nestedCarrierStates.Add(
+                capabilityId,
+                new NestedCarrierState(
+                    carrier,
+                    parentCall,
+                    nestedCall,
+                    descriptor,
+                    action,
+                    childContext,
+                    carrierAuthority));
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult BeginNestedHostActionEntryCall(
+        SidecarNestedHostActionEntryCarrier carrier,
+        SidecarCapabilityCallIdentity call,
+        SidecarSerializedPayload action,
+        int frameByteLength,
+        DateTimeOffset now,
+        out HostActionEntryRequestContext? hostContext)
+    {
+        hostContext = null;
+
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            if (carrier is null ||
+                !carrier.IsWellFormed ||
+                !_nestedCarrierStates.TryGetValue(carrier.CarrierId, out var state))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The nested host action carrier is unknown or already consumed.");
+            }
+
+            if (state.Carrier != carrier ||
+                state.Call != call ||
+                action is null ||
+                state.Descriptor.Key != carrier.ActionKey ||
+                state.Descriptor.Version != carrier.ActionVersion ||
+                !string.Equals(state.Descriptor.DescriptorHash, carrier.DescriptorHash, StringComparison.Ordinal) ||
+                !string.Equals(state.Action.ContentHash, carrier.ActionContentHash, StringComparison.OrdinalIgnoreCase) ||
+                state.Action.ByteLength != carrier.ActionByteLength ||
+                !string.Equals(action.ContentHash, state.Action.ContentHash, StringComparison.OrdinalIgnoreCase) ||
+                action.ByteLength != state.Action.ByteLength ||
+                carrier.ExpiresAt <= now)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The nested host action carrier does not match its issued authority.");
+            }
+
+            var result = BeginCall(
+                call,
+                SidecarCapabilityKind.Action,
+                action,
+                frameByteLength,
+                now,
+                state.Context);
+            if (!result.Accepted)
+                return result;
+
+            _nestedCarrierStates.Remove(carrier.CarrierId);
+            _nestedCarrierIds.Add(carrier.CarrierId);
+            _nestedCarrierParents.Add(carrier.CarrierId, state.ParentCall.CallId);
+            hostContext = _callEntryContexts[call.CallId];
+            return result;
+        }
+    }
+
+    public SidecarCapabilityValidationResult BeginActionCall(
+        SidecarActionCapabilityRequest request,
+        int frameByteLength,
+        DateTimeOffset now,
+        out HostActionEntryRequestContext? hostContext)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        hostContext = null;
+
+        var requestResult = SidecarCapabilityTransportValidation.ValidateActionRequest(
+            request,
+            Binding,
+            now);
+        if (!requestResult.Accepted)
+            return requestResult;
+
+        if (request.Invocation == SidecarActionInvocationKind.HostEntry &&
+            request.NestedCarrier is not null)
+        {
+            return BeginNestedHostActionEntryCall(
+                request.NestedCarrier,
+                request.Call,
+                request.Action,
+                frameByteLength,
+                now,
+                out hostContext);
+        }
+
+        var result = BeginCall(
+            request.Call,
+            SidecarCapabilityKind.Action,
+            request.Action,
+            frameByteLength,
+            now,
+            request.HostContext);
+        if (result.Accepted && request.HostContext is not null)
+            hostContext = request.HostContext;
+
+        return result;
+    }
+
     public SidecarCapabilityValidationResult CompleteHostActionEntryCarrier(
         HostActionEntryCarrierAuthority authority,
         HostActionEntryCarrierCompletionKind completion,
@@ -574,7 +874,7 @@ public sealed class SidecarCapabilitySession
                     SidecarCapabilityErrors.InvalidBinding,
                     "The capability session cannot rotate while a capability call is active.");
 
-            if (_issuedEntryContexts.Count != 0)
+            if (_issuedEntryContexts.Count != 0 || _nestedCarrierStates.Count != 0)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.InvalidBinding,
                     "The capability session cannot rotate while a carrier context is pending activation.");
@@ -610,6 +910,9 @@ public sealed class SidecarCapabilitySession
             _nonces.Clear();
             _completedCalls.Clear();
             _completedEntryCarriers.Clear();
+            _nestedCarrierStates.Clear();
+            _nestedCarrierIds.Clear();
+            _nestedCarrierParents.Clear();
             return SidecarCapabilityValidationResult.Accept();
         }
     }
@@ -947,6 +1250,11 @@ public sealed class SidecarCapabilitySession
                     SidecarCapabilityErrors.InvalidBinding,
                     "The terminal call count must be zero or one.");
 
+            if (_nestedCarrierParents.Values.Contains(callId))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "A parent action cannot complete while a nested action is active.");
+
             if (capability == SidecarCapabilityKind.Action &&
                 _terminalCalls.ContainsKey(callId) != (terminalCallCount == 1))
                 return SidecarCapabilityValidationResult.Reject(
@@ -957,6 +1265,13 @@ public sealed class SidecarCapabilitySession
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.InvalidBinding,
                     "Storage calls cannot complete with a terminal callback.");
+
+            if (_callEntryContexts.TryGetValue(callId, out var completedContext))
+            {
+                RevokeNestedCarriersForParent(callId, DateTimeOffset.UtcNow);
+                if (_nestedCarrierIds.Remove(completedContext.CapabilityId))
+                    RemoveEntryCarrier(completedContext.CapabilityId, DateTimeOffset.UtcNow);
+            }
 
             _calls.Remove(callId);
             _callIdentities.Remove(callId);
@@ -989,11 +1304,32 @@ public sealed class SidecarCapabilitySession
             .Select(pair => pair.Key)
             .ToArray())
         {
+            _nestedCarrierStates.Remove(capabilityId);
             RemoveEntryCarrier(capabilityId, now);
             removed++;
         }
 
+        foreach (var state in _nestedCarrierStates.Values
+            .Where(state => state.Carrier.ExpiresAt <= now)
+            .ToArray())
+        {
+            _nestedCarrierStates.Remove(state.Carrier.CarrierId);
+            RemoveEntryCarrier(state.Carrier.CarrierId, now);
+            removed++;
+        }
+
         return removed;
+    }
+
+    private void RevokeNestedCarriersForParent(Guid parentCallId, DateTimeOffset now)
+    {
+        foreach (var state in _nestedCarrierStates.Values
+            .Where(state => state.ParentCall.CallId == parentCallId)
+            .ToArray())
+        {
+            _nestedCarrierStates.Remove(state.Carrier.CarrierId);
+            RemoveEntryCarrier(state.Carrier.CarrierId, now);
+        }
     }
 
     private void RemoveEntryCarrier(Guid capabilityId, DateTimeOffset now)
@@ -1013,6 +1349,7 @@ public sealed class SidecarCapabilitySession
         }
 
         _consumedEntryCarriers.Remove(capabilityId);
+        _nestedCarrierParents.Remove(capabilityId);
     }
 
     private void RecordCarrierTombstone(
@@ -1098,6 +1435,9 @@ public sealed class SidecarCapabilitySession
             _callEntryContexts.Clear();
             _issuedEntryContexts.Clear();
             _activeEntryCarriers.Clear();
+            _nestedCarrierStates.Clear();
+            _nestedCarrierIds.Clear();
+            _nestedCarrierParents.Clear();
             _completedEntryCarriers.Clear();
             _consumedEntryCarriers.Clear();
             _terminalCalls.Clear();
@@ -1364,6 +1704,36 @@ public sealed record SidecarActionOutcomeEnvelope(
     SidecarSafeFailureIdentity SafeFailure,
     int TerminalCallCount);
 
+/// <summary>Opaque, one-use carrier issued by the host for one nested action.</summary>
+public sealed record SidecarNestedHostActionEntryCarrier(
+    Guid CarrierId,
+    string Handle,
+    Guid ParentCallId,
+    Guid CallId,
+    Guid InvocationId,
+    SharpClawActionKey ActionKey,
+    int ActionVersion,
+    string DescriptorHash,
+    string ActionContentHash,
+    int ActionByteLength,
+    long BindingGeneration,
+    DateTimeOffset ExpiresAt)
+{
+    public bool IsWellFormed =>
+        CarrierId != Guid.Empty &&
+        !string.IsNullOrWhiteSpace(Handle) &&
+        ParentCallId != Guid.Empty &&
+        CallId != Guid.Empty &&
+        InvocationId != Guid.Empty &&
+        !string.IsNullOrWhiteSpace(ActionKey.Value) &&
+        ActionVersion >= 1 &&
+        !string.IsNullOrWhiteSpace(DescriptorHash) &&
+        !string.IsNullOrWhiteSpace(ActionContentHash) &&
+        ActionByteLength > 0 &&
+        BindingGeneration > 0 &&
+        ExpiresAt > DateTimeOffset.MinValue;
+}
+
 public sealed record SidecarTerminalContinuationResponse(
     Guid ContinuationRequestId,
     bool Accepted,
@@ -1381,6 +1751,7 @@ public sealed record SidecarActionCapabilityRequest(
     DateTimeOffset Deadline)
 {
     public HostActionEntryRequestContext? HostContext { get; init; }
+    public SidecarNestedHostActionEntryCarrier? NestedCarrier { get; init; }
     public SidecarActionTerminalRegistration? Terminal { get; init; }
 
     public static SidecarActionCapabilityRequest HostEntry(
@@ -1402,6 +1773,28 @@ public sealed record SidecarActionCapabilityRequest(
             deadline)
         {
             HostContext = hostContext,
+            Terminal = terminal,
+        };
+
+    public static SidecarActionCapabilityRequest HostEntryNested(
+        SidecarCapabilityCallIdentity call,
+        SidecarActionDescriptorIdentity descriptor,
+        SidecarSerializedPayload action,
+        SidecarCancellationIdentity cancellation,
+        DateTimeOffset deadline,
+        SidecarNestedHostActionEntryCarrier carrier,
+        SidecarActionTerminalRegistration terminal) =>
+        new(
+            call,
+            SidecarActionInvocationKind.HostEntry,
+            descriptor,
+            action,
+            null,
+            cancellation,
+            null,
+            deadline)
+        {
+            NestedCarrier = carrier,
             Terminal = terminal,
         };
 }
@@ -1739,8 +2132,9 @@ public static class SidecarCapabilityTransportValidation
             (request.Snapshot is null || string.IsNullOrWhiteSpace(request.Snapshot.ContractHash)) ||
             hostEntry &&
             (request.Snapshot is not null ||
-             request.HostContext is null ||
-             !request.HostContext.IsWellFormed(now) ||
+             (request.HostContext is null) == (request.NestedCarrier is null) ||
+             request.HostContext is not null && !request.HostContext.IsWellFormed(now) ||
+             request.NestedCarrier is not null && !request.NestedCarrier.IsWellFormed ||
              request.Terminal is null ||
              !request.Terminal.IsWellFormed) ||
             !hostEntry && (request.HostContext is not null || request.Terminal is not null))
@@ -1757,8 +2151,8 @@ public static class SidecarCapabilityTransportValidation
         if (!payloadResult.Accepted)
             return payloadResult;
 
-        if (hostEntry &&
-            (request.HostContext!.Contribution?.Lineage is null ||
+        if (hostEntry && request.HostContext is not null &&
+            (request.HostContext.Contribution?.Lineage is null ||
              !string.Equals(request.HostContext.Contribution.Lineage.ActionKey.Value, request.Descriptor.Key.Value, StringComparison.Ordinal) ||
              request.HostContext.Contribution.Lineage.ActionVersion != request.Descriptor.Version ||
              !string.Equals(request.HostContext.Contribution.Lineage.DescriptorHash, request.Descriptor.DescriptorHash, StringComparison.Ordinal) ||
@@ -1775,6 +2169,25 @@ public static class SidecarCapabilityTransportValidation
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.SpoofedIdentity,
                 "The host action entry context does not bind to the descriptor and payload.");
+        }
+
+        if (hostEntry && request.NestedCarrier is not null &&
+            (request.NestedCarrier.CallId != request.Call.CallId ||
+             request.NestedCarrier.ActionKey != request.Descriptor.Key ||
+             request.NestedCarrier.ActionVersion != request.Descriptor.Version ||
+             !string.Equals(
+                 request.NestedCarrier.DescriptorHash,
+                 request.Descriptor.DescriptorHash,
+                 StringComparison.Ordinal) ||
+             !string.Equals(
+                 request.NestedCarrier.ActionContentHash,
+                 request.Action.ContentHash,
+                 StringComparison.OrdinalIgnoreCase) ||
+             request.NestedCarrier.ActionByteLength != request.Action.ByteLength))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The nested host action carrier does not bind to the descriptor and payload.");
         }
 
         if (hostEntry &&
@@ -1942,9 +2355,13 @@ public static class SidecarCapabilityTransportValidation
              initiatingRequest.Terminal.ResultSchemaVersion != initiatingRequest.Descriptor.ResultSchemaVersion ||
              !string.Equals(initiatingRequest.Terminal.DescriptorHash, initiatingRequest.Descriptor.DescriptorHash, StringComparison.Ordinal) ||
              request.TerminalId != initiatingRequest.Terminal.TerminalId ||
-             initiatingRequest.HostContext is null ||
-             request.Context is null ||
-             !MatchesInitiatingHostContext(initiatingRequest.HostContext, request)) ||
+             initiatingRequest.HostContext is null && initiatingRequest.NestedCarrier is null ||
+             initiatingRequest.HostContext is not null &&
+             (request.Context is null ||
+              !MatchesInitiatingHostContext(initiatingRequest.HostContext, request)) ||
+             initiatingRequest.NestedCarrier is not null &&
+             (request.Context is null ||
+              request.Context.InvocationId != initiatingRequest.NestedCarrier.InvocationId)) ||
             initiatingRequest.Invocation != SidecarActionInvocationKind.HostEntry &&
             request.TerminalId != Guid.Empty ||
             !ValidateHostTerminalAuthority(
