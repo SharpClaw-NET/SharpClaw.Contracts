@@ -3032,6 +3032,21 @@ public sealed class SidecarCapabilityTransportTests
             SidecarCapabilityErrors.InvalidBinding,
             fixture.Session.CompleteCall(parentCall.CallId, 1).Code);
 
+        var unrelatedBeforeChild = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Storage,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "relay-unrelated-before-child",
+            Sequence = 3,
+        };
+        Assert.True(fixture.Session.BeginCall(
+            unrelatedBeforeChild,
+            SidecarCapabilityKind.Storage,
+            null,
+            0,
+            fixture.Now).Accepted);
+        Assert.True(fixture.Session.CompleteCall(unrelatedBeforeChild.CallId, 0).Accepted);
+
         var terminalRequest = CreateTerminalRequest(
             fixture,
             rootRequest,
@@ -3110,11 +3125,73 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Now,
             out var childContext).Accepted);
         Assert.Equal(rootContext.InvocationId, childContext!.ParentInvocationId);
+        var childReceipt = new SidecarTerminalReceipt(
+            "relay-child-receipt",
+            childDescriptor.Key,
+            childDescriptor.Version,
+            relay.Call.CallId,
+            1,
+            "relay-child-scope",
+            childAction.ContentHash);
+        Assert.True(fixture.Session.RecordTerminal(
+            relay.Call.CallId,
+            Guid.NewGuid(),
+            childReceipt).Accepted);
+
+        var grandchildAction = Payload(childDescriptor.InputTypeIdentity, "grandchild");
+        var grandchildRequest = new SidecarNestedHostActionEntryRequest(
+            childDescriptor,
+            grandchildAction,
+            contribution,
+            fixture.Now.AddSeconds(20),
+            fixture.Now.AddSeconds(20));
+        Assert.True(fixture.Session.IssueNestedHostActionEntryRelay(
+            relay.Call,
+            grandchildRequest,
+            fixture.Now,
+            out var grandchildRelay).Accepted);
+        Assert.NotNull(grandchildRelay);
+        var grandchildCapabilityRequest = SidecarActionCapabilityRequest.HostEntryNested(
+            grandchildRelay!.Call,
+            childDescriptor,
+            grandchildAction,
+            new SidecarCancellationIdentity(
+                grandchildRelay.Call.CancellationId,
+                "relay-grandchild-cancel",
+                grandchildRelay.Call.Deadline),
+            grandchildRelay.Call.Deadline,
+            grandchildRelay.Carrier,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                childDescriptor.InputTypeIdentity,
+                childDescriptor.InputSchemaVersion,
+                childDescriptor.ResultTypeIdentity,
+                childDescriptor.ResultSchemaVersion,
+                childDescriptor.DescriptorHash));
+        Assert.True(fixture.Session.BeginActionCall(
+            grandchildCapabilityRequest,
+            grandchildAction.ByteLength,
+            fixture.Now,
+            out _).Accepted);
+        var grandchildReceipt = new SidecarTerminalReceipt(
+            "relay-grandchild-receipt",
+            childDescriptor.Key,
+            childDescriptor.Version,
+            grandchildRelay.Call.CallId,
+            1,
+            "relay-grandchild-scope",
+            grandchildAction.ContentHash);
+        Assert.True(fixture.Session.RecordTerminal(
+            grandchildRelay.Call.CallId,
+            Guid.NewGuid(),
+            grandchildReceipt).Accepted);
 
         Assert.Equal(
             SidecarCapabilityErrors.InvalidBinding,
             fixture.Session.CompleteCall(parentCall.CallId, 1).Code);
-        Assert.True(fixture.Session.CompleteCall(relay.Call.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(grandchildRelay.Call.CallId, 1).Accepted);
+        var childCompletion = fixture.Session.CompleteCall(relay.Call.CallId, 1);
+        Assert.True(childCompletion.Accepted, $"{childCompletion.Code}: {childCompletion.Message}");
         Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 1).Accepted);
         Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
             rootAuthority,
