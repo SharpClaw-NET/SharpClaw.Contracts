@@ -3057,6 +3057,7 @@ public sealed class SidecarCapabilityTransportTests
         var relayAuthority = terminalRequest.Authority with
         {
             NestedCarrierRelay = relay,
+            NestedCarrierOutcomeKind = SidecarNestedHostActionEntryRelayOutcomeKind.Issued,
             Proof = "relay-proof",
         };
         relayAuthority = relayAuthority with
@@ -3111,32 +3112,126 @@ public sealed class SidecarCapabilityTransportTests
                 },
                 fixture.Binding,
                 (_, _) => true).Code);
+
+        SidecarHostTerminalAuthority SignRelayOutcome(
+            SidecarNestedHostActionEntryRelayOutcomeKind kind,
+            string proof) =>
+            (terminalRequest.Authority with
+            {
+                NestedCarrierOutcomeKind = kind,
+                Proof = proof,
+            }) with
+            {
+                CanonicalBindingHash =
+                    SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                        terminalRequest.Authority with
+                        {
+                            NestedCarrierOutcomeKind = kind,
+                            Proof = proof,
+                        }),
+            };
+
+        var failedAuthority = SignRelayOutcome(
+            SidecarNestedHostActionEntryRelayOutcomeKind.Failed,
+            "failed-proof");
+        var failedResponse = terminalResponse with
+        {
+            NestedCarrierRelay = null,
+            NestedCarrierAuthority = failedAuthority,
+            NestedCarrierOutcome = new(
+                SidecarNestedHostActionEntryRelayOutcomeKind.Failed,
+                fixture.SafeFailure),
+            ResultIdentity = null,
+            Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
+        };
+        var failedWireResponse = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+            SidecarCapabilityTransportCodec.Serialize(failedResponse));
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
             terminalRequest,
-            terminalResponse with
-            {
-                NestedCarrierRelay = null,
-                NestedCarrierAuthority = null,
-                NestedCarrierOutcome = new(
-                    SidecarNestedHostActionEntryRelayOutcomeKind.Failed,
-                    fixture.SafeFailure),
-                ResultIdentity = null,
-                Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
-            },
-            fixture.Binding).Accepted);
+            failedWireResponse,
+            fixture.Binding,
+            (authority, bindingHash) => authority.Proof == "failed-proof" &&
+                bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Accepted);
+
+        var cancelledAuthority = SignRelayOutcome(
+            SidecarNestedHostActionEntryRelayOutcomeKind.Cancelled,
+            "cancelled-proof");
+        var cancelledResponse = terminalResponse with
+        {
+            NestedCarrierRelay = null,
+            NestedCarrierAuthority = cancelledAuthority,
+            NestedCarrierOutcome = new(
+                SidecarNestedHostActionEntryRelayOutcomeKind.Cancelled,
+                fixture.SafeFailure),
+            ResultIdentity = null,
+            Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
+        };
+        var cancelledWireResponse = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+            SidecarCapabilityTransportCodec.Serialize(cancelledResponse));
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
             terminalRequest,
-            terminalResponse with
-            {
-                NestedCarrierRelay = null,
-                NestedCarrierAuthority = null,
-                NestedCarrierOutcome = new(
-                    SidecarNestedHostActionEntryRelayOutcomeKind.Cancelled,
-                    fixture.SafeFailure),
-                ResultIdentity = null,
-                Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
-            },
-            fixture.Binding).Accepted);
+            cancelledWireResponse,
+            fixture.Binding,
+            (authority, bindingHash) => authority.Proof == "cancelled-proof" &&
+                bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Accepted);
+
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+                    SidecarCapabilityTransportCodec.Serialize(
+                        terminalResponse with
+                        {
+                            Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
+                            ResultIdentity = null,
+                        })),
+                fixture.Binding,
+                (_, _) => true).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+                    SidecarCapabilityTransportCodec.Serialize(
+                        failedResponse with
+                        {
+                            Execution = new SidecarTerminalExecutionResult(parentResult, null, true),
+                            ResultIdentity = terminalResponse.ResultIdentity,
+                        })),
+                fixture.Binding,
+                (_, _) => true).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+                    SidecarCapabilityTransportCodec.Serialize(
+                        failedResponse with
+                        {
+                            NestedCarrierOutcome = new(
+                                SidecarNestedHostActionEntryRelayOutcomeKind.Failed,
+                                new SidecarSafeFailureIdentity(
+                                    Guid.NewGuid(),
+                                    fixture.SafeFailure.Code,
+                                    fixture.SafeFailure.Message)),
+                        })),
+                fixture.Binding,
+                (_, _) => true).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+                    SidecarCapabilityTransportCodec.Serialize(
+                        failedResponse with
+                        {
+                            NestedCarrierOutcome = new(
+                                SidecarNestedHostActionEntryRelayOutcomeKind.Cancelled,
+                                fixture.SafeFailure),
+                        })),
+                fixture.Binding,
+                (_, _) => true).Code);
 
         var childRequest = SidecarActionCapabilityRequest.HostEntryNested(
             relay.Call,
@@ -3911,6 +4006,7 @@ public sealed class SidecarCapabilityTransportTests
             var relayAuthority = wireRequest.Authority with
             {
                 NestedCarrierRelay = relay,
+                NestedCarrierOutcomeKind = SidecarNestedHostActionEntryRelayOutcomeKind.Issued,
                 Proof = "relay-proof",
             };
             relayAuthority = relayAuthority with

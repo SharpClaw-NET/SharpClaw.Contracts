@@ -2033,6 +2033,7 @@ public sealed record SidecarHostTerminalAuthority(
     public int Depth { get; init; }
     public int Attempt { get; init; }
     public SidecarNestedHostActionEntryRelay? NestedCarrierRelay { get; init; }
+    public SidecarNestedHostActionEntryRelayOutcomeKind? NestedCarrierOutcomeKind { get; init; }
 }
 
 public sealed record SidecarActionTerminalExecutionContext(
@@ -2614,25 +2615,42 @@ public static class SidecarCapabilityTransportValidation
         ArgumentNullException.ThrowIfNull(response);
         ArgumentNullException.ThrowIfNull(binding);
 
+        var nestedOutcome = response.NestedCarrierOutcome;
+        var nestedKind = nestedOutcome?.Kind;
+        var nestedAuthority = response.NestedCarrierAuthority;
         var nestedRelayValid = request.NestedCarrierRequest is null
             ? response.NestedCarrierRelay is null &&
-              response.NestedCarrierAuthority is null &&
-              response.NestedCarrierOutcome is null
-            : response.NestedCarrierOutcome is not null &&
-              response.NestedCarrierOutcome.IsWellFormed &&
-              (response.NestedCarrierOutcome.Kind == SidecarNestedHostActionEntryRelayOutcomeKind.Issued
+              nestedAuthority is null &&
+              nestedOutcome is null
+            : nestedOutcome is not null &&
+              nestedOutcome.IsWellFormed &&
+              nestedAuthority is not null &&
+              nestedAuthority.NestedCarrierOutcomeKind == nestedKind &&
+              SameNestedCarrierAuthorityBinding(request, response.NestedCarrierRelay, nestedKind!.Value, nestedAuthority) &&
+              authenticateNestedCarrierAuthority is not null &&
+              authenticateNestedCarrierAuthority(
+                  nestedAuthority,
+                  ComputeTerminalAuthorityBindingHash(nestedAuthority)) &&
+              (nestedKind == SidecarNestedHostActionEntryRelayOutcomeKind.Issued
                   ? response.NestedCarrierRelay is not null &&
-                    response.NestedCarrierAuthority is not null &&
                     MatchesNestedRelay(request, response.NestedCarrierRelay) &&
-                    SameNestedCarrierAuthorityBinding(request, response.NestedCarrierRelay, response.NestedCarrierAuthority) &&
-                    authenticateNestedCarrierAuthority is not null &&
-                    authenticateNestedCarrierAuthority(
-                        response.NestedCarrierAuthority,
-                        ComputeTerminalAuthorityBindingHash(response.NestedCarrierAuthority))
+                    nestedOutcome.Failure is null
                   : response.NestedCarrierRelay is null &&
-                    response.NestedCarrierAuthority is null);
+                    nestedOutcome.Failure is not null &&
+                    SameSafeFailure(nestedOutcome.Failure, binding.SafeFailure));
+
+        var nestedExecutionValid = request.NestedCarrierRequest is null ||
+            (nestedKind == SidecarNestedHostActionEntryRelayOutcomeKind.Issued
+                ? response.Execution?.Result is not null &&
+                  response.Execution.Failure is null &&
+                  response.ResultIdentity is not null
+                : response.Execution?.Result is null &&
+                  response.Execution?.Failure is not null &&
+                  response.ResultIdentity is null &&
+                  SameSafeFailure(response.Execution.Failure, binding.SafeFailure));
 
         if (!nestedRelayValid ||
+            !nestedExecutionValid ||
             response.TerminalId != request.TerminalId ||
             response.Execution is null ||
             !response.Execution.Completed ||
@@ -2849,6 +2867,7 @@ public static class SidecarCapabilityTransportValidation
             authority.ParentInvocationId,
             authority.Depth,
             authority.Attempt,
+            authority.NestedCarrierOutcomeKind,
             NestedCarrierRelay = authority.NestedCarrierRelay is null
                 ? null
                 : new
@@ -3033,12 +3052,14 @@ public static class SidecarCapabilityTransportValidation
 
     private static bool SameNestedCarrierAuthorityBinding(
         SidecarActionTerminalTransportRequest request,
-        SidecarNestedHostActionEntryRelay relay,
+        SidecarNestedHostActionEntryRelay? relay,
+        SidecarNestedHostActionEntryRelayOutcomeKind outcomeKind,
         SidecarHostTerminalAuthority authority)
     {
         var expected = request.Authority with
         {
             NestedCarrierRelay = relay,
+            NestedCarrierOutcomeKind = outcomeKind,
         };
         expected = expected with
         {
@@ -3072,17 +3093,19 @@ public static class SidecarCapabilityTransportValidation
             expected.TerminalId == authority.TerminalId &&
             string.Equals(expected.CanonicalBindingHash, authority.CanonicalBindingHash, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(expected.SnapshotContentHash, authority.SnapshotContentHash, StringComparison.OrdinalIgnoreCase) &&
-            SamePrincipal(expected.Caller, authority.Caller) &&
-            SameFeatures(expected.Features, authority.Features) &&
+            SamePrincipal(expected.Caller, authority.Caller!) &&
+            SameFeatures(expected.Features, authority.Features!) &&
             expected.TraceId == authority.TraceId &&
             expected.IdempotencyKey == authority.IdempotencyKey &&
             expected.InvocationId == authority.InvocationId &&
             expected.ParentInvocationId == authority.ParentInvocationId &&
             expected.Depth == authority.Depth &&
             expected.Attempt == authority.Attempt &&
-            expected.NestedCarrierRelay is not null &&
-            authority.NestedCarrierRelay is not null &&
-            SameNestedRelay(expected.NestedCarrierRelay, authority.NestedCarrierRelay);
+            expected.NestedCarrierOutcomeKind == authority.NestedCarrierOutcomeKind &&
+            (expected.NestedCarrierRelay is null
+                ? authority.NestedCarrierRelay is null
+                : authority.NestedCarrierRelay is not null &&
+                  SameNestedRelay(expected.NestedCarrierRelay, authority.NestedCarrierRelay));
     }
 
     private static bool SameReceipt(
