@@ -2524,6 +2524,7 @@ public sealed class SidecarCapabilityTransportTests
             descriptor.DescriptorHash,
             action.ContentHash,
             action.ByteLength,
+            descriptor,
             1,
             fixture.Now.AddMinutes(1));
 
@@ -3760,7 +3761,7 @@ public sealed class SidecarCapabilityTransportTests
             terminalRequest,
             childDescriptor,
             contribution);
-        var entry = new RuntimeNestedHostActionEntryProxy(transport, childDescriptor);
+        var entry = new RuntimeNestedHostActionEntryProxy(transport);
         var parentContext = new ActionContext<string>(
             rootContext.InvocationId,
             rootContext.ParentInvocationId,
@@ -4292,6 +4293,7 @@ public sealed class SidecarCapabilityTransportTests
             Assert.Equal(wireRequest.TerminalId, wireResponse.TerminalId);
             Assert.Equal(wireRequest.Receipt, wireResponse.Receipt);
             Assert.Equal(response.NestedCarrierRelay!.Carrier.CarrierId, wireResponse.NestedCarrierRelay!.Carrier.CarrierId);
+            Assert.Equal(resolvedDescriptor, wireResponse.NestedCarrierRelay.Descriptor);
             Assert.Equal(response.NestedCarrierAuthority!.AuthorityId, wireResponse.NestedCarrierAuthority!.AuthorityId);
             Assert.Equal(response.NestedCarrierOutcome!.Kind, wireResponse.NestedCarrierOutcome!.Kind);
             var responseValidation = SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
@@ -4301,6 +4303,56 @@ public sealed class SidecarCapabilityTransportTests
                 (authority, bindingHash) => authority.Proof == "relay-proof" &&
                     bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority));
             Assert.True(responseValidation.Accepted, $"{responseValidation.Code}: {responseValidation.Message}");
+
+            var validRelay = wireResponse.NestedCarrierRelay!;
+            var validAuthority = wireResponse.NestedCarrierAuthority!;
+            foreach (var mutatedDescriptor in new[]
+            {
+                resolvedDescriptor with { Key = new SharpClawActionKey("child.runtime.mutated") },
+                resolvedDescriptor with { Version = resolvedDescriptor.Version + 1 },
+                resolvedDescriptor with { Category = "mutated-category" },
+                resolvedDescriptor with { InputTypeIdentity = typeof(Guid).AssemblyQualifiedName! },
+                resolvedDescriptor with { InputSchemaHash = "mutated-input-schema" },
+                resolvedDescriptor with { InputSchemaVersion = resolvedDescriptor.InputSchemaVersion + 1 },
+                resolvedDescriptor with { ResultTypeIdentity = typeof(Guid).AssemblyQualifiedName! },
+                resolvedDescriptor with { ResultSchemaHash = "mutated-result-schema" },
+                resolvedDescriptor with { ResultSchemaVersion = resolvedDescriptor.ResultSchemaVersion + 1 },
+                resolvedDescriptor with { DescriptorHash = "mutated-descriptor" },
+            })
+            {
+                var mutatedRelay = validRelay with
+                {
+                    Carrier = validRelay.Carrier with
+                    {
+                        ActionKey = mutatedDescriptor.Key,
+                        ActionVersion = mutatedDescriptor.Version,
+                        DescriptorHash = mutatedDescriptor.DescriptorHash,
+                        Descriptor = mutatedDescriptor,
+                    },
+                };
+                var mutatedAuthority = validAuthority with
+                {
+                    NestedCarrierRelay = mutatedRelay,
+                };
+                mutatedAuthority = mutatedAuthority with
+                {
+                    CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                        mutatedAuthority),
+                };
+                var mutatedResponse = wireResponse with
+                {
+                    NestedCarrierRelay = mutatedRelay,
+                    NestedCarrierAuthority = mutatedAuthority,
+                };
+                var mutationValidation = SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                    wireRequest,
+                    mutatedResponse,
+                    fixture.Binding,
+                    (authority, bindingHash) => authority.Proof == "relay-proof" &&
+                        bindingHash == validAuthority.CanonicalBindingHash);
+                Assert.False(mutationValidation.Accepted, mutatedDescriptor.ToString());
+            }
+
             Assert.Null(request.Authority.NestedCarrierRelay);
             return ValueTask.FromResult(wireResponse);
         }
@@ -4311,8 +4363,7 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     private sealed class RuntimeNestedHostActionEntryProxy(
-        RuntimeNestedTransport transport,
-        SidecarActionDescriptorIdentity descriptor) : IHostActionEntry
+        RuntimeNestedTransport transport) : IHostActionEntry
     {
         public ValueTask<IActionOutcome<TResult>> InvokeAsync<TAction, TResult>(
             HostActionEntryRequest<TAction, TResult> request,
@@ -4326,10 +4377,12 @@ public sealed class SidecarCapabilityTransportTests
             IHostActionEntryTerminal<TAction, TResult> terminal,
             CancellationToken cancellationToken = default)
         {
-            var action = Payload(descriptor.InputTypeIdentity, request.Action);
+            var action = Payload(
+                typeof(TAction).AssemblyQualifiedName ?? typeof(TAction).FullName ?? typeof(TAction).Name,
+                request.Action);
             var nestedRequest = new SidecarNestedHostActionEntryRequest(
-                descriptor.Key,
-                descriptor.Version,
+                request.ActionKey,
+                request.ActionVersion,
                 action,
                 request.ParentContext.Deadline,
                 request.ParentContext.Deadline);
@@ -4337,6 +4390,7 @@ public sealed class SidecarCapabilityTransportTests
                 transport.CreateNestedTerminalRequest(nestedRequest),
                 cancellationToken);
             var relay = terminalResponse.NestedCarrierRelay ?? throw new InvalidOperationException();
+            var descriptor = relay.Descriptor;
             var childRequest = SidecarActionCapabilityRequest.HostEntryNested(
                 relay.Call,
                 descriptor,

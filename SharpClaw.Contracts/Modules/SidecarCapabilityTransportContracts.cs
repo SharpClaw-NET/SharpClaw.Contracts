@@ -642,6 +642,7 @@ public sealed class SidecarCapabilitySession
                 descriptor.DescriptorHash,
                 action.ContentHash,
                 action.ByteLength,
+                descriptor,
                 _bindingGeneration,
                 expiresAt);
             _lastSequence = nestedCall.Sequence;
@@ -1791,7 +1792,20 @@ public sealed record SidecarActionDescriptorIdentity(
     string ResultTypeIdentity,
     string ResultSchemaHash,
     int ResultSchemaVersion,
-    string DescriptorHash);
+    string DescriptorHash)
+{
+    public bool IsWellFormed =>
+        !string.IsNullOrWhiteSpace(Key.Value) &&
+        Version >= 1 &&
+        !string.IsNullOrWhiteSpace(Category) &&
+        !string.IsNullOrWhiteSpace(InputTypeIdentity) &&
+        !string.IsNullOrWhiteSpace(InputSchemaHash) &&
+        InputSchemaVersion >= 1 &&
+        !string.IsNullOrWhiteSpace(ResultTypeIdentity) &&
+        !string.IsNullOrWhiteSpace(ResultSchemaHash) &&
+        ResultSchemaVersion >= 1 &&
+        !string.IsNullOrWhiteSpace(DescriptorHash);
+}
 
 public sealed record SidecarCancellationIdentity(
     Guid CancellationId,
@@ -1853,6 +1867,7 @@ public sealed record SidecarNestedHostActionEntryCarrier(
     string DescriptorHash,
     string ActionContentHash,
     int ActionByteLength,
+    SidecarActionDescriptorIdentity Descriptor,
     long BindingGeneration,
     DateTimeOffset ExpiresAt)
 {
@@ -1867,6 +1882,11 @@ public sealed record SidecarNestedHostActionEntryCarrier(
         !string.IsNullOrWhiteSpace(DescriptorHash) &&
         !string.IsNullOrWhiteSpace(ActionContentHash) &&
         ActionByteLength > 0 &&
+        Descriptor is not null &&
+        Descriptor.IsWellFormed &&
+        Descriptor.Key == ActionKey &&
+        Descriptor.Version == ActionVersion &&
+        string.Equals(Descriptor.DescriptorHash, DescriptorHash, StringComparison.Ordinal) &&
         BindingGeneration > 0 &&
         ExpiresAt > DateTimeOffset.MinValue;
 }
@@ -1891,12 +1911,19 @@ public sealed record SidecarNestedHostActionEntryRelay(
     SidecarCapabilityCallIdentity Call,
     SidecarNestedHostActionEntryCarrier Carrier)
 {
+    public SidecarActionDescriptorIdentity Descriptor => Carrier.Descriptor;
+
     public bool IsWellFormed =>
         Call is not null &&
         Call.IsValid &&
         Carrier is not null &&
+        Descriptor is not null &&
+        Descriptor.IsWellFormed &&
         Carrier.IsWellFormed &&
-        Carrier.CallId == Call.CallId;
+        Carrier.CallId == Call.CallId &&
+        Descriptor.Key == Carrier.ActionKey &&
+        Descriptor.Version == Carrier.ActionVersion &&
+        string.Equals(Descriptor.DescriptorHash, Carrier.DescriptorHash, StringComparison.Ordinal);
 }
 
 public enum SidecarNestedHostActionEntryRelayOutcomeKind
@@ -2407,6 +2434,7 @@ public static class SidecarCapabilityTransportValidation
 
         if (hostEntry && request.NestedCarrier is not null &&
             (request.NestedCarrier.CallId != request.Call.CallId ||
+             request.NestedCarrier.Descriptor != request.Descriptor ||
              request.NestedCarrier.ActionKey != request.Descriptor.Key ||
              request.NestedCarrier.ActionVersion != request.Descriptor.Version ||
              !string.Equals(
@@ -2748,17 +2776,7 @@ public static class SidecarCapabilityTransportValidation
     }
 
     private static bool IsValidDescriptor(SidecarActionDescriptorIdentity descriptor) =>
-        descriptor is not null &&
-        !string.IsNullOrWhiteSpace(descriptor.Key.Value) &&
-        descriptor.Version >= 1 &&
-        !string.IsNullOrWhiteSpace(descriptor.Category) &&
-        !string.IsNullOrWhiteSpace(descriptor.InputTypeIdentity) &&
-        !string.IsNullOrWhiteSpace(descriptor.InputSchemaHash) &&
-        descriptor.InputSchemaVersion >= 1 &&
-        !string.IsNullOrWhiteSpace(descriptor.ResultTypeIdentity) &&
-        !string.IsNullOrWhiteSpace(descriptor.ResultSchemaHash) &&
-        descriptor.ResultSchemaVersion >= 1 &&
-        !string.IsNullOrWhiteSpace(descriptor.DescriptorHash);
+        descriptor is not null && descriptor.IsWellFormed;
 
     private static bool MatchesBinding(
         SidecarCapabilityCallIdentity call,
@@ -2949,6 +2967,19 @@ public static class SidecarCapabilityTransportValidation
                         HandleHash = SidecarCapabilityTransportCodec.ComputeSha256(
                             Encoding.UTF8.GetBytes(authority.NestedCarrierRelay.Carrier.Handle)),
                     },
+                    Descriptor = new
+                    {
+                        ActionKey = authority.NestedCarrierRelay.Descriptor.Key.Value,
+                        authority.NestedCarrierRelay.Descriptor.Version,
+                        authority.NestedCarrierRelay.Descriptor.Category,
+                        authority.NestedCarrierRelay.Descriptor.InputTypeIdentity,
+                        authority.NestedCarrierRelay.Descriptor.InputSchemaHash,
+                        authority.NestedCarrierRelay.Descriptor.InputSchemaVersion,
+                        authority.NestedCarrierRelay.Descriptor.ResultTypeIdentity,
+                        authority.NestedCarrierRelay.Descriptor.ResultSchemaHash,
+                        authority.NestedCarrierRelay.Descriptor.ResultSchemaVersion,
+                        authority.NestedCarrierRelay.Descriptor.DescriptorHash,
+                    },
                 },
         };
 
@@ -3093,6 +3124,11 @@ public static class SidecarCapabilityTransportValidation
         relay.Call.Deadline == request.NestedCarrierRequest.Deadline &&
         relay.Carrier.ActionKey == request.NestedCarrierRequest.ActionKey &&
         relay.Carrier.ActionVersion == request.NestedCarrierRequest.ActionVersion &&
+        relay.Descriptor.Key == request.NestedCarrierRequest.ActionKey &&
+        relay.Descriptor.Version == request.NestedCarrierRequest.ActionVersion &&
+        string.Equals(relay.Descriptor.InputTypeIdentity, request.NestedCarrierRequest.Action.TypeIdentity, StringComparison.Ordinal) &&
+        relay.Descriptor.InputSchemaVersion == request.NestedCarrierRequest.Action.SchemaVersion &&
+        string.Equals(relay.Descriptor.DescriptorHash, relay.Carrier.DescriptorHash, StringComparison.Ordinal) &&
         string.Equals(relay.Carrier.ActionContentHash, request.NestedCarrierRequest.Action.ContentHash, StringComparison.OrdinalIgnoreCase) &&
         relay.Carrier.ActionByteLength == request.NestedCarrierRequest.Action.ByteLength &&
         relay.Carrier.ExpiresAt == new[]
