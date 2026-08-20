@@ -2034,6 +2034,7 @@ public sealed record SidecarHostTerminalAuthority(
     public int Attempt { get; init; }
     public SidecarNestedHostActionEntryRelay? NestedCarrierRelay { get; init; }
     public SidecarNestedHostActionEntryRelayOutcomeKind? NestedCarrierOutcomeKind { get; init; }
+    public string NestedCarrierRequestFingerprint { get; init; } = string.Empty;
 }
 
 public sealed record SidecarActionTerminalExecutionContext(
@@ -2624,6 +2625,7 @@ public static class SidecarCapabilityTransportValidation
               nestedOutcome is null
             : nestedOutcome is not null &&
               nestedOutcome.IsWellFormed &&
+              request.NestedCarrierRequest.IsWellFormed &&
               nestedAuthority is not null &&
               nestedAuthority.NestedCarrierOutcomeKind == nestedKind &&
               SameNestedCarrierAuthorityBinding(request, response.NestedCarrierRelay, nestedKind!.Value, nestedAuthority) &&
@@ -2868,6 +2870,7 @@ public static class SidecarCapabilityTransportValidation
             authority.Depth,
             authority.Attempt,
             authority.NestedCarrierOutcomeKind,
+            authority.NestedCarrierRequestFingerprint,
             NestedCarrierRelay = authority.NestedCarrierRelay is null
                 ? null
                 : new
@@ -2906,6 +2909,15 @@ public static class SidecarCapabilityTransportValidation
 
         return SidecarCapabilityTransportCodec.ComputeSha256(
             SidecarCapabilityTransportCodec.Serialize(canonical));
+    }
+
+    public static string ComputeNestedCarrierRequestFingerprint(
+        SidecarNestedHostActionEntryRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        return SidecarCapabilityTransportCodec.ComputeSha256(
+            SidecarCapabilityTransportCodec.Serialize(request));
     }
 
     private static bool MatchesInitiatingHostContext(
@@ -3043,6 +3055,7 @@ public static class SidecarCapabilityTransportValidation
         string.Equals(relay.Carrier.DescriptorHash, request.NestedCarrierRequest.Descriptor.DescriptorHash, StringComparison.Ordinal) &&
         string.Equals(relay.Carrier.ActionContentHash, request.NestedCarrierRequest.Action.ContentHash, StringComparison.OrdinalIgnoreCase) &&
         relay.Carrier.ActionByteLength == request.NestedCarrierRequest.Action.ByteLength &&
+        relay.Carrier.ExpiresAt == request.NestedCarrierRequest.ExpiresAt &&
         relay.Call.CallId == relay.Carrier.CallId;
 
     private static bool SameNestedRelay(
@@ -3060,6 +3073,8 @@ public static class SidecarCapabilityTransportValidation
         {
             NestedCarrierRelay = relay,
             NestedCarrierOutcomeKind = outcomeKind,
+            NestedCarrierRequestFingerprint = ComputeNestedCarrierRequestFingerprint(
+                request.NestedCarrierRequest!),
         };
         expected = expected with
         {
@@ -3102,6 +3117,10 @@ public static class SidecarCapabilityTransportValidation
             expected.Depth == authority.Depth &&
             expected.Attempt == authority.Attempt &&
             expected.NestedCarrierOutcomeKind == authority.NestedCarrierOutcomeKind &&
+            string.Equals(
+                expected.NestedCarrierRequestFingerprint,
+                authority.NestedCarrierRequestFingerprint,
+                StringComparison.OrdinalIgnoreCase) &&
             (expected.NestedCarrierRelay is null
                 ? authority.NestedCarrierRelay is null
                 : authority.NestedCarrierRelay is not null &&

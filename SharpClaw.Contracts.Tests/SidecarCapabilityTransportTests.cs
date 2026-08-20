@@ -3058,6 +3058,8 @@ public sealed class SidecarCapabilityTransportTests
         {
             NestedCarrierRelay = relay,
             NestedCarrierOutcomeKind = SidecarNestedHostActionEntryRelayOutcomeKind.Issued,
+            NestedCarrierRequestFingerprint =
+                SidecarCapabilityTransportValidation.ComputeNestedCarrierRequestFingerprint(nestedRequest),
             Proof = "relay-proof",
         };
         relayAuthority = relayAuthority with
@@ -3119,6 +3121,8 @@ public sealed class SidecarCapabilityTransportTests
             (terminalRequest.Authority with
             {
                 NestedCarrierOutcomeKind = kind,
+                NestedCarrierRequestFingerprint =
+                    SidecarCapabilityTransportValidation.ComputeNestedCarrierRequestFingerprint(nestedRequest),
                 Proof = proof,
             }) with
             {
@@ -3127,6 +3131,8 @@ public sealed class SidecarCapabilityTransportTests
                         terminalRequest.Authority with
                         {
                             NestedCarrierOutcomeKind = kind,
+                            NestedCarrierRequestFingerprint =
+                                SidecarCapabilityTransportValidation.ComputeNestedCarrierRequestFingerprint(nestedRequest),
                             Proof = proof,
                         }),
             };
@@ -3174,6 +3180,64 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Binding,
             (authority, bindingHash) => authority.Proof == "cancelled-proof" &&
                 bindingHash == SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority)).Accepted);
+
+        void AssertNestedRequestSubstitutionRejected(
+            SidecarActionTerminalTransportResponse response,
+            SidecarNestedHostActionEntryRequest substitutedRequest)
+        {
+            var substitutedTerminalRequest = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportRequest>(
+                SidecarCapabilityTransportCodec.Serialize(
+                    terminalRequest with { NestedCarrierRequest = substitutedRequest }));
+            var substitutedResponse = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+                SidecarCapabilityTransportCodec.Serialize(response));
+            Assert.False(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                substitutedTerminalRequest,
+                substitutedResponse,
+                fixture.Binding,
+                (_, _) => true).Accepted);
+        }
+
+        var descriptorSubstitution = nestedRequest with
+        {
+            Descriptor = nestedRequest.Descriptor with
+            {
+                Key = new SharpClawActionKey("nested.other"),
+            },
+        };
+        var payloadSubstitution = nestedRequest with
+        {
+            Action = Payload(nestedRequest.Action.TypeIdentity, "changed-nested-payload"),
+        };
+        var contributionSubstitution = nestedRequest with
+        {
+            Contribution = nestedRequest.Contribution with
+            {
+                Lineage = nestedRequest.Contribution.Lineage with
+                {
+                    DescriptorHash = "changed-contribution",
+                },
+            },
+        };
+        var deadlineSubstitution = nestedRequest with
+        {
+            Deadline = nestedRequest.Deadline.AddSeconds(-1),
+        };
+        var expirySubstitution = nestedRequest with
+        {
+            ExpiresAt = nestedRequest.ExpiresAt.AddSeconds(1),
+        };
+        foreach (var substitutedRequest in new[]
+        {
+            descriptorSubstitution,
+            payloadSubstitution,
+            contributionSubstitution,
+            deadlineSubstitution,
+            expirySubstitution,
+        })
+        {
+            AssertNestedRequestSubstitutionRejected(failedResponse, substitutedRequest);
+            AssertNestedRequestSubstitutionRejected(cancelledResponse, substitutedRequest);
+        }
 
         Assert.Equal(
             SidecarCapabilityErrors.InvalidResponse,
@@ -4007,6 +4071,8 @@ public sealed class SidecarCapabilityTransportTests
             {
                 NestedCarrierRelay = relay,
                 NestedCarrierOutcomeKind = SidecarNestedHostActionEntryRelayOutcomeKind.Issued,
+                NestedCarrierRequestFingerprint =
+                    SidecarCapabilityTransportValidation.ComputeNestedCarrierRequestFingerprint(nestedRequest),
                 Proof = "relay-proof",
             };
             relayAuthority = relayAuthority with
