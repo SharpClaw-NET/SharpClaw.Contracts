@@ -26,6 +26,7 @@ public enum SidecarActionInvocationKind
     Run,
     RunRequired,
     HostEntry,
+    HostEntryCrossSidecar,
 }
 
 public sealed record SidecarAuthenticationProof(
@@ -184,6 +185,8 @@ public sealed class SidecarCapabilitySession
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _issuedEntryContexts = [];
     private readonly Dictionary<Guid, HostActionEntryCarrierAuthority> _activeEntryCarriers = [];
     private readonly Dictionary<Guid, NestedCarrierState> _nestedCarrierStates = [];
+    private readonly Dictionary<Guid, CrossSidecarCarrierState> _crossSidecarStates = [];
+    private readonly Dictionary<Guid, Guid> _crossSidecarParentChildren = [];
     private readonly Dictionary<Guid, SidecarCapabilityCallIdentity> _reservedNestedCalls = [];
     private readonly HashSet<Guid> _nestedCarrierIds = [];
     private readonly Dictionary<Guid, Guid> _nestedCarrierParents = [];
@@ -213,6 +216,13 @@ public sealed class SidecarCapabilitySession
         SidecarSerializedPayload Action,
         HostActionEntryRequestContext Context,
         HostActionEntryCarrierAuthority Authority);
+
+    private sealed record CrossSidecarCarrierState(
+        SidecarCrossSidecarActionEntryCarrier Carrier,
+        SidecarCapabilityCallIdentity SourceParentCall,
+        SidecarCapabilityCallIdentity TargetChildCall,
+        SidecarModuleActionEntryDefinition TargetEntry,
+        bool Active);
 
     private static readonly TimeSpan CarrierReplayRetention = TimeSpan.FromMinutes(5);
 
@@ -835,8 +845,22 @@ public sealed class SidecarCapabilitySession
         int frameByteLength,
         DateTimeOffset now,
         out HostActionEntryRequestContext? hostContext)
+        => BeginActionCall(
+            request,
+            frameByteLength,
+            now,
+            out hostContext,
+            static (_, _) => false);
+
+    public SidecarCapabilityValidationResult BeginActionCall(
+        SidecarActionCapabilityRequest request,
+        int frameByteLength,
+        DateTimeOffset now,
+        out HostActionEntryRequestContext? hostContext,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, bool> authenticateCrossSidecarAuthority)
     {
         ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(authenticateCrossSidecarAuthority);
         hostContext = null;
 
         var requestResult = SidecarCapabilityTransportValidation.ValidateActionRequest(
@@ -858,6 +882,18 @@ public sealed class SidecarCapabilitySession
                 out hostContext);
         }
 
+        if (request.Invocation == SidecarActionInvocationKind.HostEntryCrossSidecar &&
+            request.CrossSidecarCarrier is not null)
+        {
+            return BeginCrossSidecarActionEntryCall(
+                request.CrossSidecarCarrier,
+                request.Terminal!,
+                frameByteLength,
+                now,
+                out hostContext,
+                authenticateCrossSidecarAuthority);
+        }
+
         var result = BeginCall(
             request.Call,
             SidecarCapabilityKind.Action,
@@ -873,6 +909,559 @@ public sealed class SidecarCapabilitySession
         }
 
         return result;
+    }
+
+    public SidecarCapabilityValidationResult IssueCrossSidecarActionEntryRelay(
+        SidecarCapabilityCallIdentity parentCall,
+        SidecarCrossSidecarActionEntryRequest request,
+        SidecarCapabilitySession targetSession,
+        SidecarModuleActionEntryDefinition targetEntry,
+        ActionPipelineSnapshot targetSnapshot,
+        DateTimeOffset now,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, string> issueProof,
+        out SidecarCrossSidecarActionEntryRelay? relay)
+    {
+        ArgumentNullException.ThrowIfNull(parentCall);
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(targetSession);
+        ArgumentNullException.ThrowIfNull(targetEntry);
+        ArgumentNullException.ThrowIfNull(targetSnapshot);
+        ArgumentNullException.ThrowIfNull(issueProof);
+        relay = null;
+
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The source capability session is disconnected.");
+
+            if (!_calls.TryGetValue(parentCall.CallId, out var capability) ||
+                capability != SidecarCapabilityKind.Action ||
+                !_callIdentities.TryGetValue(parentCall.CallId, out var activeParent) ||
+                activeParent != parentCall ||
+                !_callEntryContexts.ContainsKey(parentCall.CallId) ||
+                !_terminalCalls.ContainsKey(parentCall.CallId))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "Cross-sidecar entry requires an active parent terminal call.");
+            }
+
+            var requestResult = SidecarCrossSidecarActionEntryValidation.ValidateRequest(
+                request,
+                parentCall,
+                Binding,
+                now);
+            if (!requestResult.Accepted)
+                return requestResult;
+
+            if (targetSession == this ||
+                !targetEntry.IsWellFormed ||
+                !string.Equals(targetEntry.ModuleId, targetSession.Binding.ModuleId, StringComparison.Ordinal) ||
+                !string.Equals(targetEntry.GraphId, targetSession.Binding.GraphId, StringComparison.Ordinal) ||
+                targetSnapshot is null ||
+                string.IsNullOrWhiteSpace(targetSnapshot.ContractHash))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The target module action entry is not owned by the target session.");
+            }
+
+            var sourceContext = _callEntryContexts[parentCall.CallId];
+            var result = targetSession.ReserveCrossSidecarActionEntry(
+                parentCall,
+                sourceContext,
+                Binding,
+                _bindingGeneration,
+                request,
+                targetEntry,
+                targetSnapshot,
+                now,
+                issueProof,
+                out var carrier);
+            if (!result.Accepted || carrier is null)
+                return result;
+
+            try
+            {
+                _crossSidecarStates.Add(
+                    carrier.CarrierId,
+                    new CrossSidecarCarrierState(
+                        carrier,
+                        parentCall,
+                        carrier.Authority.TargetChildCall,
+                        targetEntry,
+                        Active: false));
+                _crossSidecarParentChildren.Add(carrier.CarrierId, parentCall.CallId);
+            }
+            catch
+            {
+                targetSession.RevokeCrossSidecarActionEntry(carrier.CarrierId, now);
+                throw;
+            }
+
+            relay = new SidecarCrossSidecarActionEntryRelay(carrier, targetEntry);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    private SidecarCapabilityValidationResult ReserveCrossSidecarActionEntry(
+        SidecarCapabilityCallIdentity sourceParentCall,
+        HostActionEntryRequestContext sourceContext,
+        SidecarCapabilitySessionBinding sourceBinding,
+        long sourceBindingGeneration,
+        SidecarCrossSidecarActionEntryRequest request,
+        SidecarModuleActionEntryDefinition targetEntry,
+        ActionPipelineSnapshot targetSnapshot,
+        DateTimeOffset now,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, string> issueProof,
+        out SidecarCrossSidecarActionEntryCarrier? carrier)
+    {
+        carrier = null;
+
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The target capability session is disconnected.");
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            if (!sourceParentCall.IsValid ||
+                sourceParentCall.Capability != SidecarCapabilityKind.Action ||
+                sourceParentCall.SessionId != sourceBinding.SessionId ||
+                sourceParentCall.RequestId != sourceBinding.RequestId ||
+                sourceParentCall.CancellationId != sourceBinding.CancellationId ||
+                !string.Equals(sourceParentCall.ModuleId, sourceBinding.ModuleId, StringComparison.Ordinal) ||
+                !string.Equals(sourceParentCall.GraphId, sourceBinding.GraphId, StringComparison.Ordinal) ||
+                sourceContext is null ||
+                !sourceContext.IsWellFormed(now) ||
+                !targetEntry.IsWellFormed ||
+                !string.Equals(targetEntry.ModuleId, Binding.ModuleId, StringComparison.Ordinal) ||
+                !string.Equals(targetEntry.GraphId, Binding.GraphId, StringComparison.Ordinal) ||
+                !Binding.Grant.Allows(SidecarCapabilityKind.Action) ||
+                targetSnapshot is null ||
+                string.IsNullOrWhiteSpace(targetSnapshot.ContractHash))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The cross-sidecar target authority is not valid.");
+            }
+
+            var expiresAt = new[]
+            {
+                request.Deadline,
+                request.ExpiresAt,
+                sourceParentCall.Deadline,
+                sourceContext.ExpiresAt,
+                sourceBinding.ExpiresAt,
+                Binding.ExpiresAt,
+            }.Min();
+            if (expiresAt <= now)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Expired,
+                    "The cross-sidecar child authority has no valid lifetime.");
+
+            if (_totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest ||
+                _inFlight >= Binding.ConcurrencyLimits.MaximumInFlightCalls)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.ConcurrencyLimit,
+                    "The target capability session cannot reserve another action.");
+            }
+
+            var childCall = new SidecarCapabilityCallIdentity(
+                Binding.SessionId,
+                Binding.RequestId,
+                Binding.CancellationId,
+                Guid.NewGuid(),
+                Convert.ToHexString(RandomNumberGenerator.GetBytes(16)),
+                Binding.ModuleId,
+                Binding.GraphId,
+                SidecarCapabilityKind.Action,
+                _lastSequence + 1,
+                request.Deadline);
+            var childInvocationId = Guid.NewGuid();
+            var capabilityId = Guid.NewGuid();
+            var capabilityHandle = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+            var cancellation = new SidecarCancellationIdentity(
+                Binding.CancellationId,
+                SidecarCapabilitySessionValidator.ComputeBindingHash(Binding),
+                expiresAt);
+            var unsigned = new SidecarCrossSidecarActionEntryAuthority(
+                sourceParentCall,
+                childCall,
+                sourceContext.InvocationId,
+                childInvocationId,
+                capabilityId,
+                capabilityHandle,
+                sourceBindingGeneration,
+                _bindingGeneration,
+                targetEntry,
+                SidecarActionPayloadLineage.From(request.Action),
+                sourceContext.Caller,
+                sourceContext.Features,
+                sourceContext.TraceId,
+                sourceContext.IdempotencyKey,
+                cancellation,
+                request.Deadline,
+                now,
+                expiresAt,
+                sourceContext.Depth + 1,
+                sourceContext.Attempt,
+                SidecarCapabilityTransportValidation.ComputeSnapshotHash(targetSnapshot),
+                targetEntry.TerminalOwnerModuleId,
+                targetEntry.TerminalOwnerGraphId,
+                null,
+                string.Empty)
+            {
+                CanonicalBindingHash = string.Empty,
+            };
+            var canonicalHash = SidecarCrossSidecarActionEntryValidation.ComputeAuthorityHash(unsigned);
+            var signed = unsigned with
+            {
+                CanonicalBindingHash = canonicalHash,
+                Proof = issueProof(unsigned, canonicalHash),
+            };
+            if (!signed.IsValid)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The host did not issue a valid cross-sidecar authority.");
+
+            carrier = new SidecarCrossSidecarActionEntryCarrier(
+                capabilityId,
+                capabilityHandle,
+                signed,
+                request.Action,
+                _bindingGeneration,
+                expiresAt);
+            _lastSequence = childCall.Sequence;
+            _totalCalls++;
+            _inFlight++;
+            _nonces.Add(childCall.ReplayNonce);
+            _reservedNestedCalls.Add(childCall.CallId, childCall);
+            _crossSidecarStates.Add(
+                carrier.CarrierId,
+                new CrossSidecarCarrierState(
+                    carrier,
+                    sourceParentCall,
+                    childCall,
+                    targetEntry,
+                    Active: false));
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult BeginCrossSidecarActionEntryCall(
+        SidecarCrossSidecarActionEntryCarrier carrier,
+        SidecarActionTerminalRegistration terminal,
+        int frameByteLength,
+        DateTimeOffset now,
+        out HostActionEntryRequestContext? hostContext)
+        => BeginCrossSidecarActionEntryCall(
+            carrier,
+            terminal,
+            frameByteLength,
+            now,
+            out hostContext,
+            static (_, _) => false);
+
+    public SidecarCapabilityValidationResult BeginCrossSidecarActionEntryCall(
+        SidecarCrossSidecarActionEntryCarrier carrier,
+        SidecarActionTerminalRegistration terminal,
+        int frameByteLength,
+        DateTimeOffset now,
+        out HostActionEntryRequestContext? hostContext,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, bool> authenticate)
+    {
+        hostContext = null;
+        ArgumentNullException.ThrowIfNull(carrier);
+        ArgumentNullException.ThrowIfNull(terminal);
+        ArgumentNullException.ThrowIfNull(authenticate);
+
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The target capability session is disconnected.");
+
+            if (!_crossSidecarStates.TryGetValue(carrier.CarrierId, out var state) ||
+                state.Active ||
+                state.Carrier != carrier ||
+                carrier.BindingGeneration != _bindingGeneration)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The cross-sidecar carrier is unknown or already consumed.");
+            }
+
+            var carrierResult = SidecarCrossSidecarActionEntryValidation.ValidateCarrier(
+                carrier,
+                Binding,
+                now,
+                authenticate);
+            if (!carrierResult.Accepted ||
+                !terminal.IsWellFormed ||
+                terminal.ActionTypeIdentity != state.TargetEntry.Descriptor.InputTypeIdentity ||
+                terminal.ActionSchemaVersion != state.TargetEntry.Descriptor.InputSchemaVersion ||
+                terminal.ResultTypeIdentity != state.TargetEntry.Descriptor.ResultTypeIdentity ||
+                terminal.ResultSchemaVersion != state.TargetEntry.Descriptor.ResultSchemaVersion ||
+                !string.Equals(terminal.DescriptorHash, state.TargetEntry.Descriptor.DescriptorHash, StringComparison.Ordinal))
+            {
+                return carrierResult.Accepted
+                    ? SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.SpoofedIdentity,
+                        "The target terminal does not match the resolved module action.")
+                    : carrierResult;
+            }
+
+            var request = SidecarActionCapabilityRequest.HostEntryCrossSidecar(
+                state.TargetChildCall,
+                state.TargetEntry.Descriptor,
+                carrier.Action,
+                new SidecarCancellationIdentity(
+                    Binding.CancellationId,
+                    carrier.Authority.CanonicalBindingHash,
+                    carrier.ExpiresAt),
+                carrier.Authority.Deadline,
+                carrier,
+                terminal);
+            var requestResult = SidecarCapabilityTransportValidation.ValidateActionRequest(
+                request,
+                Binding,
+                now);
+            if (!requestResult.Accepted)
+                return requestResult;
+
+            var beginResult = BeginCall(
+                state.TargetChildCall,
+                SidecarCapabilityKind.Action,
+                carrier.Action,
+                frameByteLength,
+                now);
+            if (!beginResult.Accepted)
+                return beginResult;
+
+            _crossSidecarStates[carrier.CarrierId] = state with { Active = true };
+            hostContext = new HostActionEntryRequestContext(
+                carrier.Authority.CapabilityId,
+                carrier.Authority.CapabilityHandle,
+                HostActionEntryIngress.CrossModule,
+                carrier.Authority.TargetChildInvocationId,
+                Binding.RequestId,
+                Binding.CancellationId,
+                carrier.Authority.Caller,
+                carrier.Authority.Features,
+                carrier.Authority.TraceId,
+                carrier.Authority.IdempotencyKey,
+                carrier.Authority.Deadline,
+                carrier.Authority.ExpiresAt)
+            {
+                Contribution = new HostActionEntryContribution(
+                    new HostActionEntryIngressBinding(
+                        HostActionEntryIngress.CrossModule,
+                        state.TargetEntry.ModuleId,
+                        state.TargetEntry.GraphId),
+                    new HostActionEntryLineage(
+                        state.TargetEntry.Descriptor.Key,
+                        state.TargetEntry.Descriptor.Version,
+                        state.TargetEntry.Descriptor.DescriptorHash,
+                        state.TargetEntry.Descriptor.InputTypeIdentity,
+                        state.TargetEntry.Descriptor.InputSchemaVersion,
+                        state.TargetEntry.Descriptor.InputSchemaHash,
+                        carrier.Action.ContentHash,
+                        carrier.Action.ByteLength)),
+                ParentInvocationId = carrier.Authority.SourceParentInvocationId,
+                Depth = carrier.Authority.Depth,
+                Attempt = carrier.Authority.Attempt,
+            };
+            _callEntryContexts[state.TargetChildCall.CallId] = hostContext;
+            return beginResult;
+        }
+    }
+
+    public SidecarCapabilityValidationResult CompleteCrossSidecarActionEntry(
+        SidecarCrossSidecarActionEntryCarrier carrier,
+        SidecarActionOutcomeEnvelope outcome,
+        SidecarTerminalReceipt receipt,
+        DateTimeOffset now,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, string> issueProof,
+        out SidecarCrossSidecarActionEntryOutcome? completed)
+    {
+        ArgumentNullException.ThrowIfNull(carrier);
+        ArgumentNullException.ThrowIfNull(outcome);
+        ArgumentNullException.ThrowIfNull(receipt);
+        ArgumentNullException.ThrowIfNull(issueProof);
+        completed = null;
+
+        lock (_sync)
+        {
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The target capability session is disconnected.");
+
+            if (!_crossSidecarStates.TryGetValue(carrier.CarrierId, out var state) ||
+                !state.Active ||
+                state.Carrier != carrier)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The cross-sidecar carrier is not active.");
+            }
+
+            var receiptResult = SidecarCapabilityTransportValidation.ValidateReceipt(
+                receipt,
+                state.TargetChildCall.CallId,
+                state.TargetEntry.Descriptor,
+                required: true);
+            if (!receiptResult.Accepted ||
+                outcome.TerminalCallCount != 1 ||
+                outcome.Receipt != receipt ||
+                outcome.Kind is not (ActionOutcomeKind.Completed or ActionOutcomeKind.Failed or ActionOutcomeKind.Cancelled))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidResponse,
+                    "The cross-sidecar child outcome does not bind to the target call.");
+            }
+
+            var resultPayload = outcome.Kind == ActionOutcomeKind.Completed
+                ? outcome.Result
+                : null;
+            var failureShape = outcome.Kind == ActionOutcomeKind.Completed
+                ? resultPayload is not null && outcome.Error is null && outcome.Uncertainty is null
+                : resultPayload is null &&
+                  (outcome.Kind == ActionOutcomeKind.Cancelled
+                      ? outcome.Error is null && outcome.Uncertainty is null
+                      : outcome.Error is not null && outcome.Uncertainty is null);
+            if (!failureShape)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidResponse,
+                    "The cross-sidecar child outcome has an invalid terminal shape.");
+
+            if (resultPayload is not null)
+            {
+                var payloadResult = SidecarCapabilityTransportValidation.ValidateSerializedPayload(
+                    resultPayload,
+                    required: true,
+                    Binding.PayloadLimits.ActionResultBytes);
+                if (!payloadResult.Accepted ||
+                    resultPayload.TypeIdentity != state.TargetEntry.Descriptor.ResultTypeIdentity ||
+                    resultPayload.SchemaVersion != state.TargetEntry.Descriptor.ResultSchemaVersion)
+                    return payloadResult.Accepted
+                        ? SidecarCapabilityValidationResult.Reject(
+                            SidecarCapabilityErrors.InvalidResponse,
+                            "The cross-sidecar child result does not match the target descriptor.")
+                        : payloadResult;
+            }
+
+            var unsigned = carrier.Authority with
+            {
+                ResultReceipt = receipt,
+                CanonicalBindingHash = string.Empty,
+                Proof = string.Empty,
+            };
+            var canonicalHash = SidecarCrossSidecarActionEntryValidation.ComputeAuthorityHash(unsigned);
+            var signed = unsigned with
+            {
+                CanonicalBindingHash = canonicalHash,
+                Proof = issueProof(unsigned, canonicalHash),
+            };
+            if (!signed.IsValid)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The host did not issue a valid cross-sidecar result authority.");
+
+            var kind = outcome.Kind switch
+            {
+                ActionOutcomeKind.Completed => SidecarCrossSidecarActionEntryOutcomeKind.Completed,
+                ActionOutcomeKind.Cancelled => SidecarCrossSidecarActionEntryOutcomeKind.Cancelled,
+                _ => SidecarCrossSidecarActionEntryOutcomeKind.Failed,
+            };
+            var result = CompleteCall(state.TargetChildCall.CallId, 1);
+            if (!result.Accepted)
+                return result;
+
+            _crossSidecarStates.Remove(carrier.CarrierId);
+            RecordCarrierTombstone(carrier.CarrierId, _bindingGeneration, now, carrier.ExpiresAt);
+            completed = new SidecarCrossSidecarActionEntryOutcome(
+                kind,
+                outcome,
+                receipt,
+                Binding.SafeFailure,
+                signed);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult CompleteCrossSidecarActionEntry(
+        SidecarCrossSidecarActionEntryCarrier carrier,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(carrier);
+
+        lock (_sync)
+        {
+            if (!_crossSidecarParentChildren.Remove(carrier.CarrierId))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Duplicate,
+                    "The source cross-sidecar child is already completed.");
+
+            _crossSidecarStates.Remove(carrier.CarrierId);
+            RecordCarrierTombstone(carrier.CarrierId, _bindingGeneration, now, carrier.ExpiresAt);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    private void AbortCrossSidecarCall(Guid callId)
+    {
+        if (!_calls.Remove(callId))
+            return;
+
+        _callIdentities.Remove(callId);
+        _callPayloads.Remove(callId);
+        _callEntryContexts.Remove(callId);
+        _terminalCalls.Remove(callId);
+        _terminalReceipts.Remove(callId);
+        _completedCalls.Add(callId);
+        _inFlight = Math.Max(0, _inFlight - 1);
+    }
+
+    public SidecarCapabilityValidationResult RevokeCrossSidecarActionEntry(
+        Guid carrierId,
+        DateTimeOffset now)
+    {
+        lock (_sync)
+        {
+            if (!_crossSidecarStates.Remove(carrierId, out var state))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Duplicate,
+                    "The cross-sidecar carrier is not active.");
+
+            _crossSidecarParentChildren.Remove(carrierId);
+            if (_reservedNestedCalls.Remove(state.TargetChildCall.CallId))
+                _inFlight = Math.Max(0, _inFlight - 1);
+            else
+                AbortCrossSidecarCall(state.TargetChildCall.CallId);
+            RecordCarrierTombstone(carrierId, _bindingGeneration, now, state.Carrier.ExpiresAt);
+            return SidecarCapabilityValidationResult.Accept();
+        }
     }
 
     public SidecarCapabilityValidationResult CompleteHostActionEntryCarrier(
@@ -989,7 +1578,9 @@ public sealed class SidecarCapabilitySession
 
             if (_issuedEntryContexts.Count != 0 ||
                 _nestedCarrierStates.Count != 0 ||
-                _reservedNestedCalls.Count != 0)
+                _reservedNestedCalls.Count != 0 ||
+                _crossSidecarStates.Count != 0 ||
+                _crossSidecarParentChildren.Count != 0)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.InvalidBinding,
                     "The capability session cannot rotate while a carrier context is pending activation.");
@@ -1026,6 +1617,8 @@ public sealed class SidecarCapabilitySession
             _completedCalls.Clear();
             _completedEntryCarriers.Clear();
             _nestedCarrierStates.Clear();
+            _crossSidecarStates.Clear();
+            _crossSidecarParentChildren.Clear();
             _reservedNestedCalls.Clear();
             _nestedCarrierIds.Clear();
             _nestedCarrierParents.Clear();
@@ -1375,7 +1968,9 @@ public sealed class SidecarCapabilitySession
                     "The terminal call count must be zero or one.");
 
             if (_nestedCarrierParents.Values.Contains(callId) ||
-                _nestedCarrierStates.Values.Any(state => state.ParentCall.CallId == callId))
+                _nestedCarrierStates.Values.Any(state => state.ParentCall.CallId == callId) ||
+                _crossSidecarParentChildren.Values.Contains(callId) ||
+                _crossSidecarStates.Values.Any(state => state.SourceParentCall.CallId == callId))
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.InvalidBinding,
                     "A parent action cannot complete while a nested action is active.");
@@ -1444,6 +2039,24 @@ public sealed class SidecarCapabilitySession
             _nestedCarrierStates.Remove(state.Carrier.CarrierId);
             ReleaseNestedReservation(state.Call.CallId);
             RemoveEntryCarrier(state.Carrier.CarrierId, now);
+            removed++;
+        }
+
+        foreach (var state in _crossSidecarStates.Values
+            .Where(state => state.Carrier.ExpiresAt <= now)
+            .ToArray())
+        {
+            _crossSidecarStates.Remove(state.Carrier.CarrierId);
+            _crossSidecarParentChildren.Remove(state.Carrier.CarrierId);
+            if (_reservedNestedCalls.Remove(state.TargetChildCall.CallId))
+                _inFlight = Math.Max(0, _inFlight - 1);
+            else
+                AbortCrossSidecarCall(state.TargetChildCall.CallId);
+            RecordCarrierTombstone(
+                state.Carrier.CarrierId,
+                _bindingGeneration,
+                now,
+                state.Carrier.ExpiresAt);
             removed++;
         }
 
@@ -1573,6 +2186,8 @@ public sealed class SidecarCapabilitySession
             _issuedEntryContexts.Clear();
             _activeEntryCarriers.Clear();
             _nestedCarrierStates.Clear();
+            _crossSidecarStates.Clear();
+            _crossSidecarParentChildren.Clear();
             _reservedNestedCalls.Clear();
             _nestedCarrierIds.Clear();
             _nestedCarrierParents.Clear();
@@ -1962,6 +2577,7 @@ public sealed record SidecarActionCapabilityRequest(
 {
     public HostActionEntryRequestContext? HostContext { get; init; }
     public SidecarNestedHostActionEntryCarrier? NestedCarrier { get; init; }
+    public SidecarCrossSidecarActionEntryCarrier? CrossSidecarCarrier { get; init; }
     public SidecarActionTerminalRegistration? Terminal { get; init; }
 
     public static SidecarActionCapabilityRequest HostEntry(
@@ -2005,6 +2621,28 @@ public sealed record SidecarActionCapabilityRequest(
             deadline)
         {
             NestedCarrier = carrier,
+            Terminal = terminal,
+        };
+
+    public static SidecarActionCapabilityRequest HostEntryCrossSidecar(
+        SidecarCapabilityCallIdentity call,
+        SidecarActionDescriptorIdentity descriptor,
+        SidecarSerializedPayload action,
+        SidecarCancellationIdentity cancellation,
+        DateTimeOffset deadline,
+        SidecarCrossSidecarActionEntryCarrier carrier,
+        SidecarActionTerminalRegistration terminal) =>
+        new(
+            call,
+            SidecarActionInvocationKind.HostEntryCrossSidecar,
+            descriptor,
+            action,
+            null,
+            cancellation,
+            null,
+            deadline)
+        {
+            CrossSidecarCarrier = carrier,
             Terminal = terminal,
         };
 }
@@ -2120,6 +2758,7 @@ public sealed record SidecarActionTerminalTransportRequest(
 {
     public SidecarActionTerminalExecutionContext? Context { get; init; }
     public SidecarNestedHostActionEntryRequest? NestedCarrierRequest { get; init; }
+    public SidecarCrossSidecarActionEntryRequest? CrossSidecarActionRequest { get; init; }
     public Guid TerminalId { get; init; }
 }
 
@@ -2138,6 +2777,8 @@ public sealed record SidecarActionTerminalTransportResponse(
     public SidecarNestedHostActionEntryRelay? NestedCarrierRelay { get; init; }
     public SidecarHostTerminalAuthority? NestedCarrierAuthority { get; init; }
     public SidecarNestedHostActionEntryRelayOutcome? NestedCarrierOutcome { get; init; }
+    public SidecarCrossSidecarActionEntryRelay? CrossSidecarRelay { get; init; }
+    public SidecarCrossSidecarActionEntryOutcome? CrossSidecarOutcome { get; init; }
 }
 
 public static class SidecarCapabilityTransportValidation
@@ -2381,6 +3022,8 @@ public static class SidecarCapabilityTransportValidation
 
         var requiresSnapshot = request.Invocation is SidecarActionInvocationKind.Run or SidecarActionInvocationKind.RunRequired;
         var hostEntry = request.Invocation == SidecarActionInvocationKind.HostEntry;
+        var crossSidecarEntry = request.Invocation == SidecarActionInvocationKind.HostEntryCrossSidecar;
+        var requiresEntryAuthority = hostEntry || crossSidecarEntry;
         if (!Enum.IsDefined(request.Invocation) ||
             !IsValidDescriptor(request.Descriptor) ||
             request.Action is null ||
@@ -2388,17 +3031,28 @@ public static class SidecarCapabilityTransportValidation
             request.Action.SchemaVersion != request.Descriptor.InputSchemaVersion ||
             requiresSnapshot &&
             (request.Snapshot is null || string.IsNullOrWhiteSpace(request.Snapshot.ContractHash)) ||
-            hostEntry &&
+            requiresEntryAuthority &&
             (request.Snapshot is not null ||
-             (request.HostContext is null) == (request.NestedCarrier is null) ||
+             (request.HostContext is null ? 0 : 1) +
+                 (request.NestedCarrier is null ? 0 : 1) +
+                 (request.CrossSidecarCarrier is null ? 0 : 1) != 1 ||
              request.HostContext is not null && !request.HostContext.IsWellFormed(now) ||
              request.NestedCarrier is not null && !request.NestedCarrier.IsWellFormed ||
-              request.Terminal is null ||
-              !request.Terminal.IsWellFormed) ||
-             !hostEntry &&
+             request.CrossSidecarCarrier is not null && !request.CrossSidecarCarrier.IsWellFormed ||
+             crossSidecarEntry && request.CrossSidecarCarrier is null ||
+             crossSidecarEntry && request.HostContext is not null ||
+             crossSidecarEntry && request.NestedCarrier is not null ||
+             crossSidecarEntry && request.Terminal is null ||
+             crossSidecarEntry && request.CrossSidecarCarrier is not null &&
+                 (request.CrossSidecarCarrier.Authority.TargetChildCall != request.Call ||
+                  request.CrossSidecarCarrier.Descriptor != request.Descriptor) ||
+               request.Terminal is null ||
+               !request.Terminal.IsWellFormed) ||
+             !requiresEntryAuthority &&
              (request.HostContext is not null ||
               request.Terminal is not null ||
-               request.NestedCarrier is not null))
+               request.NestedCarrier is not null ||
+               request.CrossSidecarCarrier is not null))
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidPayload,
@@ -2411,6 +3065,17 @@ public static class SidecarCapabilityTransportValidation
             binding.PayloadLimits.ActionInputBytes);
         if (!payloadResult.Accepted)
             return payloadResult;
+
+        if (crossSidecarEntry &&
+            (request.CrossSidecarCarrier is null ||
+             !string.Equals(request.CrossSidecarCarrier.Action.ContentHash, request.Action.ContentHash, StringComparison.OrdinalIgnoreCase) ||
+             request.CrossSidecarCarrier.Action.ByteLength != request.Action.ByteLength ||
+             request.CrossSidecarCarrier.Authority.TargetEntry.Descriptor != request.Descriptor))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The cross-sidecar action request does not match its host-issued carrier.");
+        }
 
         if (hostEntry && request.HostContext is not null &&
             (request.HostContext.Contribution?.Lineage is null ||
@@ -2608,7 +3273,7 @@ public static class SidecarCapabilityTransportValidation
             request.Descriptor != initiatingRequest.Descriptor ||
             request.Cancellation != initiatingRequest.Cancellation ||
             request.Deadline != initiatingRequest.Deadline ||
-            initiatingRequest.Invocation == SidecarActionInvocationKind.HostEntry &&
+            initiatingRequest.Invocation is SidecarActionInvocationKind.HostEntry or SidecarActionInvocationKind.HostEntryCrossSidecar &&
             (initiatingRequest.Terminal is null ||
              !initiatingRequest.Terminal.IsWellFormed ||
              !string.Equals(initiatingRequest.Terminal.ActionTypeIdentity, initiatingRequest.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
@@ -2617,14 +3282,17 @@ public static class SidecarCapabilityTransportValidation
              initiatingRequest.Terminal.ResultSchemaVersion != initiatingRequest.Descriptor.ResultSchemaVersion ||
              !string.Equals(initiatingRequest.Terminal.DescriptorHash, initiatingRequest.Descriptor.DescriptorHash, StringComparison.Ordinal) ||
              request.TerminalId != initiatingRequest.Terminal.TerminalId ||
-             initiatingRequest.HostContext is null && initiatingRequest.NestedCarrier is null ||
+             initiatingRequest.HostContext is null && initiatingRequest.NestedCarrier is null && initiatingRequest.CrossSidecarCarrier is null ||
              initiatingRequest.HostContext is not null &&
              (request.Context is null ||
               !MatchesInitiatingHostContext(initiatingRequest.HostContext, request)) ||
              initiatingRequest.NestedCarrier is not null &&
              (request.Context is null ||
-              request.Context.InvocationId != initiatingRequest.NestedCarrier.InvocationId)) ||
-            initiatingRequest.Invocation != SidecarActionInvocationKind.HostEntry &&
+              request.Context.InvocationId != initiatingRequest.NestedCarrier.InvocationId) ||
+             initiatingRequest.CrossSidecarCarrier is not null &&
+             (request.Context is null ||
+              !MatchesCrossSidecarContext(request.Context, initiatingRequest.CrossSidecarCarrier))) ||
+            initiatingRequest.Invocation is not (SidecarActionInvocationKind.HostEntry or SidecarActionInvocationKind.HostEntryCrossSidecar) &&
             request.TerminalId != Guid.Empty ||
              request.NestedCarrierRequest is not null &&
              (initiatingRequest.Invocation != SidecarActionInvocationKind.HostEntry ||
@@ -2688,6 +3356,15 @@ public static class SidecarCapabilityTransportValidation
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(response);
         ArgumentNullException.ThrowIfNull(binding);
+
+        if (request.CrossSidecarActionRequest is not null ||
+            response.CrossSidecarRelay is not null ||
+            response.CrossSidecarOutcome is not null)
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidResponse,
+                "Cross-sidecar terminal responses require target-session validation.");
+        }
 
         var nestedOutcome = response.NestedCarrierOutcome;
         var nestedKind = nestedOutcome?.Kind;
@@ -2775,8 +3452,138 @@ public static class SidecarCapabilityTransportValidation
         return SidecarCapabilityValidationResult.Accept();
     }
 
+    public static SidecarCapabilityValidationResult ValidateActionTerminalResponse(
+        SidecarActionTerminalTransportRequest request,
+        SidecarActionTerminalTransportResponse response,
+        SidecarCapabilitySessionBinding sourceBinding,
+        SidecarCapabilitySessionBinding targetBinding,
+        DateTimeOffset now,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, bool> authenticate)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(response);
+
+        if (request.CrossSidecarActionRequest is null)
+        {
+            return ValidateActionTerminalResponse(
+                request,
+                response,
+                sourceBinding,
+                authenticateNestedCarrierAuthority: null);
+        }
+
+        return ValidateCrossSidecarActionTerminalResponse(
+            request,
+            response,
+            sourceBinding,
+            targetBinding,
+            now,
+            authenticate);
+    }
+
+    public static SidecarCapabilityValidationResult ValidateCrossSidecarActionTerminalResponse(
+        SidecarActionTerminalTransportRequest request,
+        SidecarActionTerminalTransportResponse response,
+        SidecarCapabilitySessionBinding sourceBinding,
+        SidecarCapabilitySessionBinding targetBinding,
+        DateTimeOffset now,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, bool> authenticate)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(response);
+        ArgumentNullException.ThrowIfNull(sourceBinding);
+        ArgumentNullException.ThrowIfNull(targetBinding);
+        ArgumentNullException.ThrowIfNull(authenticate);
+
+        var childRequest = request.CrossSidecarActionRequest;
+        var relay = response.CrossSidecarRelay;
+        if (childRequest is null || relay is null || !relay.IsWellFormed)
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidResponse,
+                "The cross-sidecar terminal response has no authenticated child relay.");
+        }
+
+        var requestResult = SidecarCrossSidecarActionEntryValidation.ValidateRequest(
+            childRequest,
+            request.Call,
+            sourceBinding,
+            now);
+        if (!requestResult.Accepted ||
+            relay.Carrier.Authority.SourceParentCall != request.Call ||
+            relay.TargetEntry.Descriptor.Key != childRequest.ActionKey ||
+            relay.TargetEntry.Descriptor.Version != childRequest.ActionVersion ||
+            !string.Equals(
+                relay.Carrier.Action.ContentHash,
+                childRequest.Action.ContentHash,
+                StringComparison.OrdinalIgnoreCase) ||
+            relay.Carrier.Action.ByteLength != childRequest.Action.ByteLength)
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The cross-sidecar relay does not bind to the parent terminal request.");
+        }
+
+        var carrierResult = SidecarCrossSidecarActionEntryValidation.ValidateCarrier(
+            relay.Carrier,
+            targetBinding,
+            now,
+            authenticate);
+        if (!carrierResult.Accepted)
+            return carrierResult;
+
+        if (response.CrossSidecarOutcome is not null)
+        {
+            if (response.CrossSidecarOutcome.Authority.TargetChildCall != relay.Carrier.Authority.TargetChildCall)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The cross-sidecar outcome does not bind to the relayed child call.");
+            }
+
+            return SidecarCrossSidecarActionEntryValidation.ValidateOutcome(
+                response.CrossSidecarOutcome,
+                targetBinding,
+                now,
+                authenticate);
+        }
+
+        if (response.CrossSidecarRelay is null || response.CrossSidecarOutcome is not null)
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidResponse,
+                "The cross-sidecar relay response has an invalid completion shape.");
+        }
+
+        return SidecarCapabilityValidationResult.Accept();
+    }
+
     private static bool IsValidDescriptor(SidecarActionDescriptorIdentity descriptor) =>
         descriptor is not null && descriptor.IsWellFormed;
+
+    private static bool MatchesCrossSidecarContext(
+        SidecarActionTerminalExecutionContext context,
+        SidecarCrossSidecarActionEntryCarrier carrier) =>
+        context.InvocationId == carrier.Authority.TargetChildInvocationId &&
+        context.ParentInvocationId == carrier.Authority.SourceParentInvocationId &&
+        context.Call == carrier.Authority.TargetChildCall &&
+        context.Descriptor == carrier.Authority.Descriptor &&
+        context.Caller == carrier.Authority.Caller &&
+        context.Features == carrier.Authority.Features &&
+        context.TraceId == carrier.Authority.TraceId &&
+        context.IdempotencyKey == carrier.Authority.IdempotencyKey &&
+        context.Depth == carrier.Authority.Depth &&
+        context.Attempt == carrier.Authority.Attempt &&
+        context.Deadline == carrier.Authority.Deadline &&
+        context.Cancellation.CancellationId == carrier.Authority.Cancellation.CancellationId &&
+        string.Equals(
+            context.Cancellation.AuthorityHash,
+            carrier.Authority.Cancellation.AuthorityHash,
+            StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(
+            SidecarCapabilityTransportValidation.ComputeSnapshotHash(context.Snapshot),
+            carrier.Authority.SnapshotContentHash,
+            StringComparison.OrdinalIgnoreCase);
 
     private static bool MatchesBinding(
         SidecarCapabilityCallIdentity call,
@@ -2790,7 +3597,7 @@ public static class SidecarCapabilityTransportValidation
         string.Equals(call.ModuleId, binding.ModuleId, StringComparison.Ordinal) &&
         string.Equals(call.GraphId, binding.GraphId, StringComparison.Ordinal);
 
-    private static SidecarCapabilityValidationResult ValidateReceipt(
+    public static SidecarCapabilityValidationResult ValidateReceipt(
         SidecarTerminalReceipt? receipt,
         Guid callId,
         SidecarActionDescriptorIdentity descriptor,
@@ -3254,7 +4061,7 @@ public static class SidecarCapabilityTransportValidation
                 SidecarCapabilityTransportCodec.Serialize(right)),
             StringComparison.OrdinalIgnoreCase);
 
-    private static string ComputeSnapshotHash(ActionPipelineSnapshot snapshot) =>
+    public static string ComputeSnapshotHash(ActionPipelineSnapshot snapshot) =>
         SidecarCapabilityTransportCodec.ComputeSha256(
             SidecarCapabilityTransportCodec.Serialize(snapshot));
 

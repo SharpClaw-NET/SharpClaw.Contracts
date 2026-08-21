@@ -3991,6 +3991,294 @@ public sealed class SidecarCapabilityTransportTests
         return new Fixture(now, binding, session, call, safeFailure, nonces, bindingHashes);
     }
 
+    [Fact]
+    public void CrossSidecarEntryIssuesResolvesConsumesAndCompletesOnce()
+    {
+        var fixture = CreateFixture();
+        var parentCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "cross-parent",
+            Sequence = 1,
+            Deadline = fixture.Now.AddMinutes(1),
+        };
+        var parentContext = IssueContext(
+            fixture,
+            new RequestPrincipal("source-user"),
+            HostActionEntryIngress.CrossModule,
+            lineage: new HostActionEntryLineage(
+                new SharpClawActionKey("source.action"),
+                1,
+                "source-descriptor",
+                "source.input",
+                1,
+                "source-schema",
+                null,
+                null));
+        var parentAction = Payload("source.input", new { value = 1 });
+        ActivateContext(fixture, parentContext);
+        Assert.True(fixture.Session.BeginCall(
+            parentCall,
+            SidecarCapabilityKind.Action,
+            parentAction,
+            parentAction.ByteLength,
+            fixture.Now,
+            parentContext).Accepted);
+        var parentReceipt = new SidecarTerminalReceipt(
+            "source-receipt",
+            new SharpClawActionKey("source.action"),
+            1,
+            parentCall.CallId,
+            1,
+            "source-scope",
+            parentAction.ContentHash);
+        Assert.True(fixture.Session.RecordTerminal(parentCall.CallId, Guid.NewGuid(), parentReceipt).Accepted);
+
+        var targetBinding = fixture.Binding with
+        {
+            ModuleId = "permission.module",
+            GraphId = "permission.graph",
+            SessionId = Guid.NewGuid(),
+            RequestId = Guid.NewGuid(),
+            CancellationId = Guid.NewGuid(),
+            Grant = fixture.Binding.Grant with
+            {
+                ModuleId = "permission.module",
+                GraphId = "permission.graph",
+            },
+            Authentication = fixture.Binding.Authentication with
+            {
+                Nonce = "target-binding",
+                BindingHash = string.Empty,
+            },
+        };
+        targetBinding = targetBinding with
+        {
+            Authentication = targetBinding.Authentication with
+            {
+                BindingHash = SidecarCapabilitySessionValidator.ComputeBindingHash(targetBinding),
+            },
+        };
+        var targetHashes = new HashSet<string>(StringComparer.Ordinal)
+        {
+            targetBinding.Authentication.BindingHash,
+        };
+        var targetSession = new SidecarCapabilitySession(
+            targetBinding,
+            authority => targetHashes.Contains(authority.BindingHash),
+            new HashSet<string>(StringComparer.Ordinal).Add,
+            fixture.Now);
+        var childKey = new SharpClawActionKey("permission.action");
+        var childDescriptor = new SidecarActionDescriptorIdentity(
+            childKey,
+            1,
+            "module-owned",
+            "permission.input",
+            "permission-input-schema",
+            1,
+            "permission.result",
+            "permission-result-schema",
+            1,
+            "permission-descriptor");
+        var childEntry = new SidecarModuleActionEntryDefinition(
+            "permission.module",
+            "permission.graph",
+            childDescriptor,
+            "permission.module",
+            "permission.graph");
+        var childRequest = new SidecarCrossSidecarActionEntryRequest(
+            childKey,
+            1,
+            Payload("permission.input", new { value = 2 }),
+            parentCall.Deadline,
+            fixture.Now.AddMinutes(2));
+        var snapshot = new ActionPipelineSnapshot("permission-snapshot", []);
+
+        var relayResult = fixture.Session.IssueCrossSidecarActionEntryRelay(
+            parentCall,
+            childRequest,
+            targetSession,
+            childEntry,
+            snapshot,
+            fixture.Now,
+            (authority, hash) => hash,
+            out var relay);
+        Assert.True(relayResult.Accepted, relayResult.Message);
+        Assert.NotNull(relay);
+        var relayBytes = SidecarCapabilityTransportCodec.Serialize(relay);
+        var relayRoundTrip = SidecarCapabilityTransportCodec.Deserialize<SidecarCrossSidecarActionEntryRelay>(relayBytes);
+        Assert.Equal(relayBytes, SidecarCapabilityTransportCodec.Serialize(relayRoundTrip));
+        Assert.Equal(childDescriptor, relay!.Descriptor);
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, fixture.Session.CompleteCall(parentCall.CallId, 1).Code);
+
+        var terminal = new SidecarActionTerminalRegistration(
+            Guid.NewGuid(),
+            childDescriptor.InputTypeIdentity,
+            childDescriptor.InputSchemaVersion,
+            childDescriptor.ResultTypeIdentity,
+            childDescriptor.ResultSchemaVersion,
+            childDescriptor.DescriptorHash);
+        var begin = targetSession.BeginCrossSidecarActionEntryCall(
+            relay.Carrier,
+            terminal,
+            relay.Carrier.Action.ByteLength,
+            fixture.Now,
+            out var childContext,
+            (authority, hash) => authority.Proof == hash);
+        Assert.True(begin.Accepted, begin.Message);
+        Assert.NotNull(childContext);
+        Assert.Equal(parentContext.InvocationId, childContext!.ParentInvocationId);
+        Assert.Equal(childDescriptor, relay.Descriptor);
+
+        var childReceipt = new SidecarTerminalReceipt(
+            "permission-receipt",
+            childKey,
+            1,
+            relay.Carrier.Authority.TargetChildCall.CallId,
+            relay.Carrier.Authority.Attempt,
+            "permission-scope",
+            relay.Carrier.Action.ContentHash);
+        Assert.True(targetSession.RecordTerminal(
+            relay.Carrier.Authority.TargetChildCall.CallId,
+            Guid.NewGuid(),
+            childReceipt).Accepted);
+        var childResult = Payload("permission.result", new { value = 3 });
+        var childOutcome = new SidecarActionOutcomeEnvelope(
+            ActionOutcomeKind.Completed,
+            childResult,
+            null,
+            null,
+            null,
+            childReceipt,
+            targetBinding.SafeFailure,
+            1);
+        var complete = targetSession.CompleteCrossSidecarActionEntry(
+            relay.Carrier,
+            childOutcome,
+            childReceipt,
+            fixture.Now,
+            (authority, hash) => hash,
+            out var completed);
+        Assert.True(complete.Accepted, complete.Message);
+        Assert.NotNull(completed);
+        Assert.Equal(SidecarCrossSidecarActionEntryOutcomeKind.Completed, completed!.Kind);
+        var terminalRequest = new SidecarActionTerminalTransportRequest(
+            parentCall,
+            SidecarActionInvocationKind.HostEntryCrossSidecar,
+            childDescriptor,
+            relay.Carrier.Action,
+            null!,
+            childReceipt,
+            new SidecarCancellationIdentity(parentCall.CancellationId, "source-cancellation", parentCall.Deadline),
+            parentCall.Deadline)
+        {
+            CrossSidecarActionRequest = childRequest,
+        };
+        var terminalResponse = new SidecarActionTerminalTransportResponse(
+            null,
+            new SidecarTerminalExecutionResult(childResult, null, true),
+            childReceipt,
+            targetBinding.SafeFailure)
+        {
+            CrossSidecarRelay = relay,
+            CrossSidecarOutcome = completed,
+        };
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                terminalResponse,
+                fixture.Binding).Code);
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            terminalResponse,
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.True(SidecarCrossSidecarActionEntryValidation.ValidateOutcome(
+            completed,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Replay, targetSession.BeginCrossSidecarActionEntryCall(
+            relay.Carrier,
+            terminal,
+            relay.Carrier.Action.ByteLength,
+            fixture.Now,
+            out _,
+            (authority, hash) => authority.Proof == hash).Code);
+
+        Assert.True(fixture.Session.CompleteCrossSidecarActionEntry(relay.Carrier, fixture.Now).Accepted);
+        Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarEntryRejectsChangedCarrierAndWrongTargetOwner()
+    {
+        var fixture = CreateFixture();
+        var parentCall = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "cross-parent-negative",
+            Sequence = 1,
+            Deadline = fixture.Now.AddMinutes(1),
+        };
+        var parentContext = IssueContext(
+            fixture,
+            new RequestPrincipal("source-user"),
+            HostActionEntryIngress.CrossModule,
+            lineage: new HostActionEntryLineage(
+                new SharpClawActionKey("source.action"),
+                1,
+                "source-descriptor",
+                "source.input",
+                1,
+                "source-schema",
+                null,
+                null));
+        var parentAction = Payload("source.input", new { value = 1 });
+        ActivateContext(fixture, parentContext);
+        Assert.True(fixture.Session.BeginCall(parentCall, SidecarCapabilityKind.Action, parentAction, parentAction.ByteLength, fixture.Now, parentContext).Accepted);
+        Assert.True(fixture.Session.RecordTerminal(
+            parentCall.CallId,
+            Guid.NewGuid(),
+            new SidecarTerminalReceipt("source-receipt-negative", new SharpClawActionKey("source.action"), 1, parentCall.CallId, 1, "source-scope", parentAction.ContentHash)).Accepted);
+
+        var targetBinding = fixture.Binding with
+        {
+            ModuleId = "permission.module",
+            GraphId = "permission.graph",
+            SessionId = Guid.NewGuid(),
+            RequestId = Guid.NewGuid(),
+            CancellationId = Guid.NewGuid(),
+            Grant = fixture.Binding.Grant with { ModuleId = "permission.module", GraphId = "permission.graph" },
+            Authentication = fixture.Binding.Authentication with { Nonce = "target-negative", BindingHash = string.Empty },
+        };
+        targetBinding = targetBinding with { Authentication = targetBinding.Authentication with { BindingHash = SidecarCapabilitySessionValidator.ComputeBindingHash(targetBinding) } };
+        var targetSession = new SidecarCapabilitySession(targetBinding, _ => true, new HashSet<string>(StringComparer.Ordinal).Add, fixture.Now);
+        var descriptor = new SidecarActionDescriptorIdentity(new SharpClawActionKey("permission.action"), 1, "module-owned", "permission.input", "permission-input-schema", 1, "permission.result", "permission-result-schema", 1, "permission-descriptor");
+        var entry = new SidecarModuleActionEntryDefinition("permission.module", "permission.graph", descriptor, "permission.module", "permission.graph");
+        var request = new SidecarCrossSidecarActionEntryRequest(descriptor.Key, 1, Payload("permission.input", new { value = 2 }), parentCall.Deadline, fixture.Now.AddMinutes(2));
+        var relayResult = fixture.Session.IssueCrossSidecarActionEntryRelay(parentCall, request, targetSession, entry, new ActionPipelineSnapshot("snapshot", []), fixture.Now, (authority, hash) => hash, out var relay);
+        Assert.True(relayResult.Accepted, relayResult.Message);
+        Assert.NotNull(relay);
+        var changed = relay!.Carrier with { Action = Payload("permission.input", new { value = 9 }) };
+        var changedResult = targetSession.BeginCrossSidecarActionEntryCall(
+            changed,
+            new SidecarActionTerminalRegistration(Guid.NewGuid(), descriptor.InputTypeIdentity, 1, descriptor.ResultTypeIdentity, 1, descriptor.DescriptorHash),
+            changed.Action.ByteLength,
+            fixture.Now,
+            out _,
+            (authority, hash) => authority.Proof == hash);
+        Assert.False(changedResult.Accepted);
+
+        var wrongEntry = entry with { ModuleId = "other.module", TerminalOwnerModuleId = "other.module" };
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, fixture.Session.IssueCrossSidecarActionEntryRelay(parentCall, request, targetSession, wrongEntry, new ActionPipelineSnapshot("snapshot", []), fixture.Now, (authority, hash) => hash, out _).Code);
+    }
+
     private static HostActionEntryRequestContext IssueContext(
         Fixture fixture,
         RequestPrincipal caller,
