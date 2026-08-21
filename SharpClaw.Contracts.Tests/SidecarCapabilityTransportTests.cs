@@ -3842,10 +3842,11 @@ public sealed class SidecarCapabilityTransportTests
     private static SidecarActionTerminalTransportRequest CreateTerminalRequest(
         Fixture fixture,
         SidecarActionCapabilityRequest request,
-        ActionPipelineSnapshot snapshot)
+        ActionPipelineSnapshot snapshot,
+        SidecarTerminalReceipt? receiptOverride = null)
     {
         var effectiveAction = request.Action;
-        var receipt = new SidecarTerminalReceipt(
+        var receipt = receiptOverride ?? new SidecarTerminalReceipt(
             "host-entry-receipt",
             request.Descriptor.Key,
             request.Descriptor.Version,
@@ -4176,26 +4177,54 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(complete.Accepted, complete.Message);
         Assert.NotNull(completed);
         Assert.Equal(SidecarCrossSidecarActionEntryOutcomeKind.Completed, completed!.Kind);
-        var terminalRequest = new SidecarActionTerminalTransportRequest(
+        var sourceDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("source.action"),
+            1,
+            "source.category",
+            "source.input",
+            "source-schema",
+            1,
+            "source.result",
+            "source-result-schema",
+            1,
+            "source-descriptor");
+        var parentTerminal = new SidecarActionTerminalRegistration(
+            Guid.NewGuid(),
+            sourceDescriptor.InputTypeIdentity,
+            sourceDescriptor.InputSchemaVersion,
+            sourceDescriptor.ResultTypeIdentity,
+            sourceDescriptor.ResultSchemaVersion,
+            sourceDescriptor.DescriptorHash);
+        var parentRequest = SidecarActionCapabilityRequest.HostEntry(
             parentCall,
-            SidecarActionInvocationKind.HostEntryCrossSidecar,
-            childDescriptor,
-            relay.Carrier.Action,
-            null!,
-            childReceipt,
+            sourceDescriptor,
+            parentAction,
             new SidecarCancellationIdentity(parentCall.CancellationId, "source-cancellation", parentCall.Deadline),
-            parentCall.Deadline)
+            parentCall.Deadline,
+            parentContext,
+            parentTerminal);
+        var terminalRequest = CreateTerminalRequest(
+            fixture,
+            parentRequest,
+            new ActionPipelineSnapshot("source-snapshot", []),
+            parentReceipt) with
         {
-            TerminalId = terminal.TerminalId,
             CrossSidecarActionRequest = childRequest,
         };
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+            parentRequest,
+            terminalRequest,
+            fixture.Binding,
+            fixture.Now,
+            (_, _) => true).Accepted);
+        var parentTerminalId = terminalRequest.TerminalId;
         var terminalResponse = new SidecarActionTerminalTransportResponse(
             childResultIdentity,
             childExecution,
-            childReceipt,
+            parentReceipt,
             targetBinding.SafeFailure)
         {
-            TerminalId = terminal.TerminalId,
+            TerminalId = parentTerminalId,
             CrossSidecarRelay = relay,
             CrossSidecarOutcome = completed,
         };
@@ -4205,9 +4234,55 @@ public sealed class SidecarCapabilityTransportTests
                 terminalRequest,
                 terminalResponse,
                 fixture.Binding).Code);
-        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+        var terminalValidation = SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
             terminalRequest,
             terminalResponse,
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash);
+        Assert.True(terminalValidation.Accepted, $"{terminalValidation.Code}: {terminalValidation.Message}");
+        var relayOnlyResponse = terminalResponse with
+        {
+            ResultIdentity = null,
+            Execution = new SidecarTerminalExecutionResult(null, null, false),
+            Receipt = parentReceipt,
+            SafeFailure = fixture.SafeFailure,
+            TerminalId = parentTerminalId,
+            CrossSidecarOutcome = null,
+        };
+        var relayOnlyRoundTrip = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+            SidecarCapabilityTransportCodec.Serialize(relayOnlyResponse));
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            relayOnlyRoundTrip,
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            relayOnlyRoundTrip with { TerminalId = Guid.NewGuid() },
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            relayOnlyRoundTrip with
+            {
+                Execution = new SidecarTerminalExecutionResult(null, null, true),
+            },
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            relayOnlyRoundTrip with
+            {
+                Receipt = parentReceipt with { ReceiptId = "changed-parent-receipt" },
+            },
             fixture.Binding,
             targetBinding,
             fixture.Now,
@@ -4290,6 +4365,77 @@ public sealed class SidecarCapabilityTransportTests
 
         Assert.True(fixture.Session.CompleteCrossSidecarActionEntry(relay.Carrier, fixture.Now).Accepted);
         Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarFailedAndCancelledOutcomesUseCompletedTerminalExecution()
+    {
+        var failed = CreateCrossRelay(CreateFixture(), CreateFixture(moduleId: "module-b", graphId: "graph-b"));
+        AssertCrossSidecarNonSuccessfulOutcome(failed, ActionOutcomeKind.Failed, includeError: true);
+
+        var cancelled = CreateCrossRelay(CreateFixture(), CreateFixture(moduleId: "module-c", graphId: "graph-c"));
+        AssertCrossSidecarNonSuccessfulOutcome(cancelled, ActionOutcomeKind.Cancelled, includeError: false);
+    }
+
+    private static void AssertCrossSidecarNonSuccessfulOutcome(
+        CrossRelayFixture cross,
+        ActionOutcomeKind kind,
+        bool includeError)
+    {
+        var failure = new SidecarSafeFailureIdentity(Guid.NewGuid(), "cross.failure", "The cross-sidecar operation failed safely.");
+        var terminal = new SidecarActionTerminalRegistration(
+            Guid.NewGuid(),
+            cross.Relay.Descriptor.InputTypeIdentity,
+            cross.Relay.Descriptor.InputSchemaVersion,
+            cross.Relay.Descriptor.ResultTypeIdentity,
+            cross.Relay.Descriptor.ResultSchemaVersion,
+            cross.Relay.Descriptor.DescriptorHash);
+        var begin = cross.TargetSession.BeginCrossSidecarActionEntryCall(
+            cross.Relay.Carrier,
+            terminal,
+            cross.Relay.Carrier.Action.ByteLength,
+            cross.Now,
+            out _,
+            (authority, hash) => authority.Proof == hash);
+        Assert.True(begin.Accepted, begin.Message);
+        var receipt = new SidecarTerminalReceipt(
+            $"{kind}-receipt",
+            cross.Relay.Descriptor.Key,
+            cross.Relay.Descriptor.Version,
+            cross.Relay.Carrier.Authority.TargetChildCall.CallId,
+            cross.Relay.Carrier.Authority.Attempt,
+            "cross-scope",
+            cross.Relay.Carrier.Action.ContentHash);
+        Assert.True(cross.TargetSession.RecordTerminal(
+            cross.Relay.Carrier.Authority.TargetChildCall.CallId,
+            terminal.TerminalId,
+            receipt).Accepted);
+        var outcome = new SidecarActionOutcomeEnvelope(
+            kind,
+            null,
+            null,
+            includeError ? new ExecutionError("cross.error", "The operation failed.") : null,
+            null,
+            receipt,
+            failure,
+            1);
+        var complete = cross.TargetSession.CompleteCrossSidecarActionEntry(
+            cross.Relay.Carrier,
+            outcome,
+            receipt,
+            new SidecarTerminalExecutionResult(null, failure, true),
+            null,
+            failure,
+            cross.Now,
+            (authority, hash) => hash,
+            out var completed);
+        Assert.True(complete.Accepted, complete.Message);
+        Assert.NotNull(completed);
+        Assert.True(SidecarCrossSidecarActionEntryValidation.ValidateOutcome(
+            completed!,
+            cross.TargetBinding,
+            cross.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
     }
 
     [Fact]
@@ -4464,6 +4610,33 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(source.Session.CompleteCall(cross.ParentCall.CallId, 1).Accepted);
     }
 
+    [Fact]
+    public void CrossSidecarNormalActivityDrainsExpiredPeerCleanup()
+    {
+        var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
+        var target = CreateFixture(moduleId: "module-b", graphId: "graph-b");
+        var cross = CreateCrossRelay(source, target);
+        var now = cross.Relay.Carrier.ExpiresAt.AddSeconds(1);
+        var call = target.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "normal-activity-after-expiry",
+            Sequence = 2,
+            Deadline = now.AddSeconds(30),
+        };
+        var payload = Payload("normal.activity.input", new { value = 1 });
+
+        Assert.True(target.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            payload,
+            payload.ByteLength,
+            now,
+            null).Accepted);
+        Assert.True(source.Session.CompleteCall(cross.ParentCall.CallId, 1).Accepted);
+    }
+
     private static (SidecarCapabilityCallIdentity Call, HostActionEntryRequestContext Context, SidecarSerializedPayload Action)
         PrepareCrossParent(Fixture fixture, string key)
     {
@@ -4547,7 +4720,7 @@ public sealed class SidecarCapabilityTransportTests
             (authority, hash) => hash,
             out var relay);
         Assert.True(result.Accepted, result.Message);
-        return new CrossRelayFixture(parent.Call, relay!);
+        return new CrossRelayFixture(parent.Call, relay!, target.Session, target.Binding, source.Now);
     }
 
     private static HostActionEntryRequestContext IssueContext(
@@ -4701,7 +4874,10 @@ public sealed class SidecarCapabilityTransportTests
 
     private sealed record CrossRelayFixture(
         SidecarCapabilityCallIdentity ParentCall,
-        SidecarCrossSidecarActionEntryRelay Relay);
+        SidecarCrossSidecarActionEntryRelay Relay,
+        SidecarCapabilitySession TargetSession,
+        SidecarCapabilitySessionBinding TargetBinding,
+        DateTimeOffset Now);
 
     private sealed class SessionHostActionEntryProxy(
         SidecarCapabilitySession session,

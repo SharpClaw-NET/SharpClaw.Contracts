@@ -392,7 +392,7 @@ public static class SidecarCrossSidecarActionEntryValidation
             authorityOutcome?.Receipt == result.ResultReceipt &&
             authorityFailure == result.Failure &&
             authorityExecution is not null &&
-            authorityExecution.Completed == (result.Kind == SidecarCrossSidecarActionEntryOutcomeKind.Completed) &&
+            authorityExecution.Completed &&
             authorityExecution.Result == outcome?.Result &&
             authorityExecution.Failure == (result.Kind == SidecarCrossSidecarActionEntryOutcomeKind.Completed ? null : result.Failure);
         if (!validOutcome ||
