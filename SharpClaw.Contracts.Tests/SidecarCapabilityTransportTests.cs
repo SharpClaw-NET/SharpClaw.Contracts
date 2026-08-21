@@ -3933,20 +3933,22 @@ public sealed class SidecarCapabilityTransportTests
     private static Fixture CreateFixture(
         int maxInFlight = 2,
         int maxCalls = 4,
-        IReadOnlyList<SidecarCapabilityKind>? capabilities = null)
+        IReadOnlyList<SidecarCapabilityKind>? capabilities = null,
+        string moduleId = "module-a",
+        string graphId = "graph-a")
     {
         var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var expires = now.AddMinutes(5);
         var safeFailure = new SidecarSafeFailureIdentity(Guid.NewGuid(), "sidecar.test.failure", "The test failure is safe.");
         var proof = new SidecarAuthenticationProof("hmac-sha256", "host-a", "nonce-a", "signature", "", now, expires);
         var binding = new SidecarCapabilitySessionBinding(
-            "module-a",
-            "graph-a",
+            moduleId,
+            graphId,
             1,
             new SidecarCapabilityGrant(
                 "grant-a",
-                "module-a",
-                "graph-a",
+                moduleId,
+                graphId,
                 capabilities ?? [SidecarCapabilityKind.Storage, SidecarCapabilityKind.Action],
                 "authorization-hash",
                 now.AddMinutes(-1),
@@ -4153,10 +4155,21 @@ public sealed class SidecarCapabilityTransportTests
             childReceipt,
             targetBinding.SafeFailure,
             1);
+        var childExecution = new SidecarTerminalExecutionResult(childResult, null, true);
+        var childResultIdentity = new SidecarActionResultIdentity(
+            Guid.NewGuid(),
+            relay.Carrier.Authority.TargetChildCall.CallId,
+            childKey,
+            1,
+            childResult.TypeIdentity,
+            childResult.ContentHash);
         var complete = targetSession.CompleteCrossSidecarActionEntry(
             relay.Carrier,
             childOutcome,
             childReceipt,
+            childExecution,
+            childResultIdentity,
+            targetBinding.SafeFailure,
             fixture.Now,
             (authority, hash) => hash,
             out var completed);
@@ -4173,14 +4186,16 @@ public sealed class SidecarCapabilityTransportTests
             new SidecarCancellationIdentity(parentCall.CancellationId, "source-cancellation", parentCall.Deadline),
             parentCall.Deadline)
         {
+            TerminalId = terminal.TerminalId,
             CrossSidecarActionRequest = childRequest,
         };
         var terminalResponse = new SidecarActionTerminalTransportResponse(
-            null,
-            new SidecarTerminalExecutionResult(childResult, null, true),
+            childResultIdentity,
+            childExecution,
             childReceipt,
             targetBinding.SafeFailure)
         {
+            TerminalId = terminal.TerminalId,
             CrossSidecarRelay = relay,
             CrossSidecarOutcome = completed,
         };
@@ -4199,6 +4214,69 @@ public sealed class SidecarCapabilityTransportTests
             (authority, hash) => authority.Proof == hash).Accepted);
         Assert.True(SidecarCrossSidecarActionEntryValidation.ValidateOutcome(
             completed,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.False(SidecarCrossSidecarActionEntryValidation.ValidateOutcome(
+            completed with
+            {
+                Authority = completed.Authority with { TerminalId = Guid.NewGuid() },
+            },
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.False(SidecarCrossSidecarActionEntryValidation.ValidateOutcome(
+            completed with
+            {
+                Outcome = completed.Outcome! with { Result = Payload("permission.result", new { value = 4 }) },
+            },
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            terminalResponse with { TerminalId = Guid.NewGuid() },
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            terminalResponse with
+            {
+                Execution = terminalResponse.Execution with { Result = Payload("permission.result", new { value = 5 }) },
+            },
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            terminalResponse with
+            {
+                ResultIdentity = terminalResponse.ResultIdentity! with { ContentHash = "changed-result-hash" },
+            },
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            terminalResponse with
+            {
+                Receipt = childReceipt with { ReceiptId = "changed-receipt" },
+            },
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            terminalResponse with
+            {
+                SafeFailure = new SidecarSafeFailureIdentity(Guid.NewGuid(), "changed.failure", "Changed failure."),
+            },
+            fixture.Binding,
             targetBinding,
             fixture.Now,
             (authority, hash) => authority.Proof == hash).Accepted);
@@ -4277,6 +4355,199 @@ public sealed class SidecarCapabilityTransportTests
 
         var wrongEntry = entry with { ModuleId = "other.module", TerminalOwnerModuleId = "other.module" };
         Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, fixture.Session.IssueCrossSidecarActionEntryRelay(parentCall, request, targetSession, wrongEntry, new ActionPipelineSnapshot("snapshot", []), fixture.Now, (authority, hash) => hash, out _).Code);
+    }
+
+    [Fact]
+    public async Task CrossSidecarReciprocalRelayDoesNotDeadlock()
+    {
+        var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
+        var target = CreateFixture(moduleId: "module-b", graphId: "graph-b");
+        var sourceParent = PrepareCrossParent(source, "source.parent");
+        var targetParent = PrepareCrossParent(target, "target.parent");
+        var sourceEntry = new SidecarModuleActionEntryDefinition(
+            source.Binding.ModuleId,
+            source.Binding.GraphId,
+            new SidecarActionDescriptorIdentity(
+                new SharpClawActionKey("source.child"),
+                1,
+                "source.category",
+                "source.child.input",
+                "source-child-input-schema",
+                1,
+                "source.child.result",
+                "source-child-result-schema",
+                1,
+                "source-child-descriptor"),
+            source.Binding.ModuleId,
+            source.Binding.GraphId);
+        var targetEntry = sourceEntry with
+        {
+            ModuleId = target.Binding.ModuleId,
+            GraphId = target.Binding.GraphId,
+            Descriptor = sourceEntry.Descriptor with
+            {
+                Key = new SharpClawActionKey("target.child"),
+                Category = "target.category",
+                InputTypeIdentity = "target.child.input",
+                InputSchemaHash = "target-child-input-schema",
+                ResultTypeIdentity = "target.child.result",
+                ResultSchemaHash = "target-child-result-schema",
+                DescriptorHash = "target-child-descriptor",
+            },
+            TerminalOwnerModuleId = target.Binding.ModuleId,
+            TerminalOwnerGraphId = target.Binding.GraphId,
+        };
+        var sourceRequest = new SidecarCrossSidecarActionEntryRequest(
+            targetEntry.Descriptor.Key,
+            targetEntry.Descriptor.Version,
+            Payload(targetEntry.Descriptor.InputTypeIdentity, new { value = 2 }),
+            sourceParent.Call.Deadline,
+            source.Now.AddMinutes(2));
+        var targetRequest = new SidecarCrossSidecarActionEntryRequest(
+            sourceEntry.Descriptor.Key,
+            sourceEntry.Descriptor.Version,
+            Payload(sourceEntry.Descriptor.InputTypeIdentity, new { value = 3 }),
+            targetParent.Call.Deadline,
+            target.Now.AddMinutes(2));
+        SidecarCrossSidecarActionEntryRelay? sourceRelay = null;
+        SidecarCrossSidecarActionEntryRelay? targetRelay = null;
+        var sourceTask = Task.Run(() => source.Session.IssueCrossSidecarActionEntryRelay(
+            sourceParent.Call,
+            sourceRequest,
+            target.Session,
+            targetEntry,
+            new ActionPipelineSnapshot("target-snapshot", []),
+            source.Now,
+            (authority, hash) => hash,
+            out sourceRelay));
+        var targetTask = Task.Run(() => target.Session.IssueCrossSidecarActionEntryRelay(
+            targetParent.Call,
+            targetRequest,
+            source.Session,
+            sourceEntry,
+            new ActionPipelineSnapshot("source-snapshot", []),
+            target.Now,
+            (authority, hash) => hash,
+            out targetRelay));
+
+        var all = Task.WhenAll(sourceTask, targetTask);
+        Assert.Same(all, await Task.WhenAny(all, Task.Delay(TimeSpan.FromSeconds(2))));
+        Assert.True((await sourceTask).Accepted);
+        Assert.True((await targetTask).Accepted);
+        Assert.NotNull(sourceRelay);
+        Assert.NotNull(targetRelay);
+    }
+
+    [Fact]
+    public void CrossSidecarTargetExpiryReleasesSourceParent()
+    {
+        var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
+        var target = CreateFixture(moduleId: "module-b", graphId: "graph-b");
+        var cross = CreateCrossRelay(source, target);
+
+        var removed = target.Session.SweepExpiredHostActionEntryCarriers(
+            cross.Relay.Carrier.ExpiresAt.AddSeconds(1));
+
+        Assert.Equal(1, removed);
+        Assert.True(source.Session.CompleteCall(cross.ParentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarTargetDisconnectReleasesSourceParent()
+    {
+        var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
+        var target = CreateFixture(moduleId: "module-b", graphId: "graph-b");
+        var cross = CreateCrossRelay(source, target);
+
+        target.Session.Disconnect();
+
+        Assert.True(source.Session.CompleteCall(cross.ParentCall.CallId, 1).Accepted);
+    }
+
+    private static (SidecarCapabilityCallIdentity Call, HostActionEntryRequestContext Context, SidecarSerializedPayload Action)
+        PrepareCrossParent(Fixture fixture, string key)
+    {
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = $"{key}-nonce",
+            Sequence = 1,
+            Deadline = fixture.Now.AddMinutes(1),
+        };
+        var action = Payload($"{key}.input", new { value = 1 });
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal($"{key}-caller"),
+            HostActionEntryIngress.CrossModule,
+            lineage: new HostActionEntryLineage(
+                new SharpClawActionKey(key),
+                1,
+                $"{key}-descriptor",
+                action.TypeIdentity,
+                1,
+                $"{key}-schema",
+                null,
+                null));
+        ActivateContext(fixture, context);
+        Assert.True(fixture.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            action,
+            action.ByteLength,
+            fixture.Now,
+            context).Accepted);
+        Assert.True(fixture.Session.RecordTerminal(
+            call.CallId,
+            Guid.NewGuid(),
+            new SidecarTerminalReceipt(
+                $"{key}-receipt",
+                new SharpClawActionKey(key),
+                1,
+                call.CallId,
+                1,
+                $"{key}-scope",
+                action.ContentHash)).Accepted);
+        return (call, context, action);
+    }
+
+    private static CrossRelayFixture CreateCrossRelay(Fixture source, Fixture target)
+    {
+        var parent = PrepareCrossParent(source, "source.parent");
+        var descriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("target.child"),
+            1,
+            "target.category",
+            "target.child.input",
+            "target-child-input-schema",
+            1,
+            "target.child.result",
+            "target-child-result-schema",
+            1,
+            "target-child-descriptor");
+        var entry = new SidecarModuleActionEntryDefinition(
+            target.Binding.ModuleId,
+            target.Binding.GraphId,
+            descriptor,
+            target.Binding.ModuleId,
+            target.Binding.GraphId);
+        var request = new SidecarCrossSidecarActionEntryRequest(
+            descriptor.Key,
+            descriptor.Version,
+            Payload(descriptor.InputTypeIdentity, new { value = 2 }),
+            parent.Call.Deadline,
+            source.Now.AddMinutes(2));
+        var result = source.Session.IssueCrossSidecarActionEntryRelay(
+            parent.Call,
+            request,
+            target.Session,
+            entry,
+            new ActionPipelineSnapshot("target-snapshot", []),
+            source.Now,
+            (authority, hash) => hash,
+            out var relay);
+        Assert.True(result.Accepted, result.Message);
+        return new CrossRelayFixture(parent.Call, relay!);
     }
 
     private static HostActionEntryRequestContext IssueContext(
@@ -4427,6 +4698,10 @@ public sealed class SidecarCapabilityTransportTests
         SidecarSafeFailureIdentity SafeFailure,
         HashSet<string> Nonces,
         HashSet<string> BindingHashes);
+
+    private sealed record CrossRelayFixture(
+        SidecarCapabilityCallIdentity ParentCall,
+        SidecarCrossSidecarActionEntryRelay Relay);
 
     private sealed class SessionHostActionEntryProxy(
         SidecarCapabilitySession session,

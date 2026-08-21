@@ -187,6 +187,7 @@ public sealed class SidecarCapabilitySession
     private readonly Dictionary<Guid, NestedCarrierState> _nestedCarrierStates = [];
     private readonly Dictionary<Guid, CrossSidecarCarrierState> _crossSidecarStates = [];
     private readonly Dictionary<Guid, Guid> _crossSidecarParentChildren = [];
+    private readonly List<(SidecarCapabilitySession Peer, Guid CarrierId)> _pendingCrossSidecarPeerCleanup = [];
     private readonly Dictionary<Guid, SidecarCapabilityCallIdentity> _reservedNestedCalls = [];
     private readonly HashSet<Guid> _nestedCarrierIds = [];
     private readonly Dictionary<Guid, Guid> _nestedCarrierParents = [];
@@ -222,7 +223,10 @@ public sealed class SidecarCapabilitySession
         SidecarCapabilityCallIdentity SourceParentCall,
         SidecarCapabilityCallIdentity TargetChildCall,
         SidecarModuleActionEntryDefinition TargetEntry,
-        bool Active);
+        bool Active,
+        SidecarActionTerminalRegistration? Terminal,
+        SidecarCapabilitySession? PeerSession,
+        bool IsSource);
 
     private static readonly TimeSpan CarrierReplayRetention = TimeSpan.FromMinutes(5);
 
@@ -929,6 +933,9 @@ public sealed class SidecarCapabilitySession
         ArgumentNullException.ThrowIfNull(issueProof);
         relay = null;
 
+        HostActionEntryRequestContext? sourceContext = null;
+        SidecarCapabilitySessionBinding sourceBinding;
+        long sourceGeneration;
         lock (_sync)
         {
             SweepExpiredEntryContexts(now);
@@ -942,7 +949,7 @@ public sealed class SidecarCapabilitySession
                 capability != SidecarCapabilityKind.Action ||
                 !_callIdentities.TryGetValue(parentCall.CallId, out var activeParent) ||
                 activeParent != parentCall ||
-                !_callEntryContexts.ContainsKey(parentCall.CallId) ||
+                !_callEntryContexts.TryGetValue(parentCall.CallId, out sourceContext) ||
                 !_terminalCalls.ContainsKey(parentCall.CallId))
             {
                 return SidecarCapabilityValidationResult.Reject(
@@ -970,45 +977,69 @@ public sealed class SidecarCapabilitySession
                     "The target module action entry is not owned by the target session.");
             }
 
-            var sourceContext = _callEntryContexts[parentCall.CallId];
-            var result = targetSession.ReserveCrossSidecarActionEntry(
-                parentCall,
-                sourceContext,
-                Binding,
-                _bindingGeneration,
-                request,
-                targetEntry,
-                targetSnapshot,
-                now,
-                issueProof,
-                out var carrier);
-            if (!result.Accepted || carrier is null)
-                return result;
+            sourceBinding = Binding;
+            sourceGeneration = _bindingGeneration;
+        }
 
-            try
+        var reservation = targetSession.ReserveCrossSidecarActionEntry(
+            this,
+            parentCall,
+            sourceContext!,
+            sourceBinding,
+            sourceGeneration,
+            request,
+            targetEntry,
+            targetSnapshot,
+            now,
+            issueProof,
+            out var reservedCarrier);
+        if (!reservation.Accepted || reservedCarrier is null)
+            return reservation;
+
+        var commitReservation = false;
+        lock (_sync)
+        {
+            commitReservation =
+                !_disconnected &&
+                _bindingGeneration == sourceGeneration &&
+                _calls.TryGetValue(parentCall.CallId, out var currentCapability) &&
+                currentCapability == SidecarCapabilityKind.Action &&
+                _callIdentities.TryGetValue(parentCall.CallId, out var currentParent) &&
+                currentParent == parentCall &&
+                _callEntryContexts.ContainsKey(parentCall.CallId) &&
+                _terminalCalls.ContainsKey(parentCall.CallId);
+
+            if (commitReservation)
             {
                 _crossSidecarStates.Add(
-                    carrier.CarrierId,
+                    reservedCarrier.CarrierId,
                     new CrossSidecarCarrierState(
-                        carrier,
+                        reservedCarrier,
                         parentCall,
-                        carrier.Authority.TargetChildCall,
+                        reservedCarrier.Authority.TargetChildCall,
                         targetEntry,
-                        Active: false));
-                _crossSidecarParentChildren.Add(carrier.CarrierId, parentCall.CallId);
+                        Active: false,
+                        Terminal: null,
+                        PeerSession: targetSession,
+                        IsSource: true));
+                _crossSidecarParentChildren.Add(reservedCarrier.CarrierId, parentCall.CallId);
             }
-            catch
-            {
-                targetSession.RevokeCrossSidecarActionEntry(carrier.CarrierId, now);
-                throw;
-            }
-
-            relay = new SidecarCrossSidecarActionEntryRelay(carrier, targetEntry);
-            return SidecarCapabilityValidationResult.Accept();
         }
+
+        if (!commitReservation)
+        {
+            targetSession.RevokeCrossSidecarActionEntry(reservedCarrier.CarrierId, now);
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidBinding,
+                "The source parent changed while the child authority was issued.");
+        }
+
+        relay = new SidecarCrossSidecarActionEntryRelay(reservedCarrier, targetEntry);
+        return SidecarCapabilityValidationResult.Accept();
     }
 
     private SidecarCapabilityValidationResult ReserveCrossSidecarActionEntry(
+        SidecarCapabilitySession sourceSession,
         SidecarCapabilityCallIdentity sourceParentCall,
         HostActionEntryRequestContext sourceContext,
         SidecarCapabilitySessionBinding sourceBinding,
@@ -1155,12 +1186,15 @@ public sealed class SidecarCapabilitySession
             _reservedNestedCalls.Add(childCall.CallId, childCall);
             _crossSidecarStates.Add(
                 carrier.CarrierId,
-                new CrossSidecarCarrierState(
-                    carrier,
-                    sourceParentCall,
-                    childCall,
-                    targetEntry,
-                    Active: false));
+                    new CrossSidecarCarrierState(
+                        carrier,
+                        sourceParentCall,
+                        childCall,
+                        targetEntry,
+                        Active: false,
+                        Terminal: null,
+                        PeerSession: sourceSession,
+                        IsSource: false));
             return SidecarCapabilityValidationResult.Accept();
         }
     }
@@ -1258,7 +1292,7 @@ public sealed class SidecarCapabilitySession
             if (!beginResult.Accepted)
                 return beginResult;
 
-            _crossSidecarStates[carrier.CarrierId] = state with { Active = true };
+            _crossSidecarStates[carrier.CarrierId] = state with { Active = true, Terminal = terminal };
             hostContext = new HostActionEntryRequestContext(
                 carrier.Authority.CapabilityId,
                 carrier.Authority.CapabilityHandle,
@@ -1300,6 +1334,9 @@ public sealed class SidecarCapabilitySession
         SidecarCrossSidecarActionEntryCarrier carrier,
         SidecarActionOutcomeEnvelope outcome,
         SidecarTerminalReceipt receipt,
+        SidecarTerminalExecutionResult execution,
+        SidecarActionResultIdentity? resultIdentity,
+        SidecarSafeFailureIdentity responseSafeFailure,
         DateTimeOffset now,
         Func<SidecarCrossSidecarActionEntryAuthority, string, string> issueProof,
         out SidecarCrossSidecarActionEntryOutcome? completed)
@@ -1307,8 +1344,12 @@ public sealed class SidecarCapabilitySession
         ArgumentNullException.ThrowIfNull(carrier);
         ArgumentNullException.ThrowIfNull(outcome);
         ArgumentNullException.ThrowIfNull(receipt);
+        ArgumentNullException.ThrowIfNull(execution);
+        ArgumentNullException.ThrowIfNull(responseSafeFailure);
         ArgumentNullException.ThrowIfNull(issueProof);
         completed = null;
+        SidecarCapabilitySession? peerSession = null;
+        SidecarCapabilityValidationResult result;
 
         lock (_sync)
         {
@@ -1325,6 +1366,11 @@ public sealed class SidecarCapabilitySession
                     SidecarCapabilityErrors.Replay,
                     "The cross-sidecar carrier is not active.");
             }
+
+            if (state.Terminal is null)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The cross-sidecar child has no registered terminal authority.");
 
             var receiptResult = SidecarCapabilityTransportValidation.ValidateReceipt(
                 receipt,
@@ -1355,6 +1401,20 @@ public sealed class SidecarCapabilitySession
                     SidecarCapabilityErrors.InvalidResponse,
                     "The cross-sidecar child outcome has an invalid terminal shape.");
 
+            if (state.Terminal.TerminalId == Guid.Empty ||
+                execution.Completed != (outcome.Kind == ActionOutcomeKind.Completed) ||
+                execution.Result != outcome.Result ||
+                execution.Failure != (outcome.Kind == ActionOutcomeKind.Completed ? null : responseSafeFailure) ||
+                outcome.SafeFailure != responseSafeFailure ||
+                (outcome.Kind == ActionOutcomeKind.Completed
+                    ? execution.Failure is not null
+                    : execution.Result is not null))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidResponse,
+                    "The cross-sidecar terminal envelope does not match the child outcome.");
+            }
+
             if (resultPayload is not null)
             {
                 var payloadResult = SidecarCapabilityTransportValidation.ValidateSerializedPayload(
@@ -1368,12 +1428,39 @@ public sealed class SidecarCapabilitySession
                         ? SidecarCapabilityValidationResult.Reject(
                             SidecarCapabilityErrors.InvalidResponse,
                             "The cross-sidecar child result does not match the target descriptor.")
-                        : payloadResult;
+                    : payloadResult;
+            }
+
+            if (outcome.Kind == ActionOutcomeKind.Completed)
+            {
+                if (resultIdentity is null ||
+                    resultIdentity.ResultId == Guid.Empty ||
+                    resultIdentity.CallId != state.TargetChildCall.CallId ||
+                    resultIdentity.ActionKey != state.TargetEntry.Descriptor.Key ||
+                    resultIdentity.ActionVersion != state.TargetEntry.Descriptor.Version ||
+                    resultIdentity.ResultTypeIdentity != resultPayload!.TypeIdentity ||
+                    resultIdentity.ContentHash != resultPayload.ContentHash)
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.InvalidResponse,
+                        "The cross-sidecar result identity does not match the child result.");
+                }
+            }
+            else if (resultIdentity is not null)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidResponse,
+                    "A non-completed cross-sidecar outcome cannot carry a result identity.");
             }
 
             var unsigned = carrier.Authority with
             {
                 ResultReceipt = receipt,
+                TerminalId = state.Terminal.TerminalId,
+                OutcomeEnvelope = outcome,
+                ResultIdentity = resultIdentity,
+                Execution = execution,
+                ResponseSafeFailure = responseSafeFailure,
                 CanonicalBindingHash = string.Empty,
                 Proof = string.Empty,
             };
@@ -1394,20 +1481,23 @@ public sealed class SidecarCapabilitySession
                 ActionOutcomeKind.Cancelled => SidecarCrossSidecarActionEntryOutcomeKind.Cancelled,
                 _ => SidecarCrossSidecarActionEntryOutcomeKind.Failed,
             };
-            var result = CompleteCall(state.TargetChildCall.CallId, 1);
+            result = CompleteCall(state.TargetChildCall.CallId, 1);
             if (!result.Accepted)
                 return result;
 
             _crossSidecarStates.Remove(carrier.CarrierId);
             RecordCarrierTombstone(carrier.CarrierId, _bindingGeneration, now, carrier.ExpiresAt);
+            peerSession = state.PeerSession;
             completed = new SidecarCrossSidecarActionEntryOutcome(
                 kind,
                 outcome,
                 receipt,
-                Binding.SafeFailure,
+                responseSafeFailure,
                 signed);
-            return SidecarCapabilityValidationResult.Accept();
         }
+
+        peerSession?.RemoveCrossSidecarPeerState(carrier.CarrierId, now);
+        return SidecarCapabilityValidationResult.Accept();
     }
 
     public SidecarCapabilityValidationResult CompleteCrossSidecarActionEntry(
@@ -1415,18 +1505,28 @@ public sealed class SidecarCapabilitySession
         DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(carrier);
+        SidecarCapabilitySession? peerSession;
 
         lock (_sync)
         {
-            if (!_crossSidecarParentChildren.Remove(carrier.CarrierId))
+            var removedRelation = _crossSidecarParentChildren.Remove(carrier.CarrierId);
+            var removedState = _crossSidecarStates.Remove(carrier.CarrierId, out var state);
+            if (!removedRelation && !removedState)
+            {
+                if (_completedEntryCarriers.ContainsKey(carrier.CarrierId))
+                    return SidecarCapabilityValidationResult.Accept();
+
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Duplicate,
                     "The source cross-sidecar child is already completed.");
+            }
 
-            _crossSidecarStates.Remove(carrier.CarrierId);
+            peerSession = removedState ? state!.PeerSession : null;
             RecordCarrierTombstone(carrier.CarrierId, _bindingGeneration, now, carrier.ExpiresAt);
-            return SidecarCapabilityValidationResult.Accept();
         }
+
+        peerSession?.RemoveCrossSidecarPeerState(carrier.CarrierId, now);
+        return SidecarCapabilityValidationResult.Accept();
     }
 
     private void AbortCrossSidecarCall(Guid callId)
@@ -1447,6 +1547,7 @@ public sealed class SidecarCapabilitySession
         Guid carrierId,
         DateTimeOffset now)
     {
+        SidecarCapabilitySession? peerSession;
         lock (_sync)
         {
             if (!_crossSidecarStates.Remove(carrierId, out var state))
@@ -1460,7 +1561,30 @@ public sealed class SidecarCapabilitySession
             else
                 AbortCrossSidecarCall(state.TargetChildCall.CallId);
             RecordCarrierTombstone(carrierId, _bindingGeneration, now, state.Carrier.ExpiresAt);
-            return SidecarCapabilityValidationResult.Accept();
+            peerSession = state.PeerSession;
+        }
+
+        peerSession?.RemoveCrossSidecarPeerState(carrierId, now);
+        return SidecarCapabilityValidationResult.Accept();
+    }
+
+    private void RemoveCrossSidecarPeerState(Guid carrierId, DateTimeOffset now)
+    {
+        lock (_sync)
+        {
+            if (!_crossSidecarStates.Remove(carrierId, out var state))
+                return;
+
+            _crossSidecarParentChildren.Remove(carrierId);
+            if (!state.IsSource)
+            {
+                if (_reservedNestedCalls.Remove(state.TargetChildCall.CallId))
+                    _inFlight = Math.Max(0, _inFlight - 1);
+                else
+                    AbortCrossSidecarCall(state.TargetChildCall.CallId);
+            }
+
+            RecordCarrierTombstone(carrierId, _bindingGeneration, now, state.Carrier.ExpiresAt);
         }
     }
 
@@ -1521,12 +1645,15 @@ public sealed class SidecarCapabilitySession
 
     public int SweepExpiredHostActionEntryCarriers(DateTimeOffset now)
     {
+        int removed;
         lock (_sync)
         {
-            var removed = SweepExpiredEntryContexts(now);
+            removed = SweepExpiredEntryContexts(now);
             SweepCompletedEntryCarriers(now);
-            return removed;
         }
+
+        DrainCrossSidecarPeerCleanup(now);
+        return removed;
     }
 
     public bool TryGetActiveHostActionEntryCarrier(
@@ -2057,6 +2184,8 @@ public sealed class SidecarCapabilitySession
                 _bindingGeneration,
                 now,
                 state.Carrier.ExpiresAt);
+            if (state.PeerSession is not null)
+                _pendingCrossSidecarPeerCleanup.Add((state.PeerSession, state.Carrier.CarrierId));
             removed++;
         }
 
@@ -2127,6 +2256,19 @@ public sealed class SidecarCapabilitySession
         }
     }
 
+    private void DrainCrossSidecarPeerCleanup(DateTimeOffset now)
+    {
+        List<(SidecarCapabilitySession Peer, Guid CarrierId)> pending;
+        lock (_sync)
+        {
+            pending = [.. _pendingCrossSidecarPeerCleanup];
+            _pendingCrossSidecarPeerCleanup.Clear();
+        }
+
+        foreach (var (peer, carrierId) in pending)
+            peer.RemoveCrossSidecarPeerState(carrierId, now);
+    }
+
     private static bool MatchesCarrier(
         HostActionEntryRequestContext context,
         HostActionEntryCarrierIdentity carrier) =>
@@ -2176,9 +2318,14 @@ public sealed class SidecarCapabilitySession
 
     public void Disconnect()
     {
+        List<(SidecarCapabilitySession Peer, Guid CarrierId)> peers;
         lock (_sync)
         {
             _disconnected = true;
+            peers = _crossSidecarStates.Values
+                .Where(state => state.PeerSession is not null)
+                .Select(state => (state.PeerSession!, state.Carrier.CarrierId))
+                .ToList();
             _calls.Clear();
             _callIdentities.Clear();
             _callPayloads.Clear();
@@ -2188,6 +2335,7 @@ public sealed class SidecarCapabilitySession
             _nestedCarrierStates.Clear();
             _crossSidecarStates.Clear();
             _crossSidecarParentChildren.Clear();
+            _pendingCrossSidecarPeerCleanup.Clear();
             _reservedNestedCalls.Clear();
             _nestedCarrierIds.Clear();
             _nestedCarrierParents.Clear();
@@ -2197,6 +2345,9 @@ public sealed class SidecarCapabilitySession
             _terminalReceipts.Clear();
             _inFlight = 0;
         }
+
+        foreach (var (peer, carrierId) in peers)
+            peer.RemoveCrossSidecarPeerState(carrierId, DateTimeOffset.UtcNow);
     }
 }
 
@@ -3534,11 +3685,20 @@ public static class SidecarCapabilityTransportValidation
 
         if (response.CrossSidecarOutcome is not null)
         {
-            if (response.CrossSidecarOutcome.Authority.TargetChildCall != relay.Carrier.Authority.TargetChildCall)
+            var outcomeAuthority = response.CrossSidecarOutcome.Authority;
+            if (outcomeAuthority.TargetChildCall != relay.Carrier.Authority.TargetChildCall ||
+                request.TerminalId != outcomeAuthority.TerminalId ||
+                request.Receipt != outcomeAuthority.ResultReceipt ||
+                response.TerminalId != outcomeAuthority.TerminalId ||
+                response.ResultIdentity != outcomeAuthority.ResultIdentity ||
+                response.Execution != outcomeAuthority.Execution ||
+                response.Receipt != outcomeAuthority.ResultReceipt ||
+                response.SafeFailure != outcomeAuthority.ResponseSafeFailure ||
+                response.CrossSidecarOutcome.Outcome != outcomeAuthority.OutcomeEnvelope)
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
-                    "The cross-sidecar outcome does not bind to the relayed child call.");
+                    "The cross-sidecar outcome does not bind to its authenticated terminal authority.");
             }
 
             return SidecarCrossSidecarActionEntryValidation.ValidateOutcome(

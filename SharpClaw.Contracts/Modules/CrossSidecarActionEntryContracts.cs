@@ -83,6 +83,11 @@ public sealed record SidecarCrossSidecarActionEntryAuthority(
     public SidecarActionDescriptorIdentity Descriptor => TargetEntry.Descriptor;
 
     public string CanonicalBindingHash { get; init; } = string.Empty;
+    public Guid TerminalId { get; init; }
+    public SidecarActionOutcomeEnvelope? OutcomeEnvelope { get; init; }
+    public SidecarActionResultIdentity? ResultIdentity { get; init; }
+    public SidecarTerminalExecutionResult? Execution { get; init; }
+    public SidecarSafeFailureIdentity? ResponseSafeFailure { get; init; }
 
     public bool IsValid =>
         SourceParentCall is not null &&
@@ -123,7 +128,20 @@ public sealed record SidecarCrossSidecarActionEntryAuthority(
         Deadline > IssuedAt &&
         Deadline <= ExpiresAt &&
         !string.IsNullOrWhiteSpace(CanonicalBindingHash) &&
-        !string.IsNullOrWhiteSpace(Proof);
+        !string.IsNullOrWhiteSpace(Proof) &&
+        (ResultReceipt is null
+            ? TerminalId == Guid.Empty &&
+              OutcomeEnvelope is null &&
+              ResultIdentity is null &&
+              Execution is null &&
+              ResponseSafeFailure is null
+            : TerminalId != Guid.Empty &&
+              OutcomeEnvelope is not null &&
+              Execution is not null &&
+              ResponseSafeFailure is not null &&
+              ResponseSafeFailure.IsValid &&
+              OutcomeEnvelope.TerminalCallCount == 1 &&
+              OutcomeEnvelope.Receipt == ResultReceipt);
 
     public bool HasResultReceipt => ResultReceipt is not null;
 }
@@ -231,6 +249,11 @@ public static class SidecarCrossSidecarActionEntryValidation
             authority.TerminalOwnerModuleId,
             authority.TerminalOwnerGraphId,
             ResultReceipt = authority.ResultReceipt,
+            authority.TerminalId,
+            OutcomeEnvelope = authority.OutcomeEnvelope,
+            ResultIdentity = authority.ResultIdentity,
+            Execution = authority.Execution,
+            ResponseSafeFailure = authority.ResponseSafeFailure,
         };
 
         return SidecarCapabilityTransportCodec.ComputeSha256(
@@ -361,7 +384,20 @@ public static class SidecarCrossSidecarActionEntryValidation
                 outcome.TerminalCallCount == 1,
             _ => false,
         };
-        if (!validOutcome || outcome!.Receipt != result.ResultReceipt)
+        var authorityOutcome = result.Authority.OutcomeEnvelope;
+        var authorityExecution = result.Authority.Execution;
+        var authorityFailure = result.Authority.ResponseSafeFailure;
+        var terminalAuthorityMatches =
+            authorityOutcome == outcome &&
+            authorityOutcome?.Receipt == result.ResultReceipt &&
+            authorityFailure == result.Failure &&
+            authorityExecution is not null &&
+            authorityExecution.Completed == (result.Kind == SidecarCrossSidecarActionEntryOutcomeKind.Completed) &&
+            authorityExecution.Result == outcome?.Result &&
+            authorityExecution.Failure == (result.Kind == SidecarCrossSidecarActionEntryOutcomeKind.Completed ? null : result.Failure);
+        if (!validOutcome ||
+            outcome!.Receipt != result.ResultReceipt ||
+            !terminalAuthorityMatches)
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidResponse,
@@ -377,11 +413,24 @@ public static class SidecarCrossSidecarActionEntryValidation
 
         if (outcome.Result is not null &&
             (outcome.Result.TypeIdentity != result.Authority.Descriptor.ResultTypeIdentity ||
-             outcome.Result.SchemaVersion != result.Authority.Descriptor.ResultSchemaVersion))
+             outcome.Result.SchemaVersion != result.Authority.Descriptor.ResultSchemaVersion ||
+             result.Authority.ResultIdentity is null ||
+             result.Authority.ResultIdentity.CallId != result.Authority.TargetChildCall.CallId ||
+             result.Authority.ResultIdentity.ActionKey != result.Authority.Descriptor.Key ||
+             result.Authority.ResultIdentity.ActionVersion != result.Authority.Descriptor.Version ||
+             result.Authority.ResultIdentity.ResultTypeIdentity != outcome.Result.TypeIdentity ||
+             result.Authority.ResultIdentity.ContentHash != outcome.Result.ContentHash))
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidResponse,
                 "The cross-sidecar child result does not match its authority.");
+        }
+
+        if (outcome.Result is null && result.Authority.ResultIdentity is not null)
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidResponse,
+                "A non-completed cross-sidecar outcome cannot carry a result identity.");
         }
 
         return SidecarCapabilityValidationResult.Accept();
