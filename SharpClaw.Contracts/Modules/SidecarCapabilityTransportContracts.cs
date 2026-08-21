@@ -3803,6 +3803,14 @@ public static class SidecarCapabilityTransportValidation
 
         if (response.CrossSidecarOutcome is not null)
         {
+            if (!response.CrossSidecarOutcome.IsWellFormed ||
+                response.CrossSidecarOutcome.Authority is null)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidResponse,
+                    "The cross-sidecar outcome authority is missing or malformed.");
+            }
+
             var outcomeAuthority = response.CrossSidecarOutcome.Authority;
             if (outcomeAuthority.TargetChildCall != relay.Carrier.Authority.TargetChildCall ||
                 response.ResultIdentity != outcomeAuthority.ResultIdentity ||
@@ -3829,7 +3837,8 @@ public static class SidecarCapabilityTransportValidation
                 "The cross-sidecar relay response has an invalid completion shape.");
         }
 
-        if (response.ResultIdentity is not null ||
+        if (response.Execution is null ||
+            response.ResultIdentity is not null ||
             response.Execution.Completed ||
             response.Execution.Result is not null ||
             response.Execution.Failure is not null ||

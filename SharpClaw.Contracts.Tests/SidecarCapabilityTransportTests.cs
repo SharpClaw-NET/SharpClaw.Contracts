@@ -4260,6 +4260,29 @@ public sealed class SidecarCapabilityTransportTests
             targetBinding,
             fixture.Now,
             (authority, hash) => authority.Proof == hash).Accepted);
+        var missingOutcomeAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+            SidecarCapabilityTransportCodec.Serialize(terminalResponse with
+            {
+                CrossSidecarOutcome = completed with { Authority = null! },
+            }));
+        var missingOutcomeAuthorityResult = SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            missingOutcomeAuthority,
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash);
+        Assert.Equal(SidecarCapabilityErrors.InvalidResponse, missingOutcomeAuthorityResult.Code);
+        var missingRelayExecution = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportResponse>(
+            SidecarCapabilityTransportCodec.Serialize(relayOnlyResponse with { Execution = null! }));
+        var missingRelayExecutionResult = SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            missingRelayExecution,
+            fixture.Binding,
+            targetBinding,
+            fixture.Now,
+            (authority, hash) => authority.Proof == hash);
+        Assert.Equal(SidecarCapabilityErrors.InvalidResponse, missingRelayExecutionResult.Code);
         Assert.False(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
             terminalRequest,
             relayOnlyRoundTrip with { TerminalId = Guid.NewGuid() },
