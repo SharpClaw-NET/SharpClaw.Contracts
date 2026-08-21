@@ -4599,6 +4599,25 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void CrossSidecarTargetDisconnectAtReservationBarrierReleasesSourceParent()
+    {
+        var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
+        var target = CreateFixture(moduleId: "module-b", graphId: "graph-b");
+        var attempt = CreateCrossRelayAttempt(
+            source,
+            target,
+            session => (authority, hash) =>
+            {
+                session.Disconnect();
+                return hash;
+            });
+
+        Assert.False(attempt.Result.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, attempt.Result.Code);
+        Assert.True(source.Session.CompleteCall(attempt.ParentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
     public void CrossSidecarTargetDisconnectReleasesSourceParent()
     {
         var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
@@ -4721,6 +4740,47 @@ public sealed class SidecarCapabilityTransportTests
             out var relay);
         Assert.True(result.Accepted, result.Message);
         return new CrossRelayFixture(parent.Call, relay!, target.Session, target.Binding, source.Now);
+    }
+
+    private static CrossRelayAttempt CreateCrossRelayAttempt(
+        Fixture source,
+        Fixture target,
+        Func<SidecarCapabilitySession, Func<SidecarCrossSidecarActionEntryAuthority, string, string>> proofFactory)
+    {
+        var parent = PrepareCrossParent(source, "source.parent.barrier");
+        var descriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("target.child.barrier"),
+            1,
+            "target.category",
+            "target.child.barrier.input",
+            "target-child-barrier-input-schema",
+            1,
+            "target.child.barrier.result",
+            "target-child-barrier-result-schema",
+            1,
+            "target-child-barrier-descriptor");
+        var entry = new SidecarModuleActionEntryDefinition(
+            target.Binding.ModuleId,
+            target.Binding.GraphId,
+            descriptor,
+            target.Binding.ModuleId,
+            target.Binding.GraphId);
+        var request = new SidecarCrossSidecarActionEntryRequest(
+            descriptor.Key,
+            descriptor.Version,
+            Payload(descriptor.InputTypeIdentity, new { value = 2 }),
+            parent.Call.Deadline,
+            source.Now.AddMinutes(2));
+        var result = source.Session.IssueCrossSidecarActionEntryRelay(
+            parent.Call,
+            request,
+            target.Session,
+            entry,
+            new ActionPipelineSnapshot("target-barrier-snapshot", []),
+            source.Now,
+            proofFactory(target.Session),
+            out var relay);
+        return new CrossRelayAttempt(result, parent.Call, relay, target.Session, target.Binding, source.Now);
     }
 
     private static HostActionEntryRequestContext IssueContext(
@@ -4875,6 +4935,14 @@ public sealed class SidecarCapabilityTransportTests
     private sealed record CrossRelayFixture(
         SidecarCapabilityCallIdentity ParentCall,
         SidecarCrossSidecarActionEntryRelay Relay,
+        SidecarCapabilitySession TargetSession,
+        SidecarCapabilitySessionBinding TargetBinding,
+        DateTimeOffset Now);
+
+    private sealed record CrossRelayAttempt(
+        SidecarCapabilityValidationResult Result,
+        SidecarCapabilityCallIdentity ParentCall,
+        SidecarCrossSidecarActionEntryRelay? Relay,
         SidecarCapabilitySession TargetSession,
         SidecarCapabilitySessionBinding TargetBinding,
         DateTimeOffset Now);
