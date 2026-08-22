@@ -200,8 +200,8 @@ public sealed class SidecarCapabilityTransportTests
                 typeof(JsonElement).AssemblyQualifiedName!,
                 1,
                 "action-input-schema",
-                null,
-                null));
+                 null,
+                 null));
         var limits = new SidecarPayloadLimits(1_048_576, 1_048_576, 1_048_576, 2_097_152, 512);
         var header = new SidecarMessageHeader(
             1,
@@ -2213,10 +2213,10 @@ public sealed class SidecarCapabilityTransportTests
                 descriptor.Version,
                 descriptor.DescriptorHash,
                 descriptor.InputTypeIdentity,
-                descriptor.InputSchemaVersion,
-                descriptor.InputSchemaHash,
-                null,
-                null));
+                 descriptor.InputSchemaVersion,
+                 descriptor.InputSchemaHash,
+                 original.ContentHash,
+                 original.ByteLength));
         var initiatingRequest = SidecarActionCapabilityRequest.HostEntry(
             call,
             descriptor,
@@ -2333,6 +2333,40 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Binding,
             fixture.Now,
             Authenticate).Accepted);
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionRequest(
+                roundTrip with
+                {
+                    HostContext = roundTrip.HostContext! with
+                    {
+                        Contribution = roundTrip.HostContext.Contribution! with
+                        {
+                            Lineage = roundTrip.HostContext.Contribution.Lineage with
+                            {
+                                PayloadContentHash = new string('A', 64),
+                            },
+                        },
+                    },
+                },
+                fixture.Binding,
+                fixture.Now,
+                Authenticate).Accepted);
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionRequest(
+                roundTrip with
+                {
+                    HostContext = roundTrip.HostContext! with
+                    {
+                        Contribution = roundTrip.HostContext.Contribution! with
+                        {
+                            Lineage = roundTrip.HostContext.Contribution.Lineage with
+                            {
+                                PayloadByteLength = original.ByteLength + 1,
+                            },
+                        },
+                    },
+                },
+                fixture.Binding,
+                fixture.Now,
+                Authenticate).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             SidecarCapabilityTransportValidation.ValidateActionRequest(
@@ -2343,6 +2377,22 @@ public sealed class SidecarCapabilityTransportTests
                         EffectiveContext = roundTrip.EffectiveHostEntryContext.EffectiveContext with
                         {
                             Snapshot = new ActionPipelineSnapshot("forged-host-graph", []),
+                        },
+                    },
+                },
+                fixture.Binding,
+                fixture.Now,
+                Authenticate).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Unauthorized,
+            SidecarCapabilityTransportValidation.ValidateActionRequest(
+                roundTrip with
+                {
+                    EffectiveHostEntryContext = roundTrip.EffectiveHostEntryContext with
+                    {
+                        Authority = roundTrip.EffectiveHostEntryContext.Authority with
+                        {
+                            Proof = "forged-proof",
                         },
                     },
                 },

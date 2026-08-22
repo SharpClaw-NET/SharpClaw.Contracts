@@ -3380,7 +3380,8 @@ public static class SidecarCapabilityTransportValidation
              !string.Equals(request.HostContext.Contribution.Lineage.InputTypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
              request.HostContext.Contribution.Lineage.InputSchemaVersion != request.Descriptor.InputSchemaVersion ||
              !string.Equals(request.HostContext.Contribution.Lineage.InputSchemaHash, request.Descriptor.InputSchemaHash, StringComparison.Ordinal) ||
-             request.HostContext.Contribution.Lineage.IsPayloadBound &&
+              request.EffectiveHostEntryContext is null &&
+              request.HostContext.Contribution.Lineage.IsPayloadBound &&
              (!string.Equals(
                  request.HostContext.Contribution.Lineage.PayloadContentHash,
                  request.Action.ContentHash,
