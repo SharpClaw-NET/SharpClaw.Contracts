@@ -1030,6 +1030,142 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void Production_session_verifies_and_consumes_one_external_authority()
+    {
+        var fixture = CreateExternalSessionFixture();
+
+        var accepted = fixture.Session.ValidateAndConsume(
+            fixture.Authority,
+            fixture.Now);
+        var replay = fixture.Session.ValidateAndConsume(
+            fixture.Authority,
+            fixture.Now);
+
+        Assert.True(accepted.Accepted, accepted.Message);
+        Assert.Equal(SidecarCapabilityErrors.Replay, replay.Code);
+    }
+
+    [Fact]
+    public void Production_session_rejects_forged_proof_without_consuming_valid_authority()
+    {
+        var fixture = CreateExternalSessionFixture();
+        var forged = fixture.Authority with
+        {
+            EffectiveHostEntry = fixture.Authority.EffectiveHostEntry with
+            {
+                Authority = fixture.Authority.EffectiveHostEntry.Authority with
+                {
+                    Proof = "forged-proof",
+                },
+            },
+        };
+        var recomputed = forged with
+        {
+            EffectiveHostEntry = forged.EffectiveHostEntry with
+            {
+                Authority = forged.EffectiveHostEntry.Authority with
+                {
+                    CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                        forged.EffectiveHostEntry.Authority),
+                },
+            },
+        };
+
+        Assert.Equal(
+            SidecarCapabilityErrors.Unauthenticated,
+            fixture.Session.ValidateAndConsume(forged, fixture.Now).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Unauthenticated,
+            fixture.Session.ValidateAndConsume(recomputed, fixture.Now).Code);
+        Assert.True(fixture.Session.ValidateAndConsume(fixture.Authority, fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public void Production_session_rejects_missing_callback_disconnect_and_expiry()
+    {
+        var missingCallback = CreateExternalSessionFixture(trustedProof: false);
+        Assert.Equal(
+            SidecarCapabilityErrors.Unauthenticated,
+            missingCallback.Session.ValidateAndConsume(
+                missingCallback.Authority,
+                missingCallback.Now).Code);
+
+        var disconnected = CreateExternalSessionFixture();
+        disconnected.Session.Disconnect();
+        Assert.Equal(
+            SidecarCapabilityErrors.Disconnected,
+            disconnected.Session.ValidateAndConsume(
+                disconnected.Authority,
+                disconnected.Now).Code);
+
+        var expired = CreateExternalSessionFixture();
+        Assert.Equal(
+            SidecarCapabilityErrors.Expired,
+            expired.Session.ValidateAndConsume(
+                expired.Authority,
+                expired.Now.AddMinutes(6)).Code);
+    }
+
+    [Fact]
+    public void Production_session_rejects_changed_external_authority_fields_without_consuming_valid_call()
+    {
+        var mutations = new Func<SidecarExternalActionDispatchAuthority, SidecarExternalActionDispatchAuthority>[]
+        {
+            authority => authority with { ModuleId = "changed.module" },
+            authority => authority with { GraphId = "changed.graph" },
+            authority => authority with
+            {
+                Call = authority.Call with { SessionId = Guid.NewGuid() },
+            },
+            authority => authority with
+            {
+                Call = authority.Call with { RequestId = Guid.NewGuid() },
+            },
+            authority => authority with
+            {
+                Call = authority.Call with { CancellationId = Guid.NewGuid() },
+            },
+            authority => authority with
+            {
+                Call = authority.Call with { CallId = Guid.NewGuid() },
+            },
+            authority => authority with
+            {
+                Action = authority.Action with { ContentHash = "changed-payload-hash" },
+            },
+            authority => authority with
+            {
+                Action = authority.Action with { ByteLength = authority.Action.ByteLength + 1 },
+            },
+        };
+
+        foreach (var mutate in mutations)
+        {
+            var fixture = CreateExternalSessionFixture();
+            var rejected = fixture.Session.ValidateAndConsume(
+                mutate(fixture.Authority),
+                fixture.Now);
+
+            Assert.False(rejected.Accepted, rejected.Message);
+            Assert.True(
+                fixture.Session.ValidateAndConsume(fixture.Authority, fixture.Now).Accepted,
+                rejected.Message);
+        }
+    }
+
+    [Fact]
+    public async Task Production_session_consumes_external_authority_once_under_concurrent_replay()
+    {
+        var fixture = CreateExternalSessionFixture();
+        var results = await Task.WhenAll(
+            Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+                fixture.Session.ValidateAndConsume(fixture.Authority, fixture.Now))));
+
+        Assert.Equal(1, results.Count(result => result.Accepted));
+        Assert.Equal(7, results.Count(result => result.Code == SidecarCapabilityErrors.Replay));
+    }
+
+    [Fact]
     public async Task Entry_contexts_are_distinct_single_use_and_bound_to_ingress_lifetime()
     {
         var fixture = CreateFixture();
@@ -4170,12 +4306,89 @@ public sealed class SidecarCapabilityTransportTests
         };
     }
 
+    private static ExternalSessionFixture CreateExternalSessionFixture(bool trustedProof = true)
+    {
+        var fixture = CreateFixture(
+            authenticateHostTerminalAuthority: trustedProof
+                ? static (authority, hash) => authority.Proof == hash
+                : null);
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "external-action-call",
+            Sequence = 1,
+        };
+        var descriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("sidecar.external.action"),
+            1,
+            "sidecar",
+            "external.input",
+            "external-input-schema",
+            1,
+            "external.result",
+            "external-result-schema",
+            1,
+            "external-descriptor");
+        var action = Payload(descriptor.InputTypeIdentity, new { value = "external" });
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("external-user"),
+            HostActionEntryIngress.Endpoint,
+            lineage: new HostActionEntryLineage(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                action.ContentHash,
+                action.ByteLength),
+            bindPayload: false);
+        _ = ActivateContext(fixture, context);
+        var begin = fixture.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            action,
+            action.ByteLength,
+            fixture.Now,
+            context);
+        Assert.True(begin.Accepted, begin.Message);
+        var request = SidecarCapabilityTransportValidationRequest(
+            call,
+            descriptor,
+            action,
+            context);
+        var terminalRequest = CreateTerminalRequest(
+            fixture,
+            request,
+            new ActionPipelineSnapshot("external-snapshot", []));
+        var hostAuthority = terminalRequest.Authority with
+        {
+            Proof = terminalRequest.Authority.CanonicalBindingHash,
+        };
+        var authority = new SidecarExternalActionDispatchAuthority(
+            call.ModuleId,
+            call.GraphId,
+            call,
+            descriptor,
+            action,
+            request.Terminal!,
+            context,
+            new SidecarActionEffectiveHostEntryContext(
+                context,
+                terminalRequest.Context!,
+                hostAuthority));
+        return new ExternalSessionFixture(fixture, authority);
+    }
+
     private static Fixture CreateFixture(
         int maxInFlight = 2,
         int maxCalls = 4,
         IReadOnlyList<SidecarCapabilityKind>? capabilities = null,
         string moduleId = "module-a",
-        string graphId = "graph-a")
+        string graphId = "graph-a",
+        Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null)
     {
         var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var expires = now.AddMinutes(5);
@@ -4218,7 +4431,8 @@ public sealed class SidecarCapabilityTransportTests
             binding,
             authority => bindingHashes.Contains(authority.BindingHash),
             nonces.Add,
-            now);
+            now,
+            authenticateHostTerminalAuthority);
         var call = new SidecarCapabilityCallIdentity(
             binding.SessionId,
             binding.RequestId,
@@ -5052,7 +5266,8 @@ public sealed class SidecarCapabilityTransportTests
         Guid? traceId = null,
         Guid? idempotencyKey = null,
         DateTimeOffset? actionDeadline = null,
-        HostActionEntryLineage? lineage = null)
+        HostActionEntryLineage? lineage = null,
+        bool bindPayload = false)
     {
         var request = new HostActionEntryContextRequest(
             ingress,
@@ -5074,7 +5289,9 @@ public sealed class SidecarCapabilityTransportTests
                     HostActionEntryIngress.Tool => new HostActionEntryIngressBinding(ingress, "clock_now"),
                     _ => new HostActionEntryIngressBinding(ingress, "source.module", "target.module"),
                 },
-                LineageForContext(lineage)),
+                bindPayload
+                    ? lineage ?? throw new ArgumentException("A payload-bound context requires lineage.", nameof(lineage))
+                    : LineageForContext(lineage)),
         };
         var result = fixture.Session.IssueHostActionEntryContext(
             request,
@@ -5193,6 +5410,14 @@ public sealed class SidecarCapabilityTransportTests
         SidecarSafeFailureIdentity SafeFailure,
         HashSet<string> Nonces,
         HashSet<string> BindingHashes);
+
+    private sealed record ExternalSessionFixture(
+        Fixture SessionFixture,
+        SidecarExternalActionDispatchAuthority Authority)
+    {
+        public DateTimeOffset Now => SessionFixture.Now;
+        public SidecarCapabilitySession Session => SessionFixture.Session;
+    }
 
     private sealed record CrossRelayFixture(
         SidecarCapabilityCallIdentity ParentCall,

@@ -327,13 +327,39 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 return bindingResult;
 
             var hostAuthority = authority.EffectiveHostEntry?.Authority;
+            var effectiveContext = authority.EffectiveHostEntry?.EffectiveContext;
             if (hostAuthority is null ||
+                effectiveContext is null ||
                 hostAuthority.AuthorityId == Guid.Empty ||
                 string.IsNullOrWhiteSpace(hostAuthority.Proof) ||
                 string.IsNullOrWhiteSpace(hostAuthority.CanonicalBindingHash) ||
                 !string.Equals(
                     hostAuthority.CanonicalBindingHash,
                     SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(hostAuthority),
+                    StringComparison.OrdinalIgnoreCase) ||
+                hostAuthority.SessionId != authority.Call.SessionId ||
+                hostAuthority.RequestId != authority.Call.RequestId ||
+                hostAuthority.CancellationId != authority.Call.CancellationId ||
+                hostAuthority.CallId != authority.Call.CallId ||
+                !string.Equals(hostAuthority.ModuleId, authority.ModuleId, StringComparison.Ordinal) ||
+                !string.Equals(hostAuthority.GraphId, authority.GraphId, StringComparison.Ordinal) ||
+                hostAuthority.Invocation != effectiveContext.Invocation ||
+                hostAuthority.ActionKey != authority.Descriptor.Key ||
+                hostAuthority.ActionVersion != authority.Descriptor.Version ||
+                !string.Equals(hostAuthority.DescriptorHash, authority.Descriptor.DescriptorHash, StringComparison.Ordinal) ||
+                hostAuthority.TerminalId != authority.Terminal.TerminalId ||
+                !string.Equals(hostAuthority.EffectiveActionTypeIdentity, authority.Action.TypeIdentity, StringComparison.Ordinal) ||
+                hostAuthority.EffectiveActionSchemaVersion != authority.Action.SchemaVersion ||
+                !string.Equals(hostAuthority.EffectiveActionContentHash, authority.Action.ContentHash, StringComparison.OrdinalIgnoreCase) ||
+                hostAuthority.EffectiveActionByteLength != authority.Action.ByteLength ||
+                !string.Equals(
+                    hostAuthority.SnapshotContentHash,
+                    SidecarCapabilityTransportValidation.ComputeSnapshotHash(effectiveContext.Snapshot),
+                    StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(
+                    hostAuthority.HostContextBindingHash,
+                    SidecarCapabilityTransportValidation.ComputeHostActionEntryContextBindingHash(
+                        authority.InitiatingHostContext),
                     StringComparison.OrdinalIgnoreCase) ||
                 _authenticateHostTerminalAuthority is null ||
                 !_authenticateHostTerminalAuthority(
