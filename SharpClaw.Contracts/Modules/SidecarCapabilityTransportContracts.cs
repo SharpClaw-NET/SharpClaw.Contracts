@@ -174,10 +174,11 @@ public static class SidecarCapabilityErrors
     public const string TerminalAlreadyCalled = "sidecar_terminal_already_called";
 }
 
-public sealed class SidecarCapabilitySession
+public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAuthorityVerifier
 {
     private readonly object _sync = new();
     private readonly Func<SidecarCapabilityAuthenticationAuthority, bool> _authenticate;
+    private readonly Func<SidecarHostTerminalAuthority, string, bool>? _authenticateHostTerminalAuthority;
     private readonly Func<string, bool> _registerAuthenticationNonce;
     private readonly Dictionary<Guid, SidecarCapabilityKind> _calls = [];
     private readonly Dictionary<Guid, SidecarCapabilityCallIdentity> _callIdentities = [];
@@ -199,6 +200,7 @@ public sealed class SidecarCapabilitySession
     private readonly Dictionary<Guid, Guid> _terminalCalls = [];
     private readonly Dictionary<Guid, SidecarTerminalReceipt> _terminalReceipts = [];
     private readonly HashSet<Guid> _usedTerminalAuthorities = [];
+    private readonly HashSet<Guid> _consumedExternalActionCalls = [];
     private long _lastSequence;
     private int _inFlight;
     private int _totalCalls;
@@ -234,7 +236,8 @@ public sealed class SidecarCapabilitySession
         SidecarCapabilitySessionBinding binding,
         Func<SidecarCapabilityAuthenticationAuthority, bool> authenticate,
         Func<string, bool> registerAuthenticationNonce,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null)
     {
         ArgumentNullException.ThrowIfNull(binding);
         ArgumentNullException.ThrowIfNull(authenticate);
@@ -242,6 +245,7 @@ public sealed class SidecarCapabilitySession
         Binding = binding;
         _authenticate = authenticate;
         _registerAuthenticationNonce = registerAuthenticationNonce;
+        _authenticateHostTerminalAuthority = authenticateHostTerminalAuthority;
 
         var result = SidecarCapabilitySessionValidator.Validate(
             binding,
@@ -287,6 +291,81 @@ public sealed class SidecarCapabilitySession
         {
             lock (_sync)
                 return _completedEntryCarriers.Count;
+        }
+    }
+
+    public SidecarCapabilityValidationResult ValidateAndConsume(
+        SidecarExternalActionDispatchAuthority authority,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(authority);
+
+        lock (_sync)
+        {
+            if (!authority.IsWellFormed)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The external action authority is incomplete.");
+
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            if (_consumedExternalActionCalls.Contains(authority.Call.CallId))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The external action authority was already consumed.");
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            var hostAuthority = authority.EffectiveHostEntry?.Authority;
+            if (hostAuthority is null ||
+                hostAuthority.AuthorityId == Guid.Empty ||
+                string.IsNullOrWhiteSpace(hostAuthority.Proof) ||
+                string.IsNullOrWhiteSpace(hostAuthority.CanonicalBindingHash) ||
+                !string.Equals(
+                    hostAuthority.CanonicalBindingHash,
+                    SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(hostAuthority),
+                    StringComparison.OrdinalIgnoreCase) ||
+                _authenticateHostTerminalAuthority is null ||
+                !_authenticateHostTerminalAuthority(
+                    hostAuthority,
+                    hostAuthority.CanonicalBindingHash))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The host did not authenticate the external action authority.");
+            }
+
+            if (!string.Equals(authority.ModuleId, Binding.ModuleId, StringComparison.Ordinal) ||
+                !string.Equals(authority.GraphId, Binding.GraphId, StringComparison.Ordinal) ||
+                authority.Call.SessionId != Binding.SessionId ||
+                authority.Call.RequestId != Binding.RequestId ||
+                authority.Call.CancellationId != Binding.CancellationId ||
+                !_calls.TryGetValue(authority.Call.CallId, out var capability) ||
+                capability != SidecarCapabilityKind.Action ||
+                !_callIdentities.TryGetValue(authority.Call.CallId, out var activeCall) ||
+                activeCall != authority.Call ||
+                !_callPayloads.TryGetValue(authority.Call.CallId, out var payload) ||
+                payload is null ||
+                !string.Equals(payload.ContentHash, authority.Action.ContentHash, StringComparison.OrdinalIgnoreCase) ||
+                payload.ByteLength != authority.Action.ByteLength)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The external action authority does not match the active session call.");
+            }
+
+            _consumedExternalActionCalls.Add(authority.Call.CallId);
+            return SidecarCapabilityValidationResult.Accept();
         }
     }
 
@@ -2472,6 +2551,7 @@ public sealed class SidecarCapabilitySession
             _consumedEntryCarriers.Clear();
             _terminalCalls.Clear();
             _terminalReceipts.Clear();
+            _consumedExternalActionCalls.Clear();
             _inFlight = 0;
         }
 

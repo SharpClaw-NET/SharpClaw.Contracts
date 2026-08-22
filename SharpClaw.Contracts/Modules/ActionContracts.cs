@@ -986,6 +986,14 @@ public sealed record SidecarExternalActionDispatchAuthority(
         EffectiveHostEntry.IsWellFormed;
 }
 
+/// <summary>Trusted host or session authority for one external action dispatch.</summary>
+public interface ISidecarExternalActionDispatchAuthorityVerifier
+{
+    SidecarCapabilityValidationResult ValidateAndConsume(
+        SidecarExternalActionDispatchAuthority authority,
+        DateTimeOffset now);
+}
+
 public static class SidecarExternalActionDispatchAuthorityValidator
 {
     public static SidecarCapabilityValidationResult Validate<TAction, TResult>(
