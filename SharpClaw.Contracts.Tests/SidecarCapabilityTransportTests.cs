@@ -2181,6 +2181,194 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void Host_entry_effective_dispatcher_context_binds_replacement_and_snapshot()
+    {
+        var fixture = CreateFixture();
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "effective-host-entry",
+        };
+        var descriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("effective.host.entry"),
+            1,
+            "effective",
+            typeof(string).AssemblyQualifiedName!,
+            "effective-input",
+            1,
+            typeof(string).AssemblyQualifiedName!,
+            "effective-result",
+            1,
+            "effective-descriptor");
+        var original = Payload(descriptor.InputTypeIdentity, "action-a");
+        var replacement = Payload(descriptor.InputTypeIdentity, "action-b");
+        var hostContext = IssueContext(
+            fixture,
+            new RequestPrincipal("effective-caller", Roles: new HashSet<string>(["reader"])),
+            HostActionEntryIngress.Endpoint,
+            actionDeadline: call.Deadline,
+            lineage: new HostActionEntryLineage(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                null,
+                null));
+        var initiatingRequest = SidecarActionCapabilityRequest.HostEntry(
+            call,
+            descriptor,
+            original,
+            new SidecarCancellationIdentity(call.CancellationId, "effective-cancel", call.Deadline),
+            call.Deadline,
+            hostContext,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.ResultTypeIdentity,
+                descriptor.ResultSchemaVersion,
+                descriptor.DescriptorHash));
+        var effectiveRequest = initiatingRequest with { Action = replacement };
+        var terminalRequest = CreateTerminalRequest(
+            fixture,
+            effectiveRequest,
+            new ActionPipelineSnapshot(
+                "effective-host-graph",
+                [new ActionCapabilityGrant(
+                    descriptor.Key,
+                    descriptor.Version,
+                    ActionInterceptionCapabilities.Inspect)]));
+        effectiveRequest = effectiveRequest with
+        {
+            EffectiveHostEntryContext = new SidecarActionEffectiveHostEntryContext(
+                hostContext,
+                terminalRequest.Context!,
+                terminalRequest.Authority),
+        };
+        var roundTrip = SidecarCapabilityTransportCodec.Deserialize<SidecarActionCapabilityRequest>(
+            SidecarCapabilityTransportCodec.Serialize(effectiveRequest));
+        static bool Authenticate(SidecarHostTerminalAuthority authority, string proof) =>
+            authority.Proof == "host-proof" &&
+            proof == authority.CanonicalBindingHash;
+
+        Assert.True(roundTrip.EffectiveHostEntryContext!.IsWellFormed);
+        Assert.Equal(
+            SidecarCapabilityTransportValidation.ComputeHostActionEntryContextBindingHash(hostContext),
+            roundTrip.EffectiveHostEntryContext.Authority.HostContextBindingHash);
+        Assert.Equal(
+            SidecarCapabilityTransportValidation.ComputeSnapshotHash(
+                roundTrip.EffectiveHostEntryContext.EffectiveContext.Snapshot),
+            roundTrip.EffectiveHostEntryContext.Authority.SnapshotContentHash);
+        Assert.Equal(
+            SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                roundTrip.EffectiveHostEntryContext.Authority),
+            roundTrip.EffectiveHostEntryContext.Authority.CanonicalBindingHash);
+        Assert.Equal(hostContext.InvocationId, terminalRequest.Context!.InvocationId);
+        Assert.Equal(hostContext.ParentInvocationId, terminalRequest.Context.ParentInvocationId);
+        Assert.Equal(hostContext.Depth, terminalRequest.Context.Depth);
+        Assert.Equal(hostContext.Attempt, terminalRequest.Context.Attempt);
+        Assert.Equal(hostContext.TraceId, terminalRequest.Context.TraceId);
+        Assert.Equal(hostContext.IdempotencyKey, terminalRequest.Context.IdempotencyKey);
+        Assert.Equal(hostContext.Deadline, terminalRequest.Context.Deadline);
+        Assert.Equal(hostContext.Contribution!.Lineage.ActionKey, terminalRequest.Descriptor.Key);
+        Assert.Equal(hostContext.Contribution.Lineage.ActionVersion, terminalRequest.Descriptor.Version);
+        Assert.Equal(hostContext.Contribution.Lineage.DescriptorHash, terminalRequest.Descriptor.DescriptorHash);
+        Assert.Equal(hostContext.Contribution.Lineage.InputTypeIdentity, terminalRequest.EffectiveAction.TypeIdentity);
+        Assert.Equal(hostContext.Contribution.Lineage.InputSchemaVersion, terminalRequest.EffectiveAction.SchemaVersion);
+        Assert.Equal(hostContext.Contribution.Lineage.InputSchemaHash, terminalRequest.Descriptor.InputSchemaHash);
+        var terminalValidation = SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+            roundTrip with { EffectiveHostEntryContext = null },
+            terminalRequest,
+            fixture.Binding,
+            fixture.Now,
+            Authenticate);
+        Assert.True(terminalValidation.Accepted, $"{terminalValidation.Code}: {terminalValidation.Message}");
+
+        var effectiveValidation = SidecarCapabilityTransportValidation.ValidateActionRequest(
+            roundTrip,
+            fixture.Binding,
+            fixture.Now,
+            Authenticate);
+        Assert.True(effectiveValidation.Accepted, $"{effectiveValidation.Code}: {effectiveValidation.Message}");
+        Assert.Equal("action-b", roundTrip.Action.Value.GetString());
+        Assert.Equal(
+            "action-b",
+            roundTrip.EffectiveHostEntryContext!.EffectiveContext.EffectiveAction.Value.GetString());
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+            roundTrip,
+            terminalRequest,
+            fixture.Binding,
+            fixture.Now,
+            Authenticate).Accepted);
+        ActivateContext(fixture, hostContext);
+        var begin = fixture.Session.BeginActionCall(
+            roundTrip,
+            roundTrip.Action.ByteLength,
+            fixture.Now,
+            out _,
+            static (_, _) => false,
+            Authenticate);
+        Assert.True(begin.Accepted, begin.Message);
+        Assert.True(fixture.Session.CompleteCall(roundTrip.Call.CallId, 0).Accepted);
+        var replay = fixture.Session.BeginActionCall(
+            roundTrip,
+            roundTrip.Action.ByteLength,
+            fixture.Now,
+            out _,
+            static (_, _) => false,
+            Authenticate);
+        Assert.False(replay.Accepted);
+
+        Assert.False(SidecarCapabilityTransportValidation.ValidateActionRequest(
+            roundTrip with
+            {
+                Action = replacement with
+                {
+                    Value = JsonDocument.Parse("\"action-c\"").RootElement.Clone(),
+                },
+            },
+            fixture.Binding,
+            fixture.Now,
+            Authenticate).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionRequest(
+                roundTrip with
+                {
+                    EffectiveHostEntryContext = roundTrip.EffectiveHostEntryContext with
+                    {
+                        EffectiveContext = roundTrip.EffectiveHostEntryContext.EffectiveContext with
+                        {
+                            Snapshot = new ActionPipelineSnapshot("forged-host-graph", []),
+                        },
+                    },
+                },
+                fixture.Binding,
+                fixture.Now,
+                Authenticate).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionRequest(
+                roundTrip with
+                {
+                    HostContext = roundTrip.HostContext! with { TraceId = Guid.NewGuid() },
+                },
+                fixture.Binding,
+                fixture.Now,
+                Authenticate).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            SidecarCapabilityTransportValidation.ValidateActionRequest(
+                roundTrip,
+                fixture.Binding with { RequestId = Guid.NewGuid() },
+                fixture.Now,
+                Authenticate).Code);
+    }
+
+    [Fact]
     public void Host_entry_accepts_each_ingress_with_one_descriptor_bound_terminal()
     {
         var fixture = CreateFixture(maxCalls: 8);
@@ -3911,6 +4099,7 @@ public sealed class SidecarCapabilityTransportTests
             ParentInvocationId = terminalContext.ParentInvocationId,
             Depth = terminalContext.Depth,
             Attempt = terminalContext.Attempt,
+            HostContextBindingHash = SidecarCapabilityTransportValidation.ComputeHostActionEntryContextBindingHash(hostContext),
         };
         authority = authority with
         {

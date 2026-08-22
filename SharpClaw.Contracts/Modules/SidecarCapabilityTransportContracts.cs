@@ -891,6 +891,7 @@ public sealed class SidecarCapabilitySession
             frameByteLength,
             now,
             out hostContext,
+            static (_, _) => false,
             static (_, _) => false);
 
     public SidecarCapabilityValidationResult BeginActionCall(
@@ -899,15 +900,32 @@ public sealed class SidecarCapabilitySession
         DateTimeOffset now,
         out HostActionEntryRequestContext? hostContext,
         Func<SidecarCrossSidecarActionEntryAuthority, string, bool> authenticateCrossSidecarAuthority)
+        => BeginActionCall(
+            request,
+            frameByteLength,
+            now,
+            out hostContext,
+            authenticateCrossSidecarAuthority,
+            static (_, _) => false);
+
+    public SidecarCapabilityValidationResult BeginActionCall(
+        SidecarActionCapabilityRequest request,
+        int frameByteLength,
+        DateTimeOffset now,
+        out HostActionEntryRequestContext? hostContext,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, bool> authenticateCrossSidecarAuthority,
+        Func<SidecarHostTerminalAuthority, string, bool> authenticateEffectiveHostEntryContext)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(authenticateCrossSidecarAuthority);
+        ArgumentNullException.ThrowIfNull(authenticateEffectiveHostEntryContext);
         hostContext = null;
 
         var requestResult = SidecarCapabilityTransportValidation.ValidateActionRequest(
             request,
             Binding,
-            now);
+            now,
+            authenticateEffectiveHostEntryContext);
         if (!requestResult.Accepted)
             return requestResult;
 
@@ -2840,6 +2858,7 @@ public sealed record SidecarActionCapabilityRequest(
     public SidecarNestedHostActionEntryCarrier? NestedCarrier { get; init; }
     public SidecarCrossSidecarActionEntryCarrier? CrossSidecarCarrier { get; init; }
     public SidecarActionTerminalRegistration? Terminal { get; init; }
+    public SidecarActionEffectiveHostEntryContext? EffectiveHostEntryContext { get; init; }
 
     public static SidecarActionCapabilityRequest HostEntry(
         SidecarCapabilityCallIdentity call,
@@ -2908,6 +2927,19 @@ public sealed record SidecarActionCapabilityRequest(
         };
 }
 
+/// <summary>Authenticated host-to-module context for one effective HostEntry dispatch.</summary>
+public sealed record SidecarActionEffectiveHostEntryContext(
+    HostActionEntryRequestContext InitiatingContext,
+    SidecarActionTerminalExecutionContext EffectiveContext,
+    SidecarHostTerminalAuthority Authority)
+{
+    public bool IsWellFormed =>
+        InitiatingContext is not null &&
+        EffectiveContext is not null &&
+        Authority is not null &&
+        EffectiveContext.IsWellFormed;
+}
+
 public sealed record SidecarActionResultIdentity(
     Guid ResultId,
     Guid CallId,
@@ -2965,6 +2997,7 @@ public sealed record SidecarHostTerminalAuthority(
     public SidecarNestedHostActionEntryRelay? NestedCarrierRelay { get; init; }
     public SidecarNestedHostActionEntryRelayOutcomeKind? NestedCarrierOutcomeKind { get; init; }
     public string NestedCarrierRequestFingerprint { get; init; } = string.Empty;
+    public string HostContextBindingHash { get; init; } = string.Empty;
 }
 
 public sealed record SidecarActionTerminalExecutionContext(
@@ -3265,7 +3298,8 @@ public static class SidecarCapabilityTransportValidation
     public static SidecarCapabilityValidationResult ValidateActionRequest(
         SidecarActionCapabilityRequest request,
         SidecarCapabilitySessionBinding binding,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        Func<SidecarHostTerminalAuthority, string, bool>? authenticateEffectiveHostEntryContext = null)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(binding);
@@ -3412,6 +3446,102 @@ public static class SidecarCapabilityTransportValidation
                 "The terminal continuation request is outside the action authority.");
         }
 
+        if (request.EffectiveHostEntryContext is not null)
+        {
+            var effectiveContextResult = ValidateEffectiveHostEntryContext(
+                request,
+                request.EffectiveHostEntryContext,
+                binding,
+                now,
+                authenticateEffectiveHostEntryContext);
+            if (!effectiveContextResult.Accepted)
+                return effectiveContextResult;
+        }
+
+        return SidecarCapabilityValidationResult.Accept();
+    }
+
+    public static SidecarCapabilityValidationResult ValidateEffectiveHostEntryContext(
+        SidecarActionCapabilityRequest request,
+        SidecarActionEffectiveHostEntryContext context,
+        SidecarCapabilitySessionBinding binding,
+        DateTimeOffset now,
+        Func<SidecarHostTerminalAuthority, string, bool>? authenticate)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(binding);
+
+        if (request.Invocation != SidecarActionInvocationKind.HostEntry ||
+            request.HostContext is null ||
+            !context.IsWellFormed ||
+            !HostActionEntryAuthorityValidator.SameContext(
+                request.HostContext,
+                context.InitiatingContext))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The effective HostEntry context does not bind to the initiating context.");
+        }
+
+        var effective = context.EffectiveContext;
+        if (effective.Call != request.Call ||
+            effective.Invocation != request.Invocation ||
+            effective.Descriptor != request.Descriptor ||
+            !SamePayload(effective.EffectiveAction, request.Action) ||
+            effective.Cancellation != request.Cancellation ||
+            effective.Deadline != request.Deadline ||
+            effective.InvocationId != context.InitiatingContext.InvocationId ||
+            effective.ParentInvocationId != context.InitiatingContext.ParentInvocationId ||
+            effective.Depth != context.InitiatingContext.Depth ||
+            effective.Attempt != context.InitiatingContext.Attempt ||
+            !SamePrincipal(effective.Caller, context.InitiatingContext.Caller) ||
+            !SameFeatures(effective.Features, context.InitiatingContext.Features) ||
+            effective.TraceId != context.InitiatingContext.TraceId ||
+            effective.IdempotencyKey != context.InitiatingContext.IdempotencyKey ||
+            effective.Receipt is null ||
+            effective.Receipt.CallId != request.Call.CallId ||
+            effective.Receipt.ActionKey != request.Descriptor.Key ||
+            effective.Receipt.ActionVersion != request.Descriptor.Version ||
+            !string.Equals(
+                ComputeSnapshotHash(effective.Snapshot),
+                context.Authority.SnapshotContentHash,
+                StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(
+                context.Authority.HostContextBindingHash,
+                ComputeHostActionEntryContextBindingHash(context.InitiatingContext),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The effective HostEntry context does not bind to the dispatcher result.");
+        }
+
+        var terminalRequest = new SidecarActionTerminalTransportRequest(
+            effective.Call,
+            effective.Invocation,
+            effective.Descriptor,
+            effective.EffectiveAction,
+            context.Authority,
+            effective.Receipt,
+            effective.Cancellation,
+            effective.Deadline)
+        {
+            Context = effective,
+            TerminalId = context.Authority.TerminalId,
+        };
+        if (authenticate is null ||
+            !ValidateHostTerminalAuthority(
+                terminalRequest,
+                binding,
+                now,
+                authenticate))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthorized,
+                "The effective HostEntry context proof was not accepted.");
+        }
+
         return SidecarCapabilityValidationResult.Accept();
     }
 
@@ -3546,7 +3676,11 @@ public static class SidecarCapabilityTransportValidation
              initiatingRequest.HostContext is null && initiatingRequest.NestedCarrier is null && initiatingRequest.CrossSidecarCarrier is null ||
              initiatingRequest.HostContext is not null &&
              (request.Context is null ||
-              !MatchesInitiatingHostContext(initiatingRequest.HostContext, request)) ||
+              !MatchesInitiatingHostContext(initiatingRequest.HostContext, request) ||
+              !string.Equals(
+                  request.Authority.HostContextBindingHash,
+                  ComputeHostActionEntryContextBindingHash(initiatingRequest.HostContext),
+                  StringComparison.OrdinalIgnoreCase)) ||
              initiatingRequest.NestedCarrier is not null &&
              (request.Context is null ||
               request.Context.InvocationId != initiatingRequest.NestedCarrier.InvocationId) ||
@@ -3567,6 +3701,19 @@ public static class SidecarCapabilityTransportValidation
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.SpoofedIdentity,
                 "The terminal request does not bind to the initiating action request.");
+        }
+
+        if (initiatingRequest.EffectiveHostEntryContext is { } effectiveHostEntryContext &&
+            (!MatchesEffectiveDispatcherContext(
+                 effectiveHostEntryContext.EffectiveContext,
+                 request.Context!) ||
+             !SameTerminalAuthority(
+                 effectiveHostEntryContext.Authority,
+                 request.Authority)))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The terminal request does not match the authenticated dispatcher context.");
         }
 
         if (
@@ -4021,6 +4168,7 @@ public static class SidecarCapabilityTransportValidation
             authority.IssuedAt,
             authority.ExpiresAt,
             authority.SnapshotContentHash,
+            authority.HostContextBindingHash,
             Caller = authority.Caller is null
                 ? null
                 : Convert.ToBase64String(SidecarCapabilityTransportCodec.Serialize(authority.Caller)),
@@ -4359,6 +4507,40 @@ public static class SidecarCapabilityTransportValidation
         SidecarCapabilityTransportCodec.ComputeSha256(
             SidecarCapabilityTransportCodec.Serialize(snapshot));
 
+    public static string ComputeHostActionEntryContextBindingHash(
+        HostActionEntryRequestContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        var canonical = new
+        {
+            context.CapabilityId,
+            CapabilityHandleHash = SidecarCapabilityTransportCodec.ComputeSha256(
+                Encoding.UTF8.GetBytes(context.CapabilityHandle)),
+            context.Ingress,
+            context.InvocationId,
+            context.RequestId,
+            context.CancellationId,
+            Caller = Convert.ToBase64String(
+                SidecarCapabilityTransportCodec.Serialize(context.Caller)),
+            Features = Convert.ToBase64String(
+                SidecarCapabilityTransportCodec.Serialize(context.Features)),
+            context.TraceId,
+            context.IdempotencyKey,
+            context.Deadline,
+            context.ExpiresAt,
+            Contribution = context.Contribution is null
+                ? null
+                : Convert.ToBase64String(
+                    SidecarCapabilityTransportCodec.Serialize(context.Contribution)),
+            context.ParentInvocationId,
+            context.Depth,
+            context.Attempt,
+        };
+        return SidecarCapabilityTransportCodec.ComputeSha256(
+            SidecarCapabilityTransportCodec.Serialize(canonical));
+    }
+
     private static bool SameSafeFailure(
         SidecarSafeFailureIdentity left,
         SidecarSafeFailureIdentity right) =>
@@ -4366,6 +4548,43 @@ public static class SidecarCapabilityTransportValidation
         string.Equals(left.Code, right.Code, StringComparison.Ordinal) &&
         string.Equals(left.Message, right.Message, StringComparison.Ordinal) &&
         left.Retryable == right.Retryable;
+
+    private static bool MatchesEffectiveDispatcherContext(
+        SidecarActionTerminalExecutionContext expected,
+        SidecarActionTerminalExecutionContext actual) =>
+        expected is not null &&
+        actual is not null &&
+        expected.Call == actual.Call &&
+        expected.Invocation == actual.Invocation &&
+        expected.Descriptor == actual.Descriptor &&
+        SamePayload(expected.EffectiveAction, actual.EffectiveAction) &&
+        string.Equals(
+            ComputeSnapshotHash(expected.Snapshot),
+            ComputeSnapshotHash(actual.Snapshot),
+            StringComparison.OrdinalIgnoreCase) &&
+        expected.InvocationId == actual.InvocationId &&
+        expected.ParentInvocationId == actual.ParentInvocationId &&
+        expected.Depth == actual.Depth &&
+        expected.Attempt == actual.Attempt &&
+        SamePrincipal(expected.Caller, actual.Caller) &&
+        SameFeatures(expected.Features, actual.Features) &&
+        expected.TraceId == actual.TraceId &&
+        expected.IdempotencyKey == actual.IdempotencyKey &&
+        expected.Cancellation == actual.Cancellation &&
+        SameReceipt(expected.Receipt, actual.Receipt) &&
+        expected.Deadline == actual.Deadline;
+
+    private static bool SameTerminalAuthority(
+        SidecarHostTerminalAuthority expected,
+        SidecarHostTerminalAuthority actual) =>
+        expected is not null &&
+        actual is not null &&
+        expected.AuthorityId == actual.AuthorityId &&
+        string.Equals(
+            expected.CanonicalBindingHash,
+            actual.CanonicalBindingHash,
+            StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(expected.Proof, actual.Proof, StringComparison.Ordinal);
 
 }
 
