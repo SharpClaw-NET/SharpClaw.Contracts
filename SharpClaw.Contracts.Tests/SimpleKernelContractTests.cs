@@ -3551,6 +3551,24 @@ public sealed class SimpleKernelContractTests
         Assert.Equal("replace_result", error.RequestedEffect);
     }
 
+    [Fact]
+    public void External_dispatch_authority_requires_complete_host_and_sidecar_state()
+    {
+        var authority = new SidecarExternalActionDispatchAuthority(
+            "module-a",
+            "graph-a",
+            null!,
+            null!,
+            null!,
+            null!,
+            null!,
+            null!);
+
+        Assert.False(authority.IsWellFormed);
+        Assert.NotNull(typeof(IActionDispatcher).GetMethod(nameof(IActionDispatcher.RunExternalAsync)));
+        Assert.NotNull(typeof(IActionDispatcher).GetMethod(nameof(IActionDispatcher.RunExternalRequiredAsync)));
+    }
+
     private static JsonElement CreateElement<T>(T value) =>
         JsonSerializer.SerializeToElement(value, JsonOptions);
 

@@ -958,6 +958,188 @@ public interface IHostActionEntry
         CancellationToken cancellationToken = default);
 }
 
+/// <summary>Authenticated authority for one external module action dispatch.</summary>
+public sealed record SidecarExternalActionDispatchAuthority(
+    string ModuleId,
+    string GraphId,
+    SidecarCapabilityCallIdentity Call,
+    SidecarActionDescriptorIdentity Descriptor,
+    SidecarSerializedPayload Action,
+    SidecarActionTerminalRegistration Terminal,
+    HostActionEntryRequestContext InitiatingHostContext,
+    SidecarActionEffectiveHostEntryContext EffectiveHostEntry)
+{
+    public bool IsWellFormed =>
+        !string.IsNullOrWhiteSpace(ModuleId) &&
+        !string.IsNullOrWhiteSpace(GraphId) &&
+        Call is not null &&
+        Call.IsValid &&
+        Call.Capability == SidecarCapabilityKind.Action &&
+        Descriptor is not null &&
+        Descriptor.IsWellFormed &&
+        Action is not null &&
+        Action.IsValid &&
+        Terminal is not null &&
+        Terminal.IsWellFormed &&
+        InitiatingHostContext is not null &&
+        EffectiveHostEntry is not null &&
+        EffectiveHostEntry.IsWellFormed;
+}
+
+public static class SidecarExternalActionDispatchAuthorityValidator
+{
+    public static SidecarCapabilityValidationResult Validate<TAction, TResult>(
+        SidecarExternalActionDispatchAuthority authority,
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action,
+        ActionPipelineSnapshot snapshot,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(authority);
+        ArgumentNullException.ThrowIfNull(descriptor);
+        ArgumentNullException.ThrowIfNull(snapshot);
+
+        if (!authority.IsWellFormed)
+            return Reject("sidecar_external_invalid_authority", "The external action authority is incomplete.");
+
+        var effective = authority.EffectiveHostEntry.EffectiveContext;
+        var hostAuthority = authority.EffectiveHostEntry.Authority;
+        var expectedDescriptor = CreateDescriptorIdentity<TAction, TResult>(descriptor);
+        byte[] actionBytes;
+        try
+        {
+            actionBytes = SidecarCapabilityTransportCodec.Serialize(action);
+        }
+        catch (Exception exception) when (exception is JsonException or NotSupportedException)
+        {
+            return Reject("sidecar_external_invalid_payload", "The external action payload is not canonical.");
+        }
+
+        if (!SameDescriptor(authority.Descriptor, expectedDescriptor) ||
+            !SameDescriptor(effective.Descriptor, expectedDescriptor) ||
+            !SamePayload(authority.Action, actionBytes, TypeIdentity<TAction>(), descriptor.InputSchema?.Version ?? 0) ||
+            !SamePayload(effective.EffectiveAction, actionBytes, TypeIdentity<TAction>(), descriptor.InputSchema?.Version ?? 0) ||
+            !string.Equals(authority.ModuleId, authority.Call.ModuleId, StringComparison.Ordinal) ||
+            !string.Equals(authority.GraphId, authority.Call.GraphId, StringComparison.Ordinal) ||
+            !string.Equals(authority.ModuleId, hostAuthority.ModuleId, StringComparison.Ordinal) ||
+            !string.Equals(authority.GraphId, hostAuthority.GraphId, StringComparison.Ordinal) ||
+            effective.Call != authority.Call ||
+            hostAuthority.SessionId != authority.Call.SessionId ||
+            hostAuthority.RequestId != authority.Call.RequestId ||
+            hostAuthority.CancellationId != authority.Call.CancellationId ||
+            hostAuthority.CallId != authority.Call.CallId ||
+            hostAuthority.Invocation != effective.Invocation ||
+            hostAuthority.ActionKey != descriptor.Key ||
+            hostAuthority.ActionVersion != descriptor.Version ||
+            hostAuthority.TerminalId != authority.Terminal.TerminalId ||
+            authority.Terminal.ActionTypeIdentity != expectedDescriptor.InputTypeIdentity ||
+            authority.Terminal.ActionSchemaVersion != expectedDescriptor.InputSchemaVersion ||
+            authority.Terminal.ResultTypeIdentity != expectedDescriptor.ResultTypeIdentity ||
+            authority.Terminal.ResultSchemaVersion != expectedDescriptor.ResultSchemaVersion ||
+            !string.Equals(authority.Terminal.DescriptorHash, expectedDescriptor.DescriptorHash, StringComparison.Ordinal) ||
+            !string.Equals(
+                SidecarCapabilityTransportValidation.ComputeSnapshotHash(effective.Snapshot),
+                SidecarCapabilityTransportValidation.ComputeSnapshotHash(snapshot),
+                StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(
+                hostAuthority.SnapshotContentHash,
+                SidecarCapabilityTransportValidation.ComputeSnapshotHash(snapshot),
+                StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(
+                hostAuthority.HostContextBindingHash,
+                SidecarCapabilityTransportValidation.ComputeHostActionEntryContextBindingHash(
+                    authority.InitiatingHostContext),
+                StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(
+                hostAuthority.CanonicalBindingHash,
+                SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(hostAuthority),
+                StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(hostAuthority.Proof))
+        {
+            return Reject(
+                "sidecar_external_spoofed_authority",
+                "The external action authority does not match the descriptor, payload, terminal, or snapshot.");
+        }
+
+        if (now >= effective.Deadline ||
+            now >= hostAuthority.ExpiresAt ||
+            authority.Call.Deadline != effective.Deadline ||
+            authority.Call.CancellationId != effective.Cancellation.CancellationId ||
+            effective.Cancellation.ExpiresAt < effective.Deadline ||
+            effective.InvocationId != authority.InitiatingHostContext.InvocationId ||
+            effective.ParentInvocationId != authority.InitiatingHostContext.ParentInvocationId ||
+            effective.Depth != authority.InitiatingHostContext.Depth ||
+            effective.Attempt != authority.InitiatingHostContext.Attempt ||
+            effective.TraceId != authority.InitiatingHostContext.TraceId ||
+            effective.IdempotencyKey != authority.InitiatingHostContext.IdempotencyKey ||
+            effective.Deadline != authority.InitiatingHostContext.Deadline ||
+            !SameCanonical(effective.Caller, authority.InitiatingHostContext.Caller) ||
+            !SameCanonical(effective.Features, authority.InitiatingHostContext.Features))
+        {
+            return Reject(
+                "sidecar_external_expired_authority",
+                "The external action authority is expired or has a changed host context.");
+        }
+
+        return SidecarCapabilityValidationResult.Accept();
+    }
+
+    private static SidecarActionDescriptorIdentity CreateDescriptorIdentity<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor) =>
+        new(
+            descriptor.Key,
+            descriptor.Version,
+            descriptor.Category,
+            TypeIdentity<TAction>(),
+            descriptor.InputSchema?.ContentHash ?? string.Empty,
+            descriptor.InputSchema?.Version ?? 0,
+            TypeIdentity<TResult>(),
+            descriptor.ResultSchema?.ContentHash ?? string.Empty,
+            descriptor.ResultSchema?.Version ?? 0,
+            HostActionEntryAuthorityValidator.ComputeDescriptorHash(descriptor));
+
+    private static bool SameDescriptor(
+        SidecarActionDescriptorIdentity left,
+        SidecarActionDescriptorIdentity right) =>
+        left.Key == right.Key &&
+        left.Version == right.Version &&
+        string.Equals(left.Category, right.Category, StringComparison.Ordinal) &&
+        string.Equals(left.InputTypeIdentity, right.InputTypeIdentity, StringComparison.Ordinal) &&
+        string.Equals(left.InputSchemaHash, right.InputSchemaHash, StringComparison.Ordinal) &&
+        left.InputSchemaVersion == right.InputSchemaVersion &&
+        string.Equals(left.ResultTypeIdentity, right.ResultTypeIdentity, StringComparison.Ordinal) &&
+        string.Equals(left.ResultSchemaHash, right.ResultSchemaHash, StringComparison.Ordinal) &&
+        left.ResultSchemaVersion == right.ResultSchemaVersion &&
+        string.Equals(left.DescriptorHash, right.DescriptorHash, StringComparison.Ordinal);
+
+    private static bool SamePayload(
+        SidecarSerializedPayload left,
+        ReadOnlySpan<byte> rightBytes,
+        string rightTypeIdentity,
+        int rightSchemaVersion) =>
+        string.Equals(left.TypeIdentity, rightTypeIdentity, StringComparison.Ordinal) &&
+        left.SchemaVersion == rightSchemaVersion &&
+        string.Equals(
+            left.ContentHash,
+            SidecarCapabilityTransportCodec.ComputeSha256(rightBytes),
+            StringComparison.OrdinalIgnoreCase) &&
+        left.ByteLength == rightBytes.Length;
+
+    private static bool SameCanonical<T>(T left, T right) =>
+        string.Equals(
+            SidecarCapabilityTransportCodec.ComputeSha256(
+                SidecarCapabilityTransportCodec.Serialize(left)),
+            SidecarCapabilityTransportCodec.ComputeSha256(
+                SidecarCapabilityTransportCodec.Serialize(right)),
+            StringComparison.OrdinalIgnoreCase);
+
+    private static string TypeIdentity<T>() =>
+        typeof(T).AssemblyQualifiedName ?? typeof(T).FullName ?? typeof(T).Name;
+
+    private static SidecarCapabilityValidationResult Reject(string code, string message) =>
+        SidecarCapabilityValidationResult.Reject(code, message);
+}
+
 public interface IActionDispatcher
 {
     ValueTask<IActionOutcome<TResult>> RunAsync<TAction, TResult>(
@@ -967,11 +1149,27 @@ public interface IActionDispatcher
         ActionPipelineSnapshot snapshot,
         CancellationToken ct);
 
+    ValueTask<IActionOutcome<TResult>> RunExternalAsync<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
+        ActionPipelineSnapshot snapshot,
+        SidecarExternalActionDispatchAuthority authority,
+        CancellationToken ct);
+
     ValueTask<TResult> RunRequiredAsync<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
         Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
+        CancellationToken ct);
+
+    ValueTask<TResult> RunExternalRequiredAsync<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
+        ActionPipelineSnapshot snapshot,
+        SidecarExternalActionDispatchAuthority authority,
         CancellationToken ct);
 }
 
