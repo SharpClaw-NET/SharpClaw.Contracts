@@ -4737,27 +4737,6 @@ public sealed class SidecarCapabilityTransportTests
                 parentDescriptor.InputSchemaHash,
                 null,
                 null));
-        var peerContextRequest = new HostActionEntryContextRequest(
-            hostParentContext.Ingress,
-            hostParentContext.InvocationId,
-            peer.Binding.RequestId,
-            peer.Binding.CancellationId,
-            hostParentContext.Caller,
-            hostParentContext.Features,
-            hostParentContext.TraceId,
-            hostParentContext.IdempotencyKey,
-            peer.Call.Deadline,
-            peer.Binding.ExpiresAt)
-        {
-            Contribution = hostParentContext.Contribution,
-            ParentInvocationId = hostParentContext.ParentInvocationId,
-            Depth = hostParentContext.Depth,
-            Attempt = hostParentContext.Attempt,
-        };
-        Assert.True(peer.Session.IssueHostActionEntryContext(
-            peerContextRequest,
-            peer.Now,
-            out var peerParentContext).Accepted);
         ConsumeStorageCalls(host, 6, "peer-boundary-host");
         ConsumeStorageCalls(peer, 6, "peer-boundary-peer");
         var hostParentCall = ActionCall(host, 7, "peer-parent-host");
@@ -4767,7 +4746,6 @@ public sealed class SidecarCapabilityTransportTests
             Deadline = hostParentCall.Deadline,
         };
         var hostRootAuthority = ActivateContext(host, hostParentContext!);
-        var peerRootAuthority = ActivateContext(peer, peerParentContext!);
         Assert.True(host.Session.BeginCall(
             hostParentCall,
             SidecarCapabilityKind.Action,
@@ -4775,13 +4753,6 @@ public sealed class SidecarCapabilityTransportTests
             parentAction.ByteLength,
             host.Now,
             hostParentContext).Accepted);
-        Assert.True(peer.Session.BeginCall(
-            peerParentCall,
-            SidecarCapabilityKind.Action,
-            parentAction,
-            parentAction.ByteLength,
-            peer.Now,
-            peerParentContext).Accepted);
         var parentReceipt = new SidecarTerminalReceipt(
             "peer-parent-receipt",
             parentDescriptor.Key,
@@ -4791,7 +4762,6 @@ public sealed class SidecarCapabilityTransportTests
             "peer-parent-scope",
             parentAction.ContentHash);
         Assert.True(host.Session.RecordTerminal(hostParentCall.CallId, Guid.NewGuid(), parentReceipt).Accepted);
-        Assert.True(peer.Session.RecordTerminal(peerParentCall.CallId, Guid.NewGuid(), parentReceipt with { CallId = peerParentCall.CallId }).Accepted);
 
         var childDescriptor = NestedDescriptor("peer.child", typeof(int).AssemblyQualifiedName!);
         var childAction = Payload(childDescriptor.InputTypeIdentity, "child");
@@ -4835,6 +4805,7 @@ public sealed class SidecarCapabilityTransportTests
         };
         var authority = terminalRequest.Authority with
         {
+            RootPeerCall = peerParentCall,
             NestedCarrierRelay = issuedRelay,
             NestedCarrierOutcomeKind = SidecarNestedHostActionEntryRelayOutcomeKind.Issued,
             NestedCarrierRequestFingerprint = SidecarCapabilityTransportValidation.ComputeNestedCarrierRequestFingerprint(childRequest),
@@ -4848,6 +4819,111 @@ public sealed class SidecarCapabilityTransportTests
             SidecarCapabilityTransportCodec.Serialize(issuedRelay));
         var wireAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostTerminalAuthority>(
             SidecarCapabilityTransportCodec.Serialize(authority));
+        var rootRelay = authority;
+        var rootIssue = host.Session.IssueHostActionEntryPeerRootRelay(
+            hostParentCall,
+            peerParentCall,
+            parentDescriptor,
+            parentAction,
+            rootRequest.Terminal!,
+            new ActionPipelineSnapshot("peer-host-snapshot", []),
+            peer.Session,
+            rootRelay,
+            host.Now,
+            out var rootRelayEnvelope);
+        Assert.True(rootIssue.Accepted, rootIssue.Message);
+        Assert.NotNull(rootRelayEnvelope);
+        var wireRootRelay = SidecarCapabilityTransportCodec.Deserialize<SidecarHostActionEntryRootRelay>(
+            SidecarCapabilityTransportCodec.Serialize(rootRelayEnvelope!));
+
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            wireRootRelay with
+            {
+                Authority = wireRootRelay.Authority with { Proof = "forged-root-proof" },
+            },
+            peer.Now,
+            out _).Accepted);
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            wireRootRelay with
+            {
+                Context = wireRootRelay.Context with { TraceId = Guid.NewGuid() },
+            },
+            peer.Now,
+            out _).Accepted);
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            wireRootRelay with
+            {
+                Context = wireRootRelay.Context with { CancellationId = Guid.NewGuid() },
+            },
+            peer.Now,
+            out _).Accepted);
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            wireRootRelay with
+            {
+                Action = Payload(parentDescriptor.InputTypeIdentity, "changed-root"),
+            },
+            peer.Now,
+            out _).Accepted);
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            wireRootRelay with
+            {
+                Descriptor = parentDescriptor with { Key = new SharpClawActionKey("peer.other") },
+            },
+            peer.Now,
+            out _).Accepted);
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            wireRootRelay with
+            {
+                Terminal = wireRootRelay.Terminal with { TerminalId = Guid.NewGuid() },
+            },
+            peer.Now,
+            out _).Accepted);
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            wireRootRelay with
+            {
+                PeerCall = wireRootRelay.PeerCall with { GraphId = "graph-forged" },
+            },
+            peer.Now,
+            out _).Accepted);
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            wireRootRelay,
+            wireRootRelay.PeerCall.Deadline,
+            out _).Accepted);
+        Assert.True(peer.Session.ImportHostActionEntryPeerRootRelay(
+            wireRootRelay,
+            peer.Now,
+            out var peerParentContext).Accepted);
+        Assert.True(peer.Session.TryGetActiveHostActionEntryCarrier(
+            peerParentContext!.CapabilityId,
+            out var peerRootAuthority));
+        Assert.NotNull(peerRootAuthority);
+        var peerRootRequest = SidecarActionCapabilityRequest.HostEntry(
+            peerParentCall,
+            parentDescriptor,
+            parentAction,
+            Cancellation(peer),
+            peerParentCall.Deadline,
+            peerParentContext,
+            rootRequest.Terminal!);
+        Assert.True(peer.Session.BeginActionCall(
+            peerRootRequest,
+            parentAction.ByteLength,
+            peer.Now,
+            out _).Accepted);
+        Assert.True(peer.Session.RecordTerminal(
+            peerParentCall.CallId,
+            Guid.NewGuid(),
+            parentReceipt with { CallId = peerParentCall.CallId }).Accepted);
+        var rootReplays = await Task.WhenAll(
+            Task.Run(() => peer.Session.ImportHostActionEntryPeerRootRelay(
+                wireRootRelay,
+                peer.Now,
+                out _)),
+            Task.Run(() => peer.Session.ImportHostActionEntryPeerRootRelay(
+                wireRootRelay,
+                peer.Now,
+                out _)));
+        Assert.All(rootReplays, result => Assert.False(result.Accepted));
 
         var changedPayload = childRequest with
         {
