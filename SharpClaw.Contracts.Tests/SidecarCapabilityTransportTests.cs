@@ -4703,6 +4703,259 @@ public sealed class SidecarCapabilityTransportTests
         return new ExternalSessionFixture(fixture, authority);
     }
 
+    [Fact]
+    public async Task Peer_nested_relay_import_is_authenticated_and_one_use()
+    {
+        static bool VerifyHostProof(SidecarHostTerminalAuthority authority, string proof) =>
+            string.Equals(authority.Proof, proof, StringComparison.Ordinal) &&
+            string.Equals(
+                authority.Proof,
+                SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority),
+                StringComparison.OrdinalIgnoreCase);
+
+        var host = CreateFixture(maxInFlight: 4, maxCalls: 8, authenticateHostTerminalAuthority: VerifyHostProof);
+        var peer = CreateFixture(
+            maxInFlight: 4,
+            maxCalls: 8,
+            moduleId: "module-b",
+            graphId: "graph-b",
+            authenticateHostTerminalAuthority: VerifyHostProof);
+        var parentDescriptor = NestedDescriptor("peer.parent", typeof(string).AssemblyQualifiedName!);
+        var parentAction = Payload(parentDescriptor.InputTypeIdentity, "parent");
+        var hostParentContext = IssueContext(
+            host,
+            new RequestPrincipal("peer-user"),
+            HostActionEntryIngress.Cli,
+            traceId: Guid.NewGuid(),
+            idempotencyKey: Guid.NewGuid(),
+            lineage: new HostActionEntryLineage(
+                parentDescriptor.Key,
+                parentDescriptor.Version,
+                parentDescriptor.DescriptorHash,
+                parentDescriptor.InputTypeIdentity,
+                parentDescriptor.InputSchemaVersion,
+                parentDescriptor.InputSchemaHash,
+                null,
+                null));
+        var peerContextRequest = new HostActionEntryContextRequest(
+            hostParentContext.Ingress,
+            hostParentContext.InvocationId,
+            peer.Binding.RequestId,
+            peer.Binding.CancellationId,
+            hostParentContext.Caller,
+            hostParentContext.Features,
+            hostParentContext.TraceId,
+            hostParentContext.IdempotencyKey,
+            peer.Call.Deadline,
+            peer.Binding.ExpiresAt)
+        {
+            Contribution = hostParentContext.Contribution,
+            ParentInvocationId = hostParentContext.ParentInvocationId,
+            Depth = hostParentContext.Depth,
+            Attempt = hostParentContext.Attempt,
+        };
+        Assert.True(peer.Session.IssueHostActionEntryContext(
+            peerContextRequest,
+            peer.Now,
+            out var peerParentContext).Accepted);
+        var hostParentCall = ActionCall(host, 1, "peer-parent-host");
+        var peerParentCall = ActionCall(peer, 1, "peer-parent-peer") with
+        {
+            CallId = hostParentCall.CallId,
+            Deadline = hostParentCall.Deadline,
+        };
+        var hostRootAuthority = ActivateContext(host, hostParentContext!);
+        ActivateContext(peer, peerParentContext!);
+        Assert.True(host.Session.BeginCall(
+            hostParentCall,
+            SidecarCapabilityKind.Action,
+            parentAction,
+            parentAction.ByteLength,
+            host.Now,
+            hostParentContext).Accepted);
+        Assert.True(peer.Session.BeginCall(
+            peerParentCall,
+            SidecarCapabilityKind.Action,
+            parentAction,
+            parentAction.ByteLength,
+            peer.Now,
+            peerParentContext).Accepted);
+        var parentReceipt = new SidecarTerminalReceipt(
+            "peer-parent-receipt",
+            parentDescriptor.Key,
+            parentDescriptor.Version,
+            hostParentCall.CallId,
+            1,
+            "peer-parent-scope",
+            parentAction.ContentHash);
+        Assert.True(host.Session.RecordTerminal(hostParentCall.CallId, Guid.NewGuid(), parentReceipt).Accepted);
+        Assert.True(peer.Session.RecordTerminal(peerParentCall.CallId, Guid.NewGuid(), parentReceipt with { CallId = peerParentCall.CallId }).Accepted);
+
+        var childDescriptor = NestedDescriptor("peer.child", typeof(int).AssemblyQualifiedName!);
+        var childAction = Payload(childDescriptor.InputTypeIdentity, "child");
+        var childRequest = new SidecarNestedHostActionEntryRequest(
+            childDescriptor.Key,
+            childDescriptor.Version,
+            childAction,
+            hostParentCall.Deadline,
+            hostParentCall.Deadline);
+        Assert.True(host.Session.IssueNestedHostActionEntryPeerRelay(
+            hostParentCall,
+            childRequest,
+            childDescriptor,
+            NestedContribution(childDescriptor),
+            peer.Session,
+            host.Now,
+            out var issuedRelay).Accepted);
+        Assert.NotNull(issuedRelay);
+
+        var rootRequest = SidecarActionCapabilityRequest.HostEntry(
+            hostParentCall,
+            parentDescriptor,
+            parentAction,
+            Cancellation(host),
+            hostParentCall.Deadline,
+            hostParentContext,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                parentDescriptor.InputTypeIdentity,
+                parentDescriptor.InputSchemaVersion,
+                parentDescriptor.ResultTypeIdentity,
+                parentDescriptor.ResultSchemaVersion,
+                parentDescriptor.DescriptorHash));
+        var terminalRequest = CreateTerminalRequest(
+            host,
+            rootRequest,
+            new ActionPipelineSnapshot("peer-host-snapshot", []),
+            parentReceipt) with
+        {
+            NestedCarrierRequest = childRequest,
+        };
+        var authority = terminalRequest.Authority with
+        {
+            NestedCarrierRelay = issuedRelay,
+            NestedCarrierOutcomeKind = SidecarNestedHostActionEntryRelayOutcomeKind.Issued,
+            NestedCarrierRequestFingerprint = SidecarCapabilityTransportValidation.ComputeNestedCarrierRequestFingerprint(childRequest),
+        };
+        authority = authority with
+        {
+            CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority),
+        };
+        authority = authority with { Proof = authority.CanonicalBindingHash };
+        var wireRelay = SidecarCapabilityTransportCodec.Deserialize<SidecarNestedHostActionEntryRelay>(
+            SidecarCapabilityTransportCodec.Serialize(issuedRelay));
+        var wireAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostTerminalAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(authority));
+
+        var changedPayload = childRequest with
+        {
+            Action = Payload(childDescriptor.InputTypeIdentity, "changed"),
+        };
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            peer.Session.ImportNestedHostActionEntryRelay(
+                wireRelay,
+                changedPayload,
+                wireAuthority,
+                peerParentCall,
+                peer.Now,
+                out _).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            peer.Session.ImportNestedHostActionEntryRelay(
+                wireRelay,
+                childRequest,
+                wireAuthority with { Proof = "forged" },
+                peerParentCall,
+                peer.Now,
+                out _).Code);
+
+        var imports = await Task.WhenAll(
+            Task.Run(() => peer.Session.ImportNestedHostActionEntryRelay(
+                wireRelay,
+                childRequest,
+                wireAuthority,
+                peerParentCall,
+                peer.Now,
+                out _)),
+            Task.Run(() => peer.Session.ImportNestedHostActionEntryRelay(
+                wireRelay,
+                childRequest,
+                wireAuthority,
+                peerParentCall,
+                peer.Now,
+                out _)));
+        Assert.Single(imports, result => result.Accepted);
+        Assert.Single(imports, result => result.Code == SidecarCapabilityErrors.Replay);
+        var rotatedPeerBinding = CreateRotatedBinding(peer, "peer-pending-rotation");
+        peer.BindingHashes.Add(rotatedPeerBinding.Authentication.BindingHash);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            peer.Session.RotateBinding(rotatedPeerBinding, peer.Now).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            peer.Session.CompleteCall(peerParentCall.CallId, 1).Code);
+
+        var peerChildCall = wireRelay.PeerCall!;
+        var childActionRequest = SidecarActionCapabilityRequest.HostEntryNested(
+            peerChildCall,
+            childDescriptor,
+            childAction,
+            new SidecarCancellationIdentity(peerChildCall.CancellationId, "peer-child-cancel", peerChildCall.Deadline),
+            peerChildCall.Deadline,
+            wireRelay.Carrier,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                childDescriptor.InputTypeIdentity,
+                childDescriptor.InputSchemaVersion,
+                childDescriptor.ResultTypeIdentity,
+                childDescriptor.ResultSchemaVersion,
+                childDescriptor.DescriptorHash));
+        Assert.True(peer.Session.BeginActionCall(
+            childActionRequest,
+            childAction.ByteLength,
+            peer.Now,
+            out _).Accepted);
+        var childReceipt = new SidecarTerminalReceipt(
+            "peer-child-receipt",
+            childDescriptor.Key,
+            childDescriptor.Version,
+            peerChildCall.CallId,
+            1,
+            "peer-child-scope",
+            childAction.ContentHash);
+        Assert.True(peer.Session.RecordTerminal(peerChildCall.CallId, Guid.NewGuid(), childReceipt).Accepted);
+        Assert.True(peer.Session.CompleteCall(peerChildCall.CallId, 1).Accepted);
+        Assert.True(peer.Session.CompleteCall(peerParentCall.CallId, 1).Accepted);
+        Assert.True(host.Session.RevokeNestedHostActionEntryRelay(
+            hostParentCall.CallId,
+            host.Now).Accepted);
+        Assert.True(host.Session.CompleteCall(hostParentCall.CallId, 1).Accepted);
+        Assert.True(host.Session.CompleteHostActionEntryCarrier(
+            hostRootAuthority,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            host.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            peer.Session.ImportNestedHostActionEntryRelay(
+                wireRelay,
+                childRequest,
+                wireAuthority,
+                peerParentCall,
+                peer.Now,
+                out _).Code);
+        peer.Session.Disconnect();
+        Assert.Equal(
+            SidecarCapabilityErrors.Disconnected,
+            peer.Session.ImportNestedHostActionEntryRelay(
+                wireRelay,
+                childRequest,
+                wireAuthority,
+                peerParentCall,
+                peer.Now,
+                out _).Code);
+    }
+
     private static Fixture CreateFixture(
         int maxInFlight = 2,
         int maxCalls = 4,
