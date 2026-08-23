@@ -3289,6 +3289,327 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void Host_entry_credit_allows_root_child_grandchild_at_the_call_budget_boundary()
+    {
+        var fixture = CreateFixture(maxInFlight: 4, maxCalls: 8);
+        var rootContext = IssueContext(
+            fixture,
+            new RequestPrincipal("budget-root"),
+            HostActionEntryIngress.Cli);
+        ActivateContext(fixture, rootContext);
+        ConsumeStorageCalls(fixture, 6, "grandchild-boundary");
+
+        var rootCall = ActionCall(fixture, 7, "budget-root-call");
+        var rootAction = Payload(typeof(string).AssemblyQualifiedName!, "root");
+        Assert.True(fixture.Session.BeginCall(
+            rootCall,
+            SidecarCapabilityKind.Action,
+            rootAction,
+            rootAction.ByteLength,
+            fixture.Now,
+            rootContext).Accepted);
+
+        var childDescriptor = NestedDescriptor("budget.child", "budget.child.input");
+        var childAction = Payload(childDescriptor.InputTypeIdentity, "child");
+        var childCall = ActionCall(fixture, 8, "budget-child-call");
+        Assert.True(fixture.Session.IssueNestedHostActionEntryCarrier(
+            rootCall,
+            childCall,
+            childDescriptor,
+            childAction,
+            NestedContribution(childDescriptor),
+            fixture.Now,
+            out var childCarrier).Accepted);
+        Assert.NotNull(childCarrier);
+        Assert.True(fixture.Session.BeginNestedHostActionEntryCall(
+            childCarrier!,
+            childCall,
+            childAction,
+            childAction.ByteLength,
+            fixture.Now,
+            out _).Accepted);
+
+        var grandchildDescriptor = NestedDescriptor("budget.grandchild", "budget.grandchild.input");
+        var grandchildAction = Payload(grandchildDescriptor.InputTypeIdentity, "grandchild");
+        var grandchildCall = ActionCall(fixture, 9, "budget-grandchild-call");
+        Assert.True(fixture.Session.IssueNestedHostActionEntryCarrier(
+            childCall,
+            grandchildCall,
+            grandchildDescriptor,
+            grandchildAction,
+            NestedContribution(grandchildDescriptor),
+            fixture.Now,
+            out var grandchildCarrier).Accepted);
+        Assert.NotNull(grandchildCarrier);
+        Assert.True(fixture.Session.BeginNestedHostActionEntryCall(
+            grandchildCarrier!,
+            grandchildCall,
+            grandchildAction,
+            grandchildAction.ByteLength,
+            fixture.Now,
+            out _).Accepted);
+
+        Assert.True(fixture.Session.CompleteCall(grandchildCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(childCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(rootCall.CallId, 0).Accepted);
+    }
+
+    [Fact]
+    public void Host_entry_credit_allows_two_sequential_children_without_increasing_the_limit()
+    {
+        var fixture = CreateFixture(maxInFlight: 3, maxCalls: 8);
+        var rootContext = IssueContext(
+            fixture,
+            new RequestPrincipal("sequential-root"),
+            HostActionEntryIngress.Cli);
+        ActivateContext(fixture, rootContext);
+        ConsumeStorageCalls(fixture, 6, "sequential-boundary");
+
+        var rootCall = ActionCall(fixture, 7, "sequential-root-call");
+        var rootAction = Payload(typeof(string).AssemblyQualifiedName!, "root");
+        Assert.True(fixture.Session.BeginCall(
+            rootCall,
+            SidecarCapabilityKind.Action,
+            rootAction,
+            rootAction.ByteLength,
+            fixture.Now,
+            rootContext).Accepted);
+
+        for (var index = 1; index <= 2; index++)
+        {
+            var descriptor = NestedDescriptor($"budget.child.{index}", $"budget.child.{index}.input");
+            var action = Payload(descriptor.InputTypeIdentity, $"child-{index}");
+            var childCall = ActionCall(fixture, 7 + index, $"sequential-child-{index}");
+            Assert.True(fixture.Session.IssueNestedHostActionEntryCarrier(
+                rootCall,
+                childCall,
+                descriptor,
+                action,
+                NestedContribution(descriptor),
+                fixture.Now,
+                out var carrier).Accepted);
+            Assert.NotNull(carrier);
+            Assert.True(fixture.Session.BeginNestedHostActionEntryCall(
+                carrier!,
+                childCall,
+                action,
+                action.ByteLength,
+                fixture.Now,
+                out _).Accepted);
+            Assert.True(fixture.Session.CompleteCall(childCall.CallId, 0).Accepted);
+        }
+
+        Assert.True(fixture.Session.CompleteCall(rootCall.CallId, 0).Accepted);
+    }
+
+    [Fact]
+    public void Host_entry_credits_are_isolated_for_two_pending_contexts_and_replay_is_rejected()
+    {
+        var fixture = CreateFixture(maxInFlight: 4, maxCalls: 8);
+        var firstContext = IssueContext(
+            fixture,
+            new RequestPrincipal("first-root"),
+            HostActionEntryIngress.Cli);
+        var secondContext = IssueContext(
+            fixture,
+            new RequestPrincipal("second-root"),
+            HostActionEntryIngress.Cli);
+        ActivateContext(fixture, firstContext);
+        ActivateContext(fixture, secondContext);
+        ConsumeStorageCalls(fixture, 6, "two-pending-boundary");
+
+        var firstCall = ActionCall(fixture, 7, "first-root-call");
+        var secondCall = ActionCall(fixture, 8, "second-root-call");
+        var rootAction = Payload(typeof(string).AssemblyQualifiedName!, "root");
+        Assert.True(fixture.Session.BeginCall(
+            firstCall,
+            SidecarCapabilityKind.Action,
+            rootAction,
+            rootAction.ByteLength,
+            fixture.Now,
+            firstContext).Accepted);
+        Assert.True(fixture.Session.BeginCall(
+            secondCall,
+            SidecarCapabilityKind.Action,
+            rootAction,
+            rootAction.ByteLength,
+            fixture.Now,
+            secondContext).Accepted);
+
+        var descriptor = NestedDescriptor("budget.pending.child", "budget.pending.child.input");
+        var action = Payload(descriptor.InputTypeIdentity, "pending-child");
+        var firstChildCall = ActionCall(fixture, 9, "first-child-call");
+        var secondChildCall = ActionCall(fixture, 10, "second-child-call");
+        Assert.True(fixture.Session.IssueNestedHostActionEntryCarrier(
+            firstCall,
+            firstChildCall,
+            descriptor,
+            action,
+            NestedContribution(descriptor),
+            fixture.Now,
+            out var firstCarrier).Accepted);
+        Assert.True(fixture.Session.IssueNestedHostActionEntryCarrier(
+            secondCall,
+            secondChildCall,
+            descriptor,
+            action,
+            NestedContribution(descriptor),
+            fixture.Now,
+            out var secondCarrier).Accepted);
+        Assert.NotNull(firstCarrier);
+        Assert.NotNull(secondCarrier);
+        var firstBegin = fixture.Session.BeginNestedHostActionEntryCall(
+                firstCarrier!,
+                firstChildCall,
+                action,
+                action.ByteLength,
+                fixture.Now,
+                out _);
+        Assert.True(firstBegin.Accepted, firstBegin.Message);
+        var replay = fixture.Session.BeginNestedHostActionEntryCall(
+            firstCarrier!,
+            firstChildCall,
+            action,
+            action.ByteLength,
+            fixture.Now,
+            out _);
+        Assert.Equal(SidecarCapabilityErrors.Replay, replay.Code);
+        Assert.True(fixture.Session.BeginNestedHostActionEntryCall(
+            secondCarrier!,
+            secondChildCall,
+            action,
+            action.ByteLength,
+            fixture.Now,
+            out _).Accepted);
+        Assert.True(fixture.Session.CompleteCall(firstChildCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(secondChildCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(firstCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(secondCall.CallId, 0).Accepted);
+    }
+
+    [Fact]
+    public void Host_entry_credit_is_revoked_on_expiry_cancellation_and_rotation()
+    {
+        var fixture = CreateFixture(maxCalls: 8);
+        var expiredContext = IssueContext(
+            fixture,
+            new RequestPrincipal("expired"),
+            HostActionEntryIngress.Cli,
+            actionDeadline: fixture.Now.AddSeconds(1),
+            contextExpiresAt: fixture.Now.AddSeconds(1));
+        var expiredAuthority = ActivateContext(fixture, expiredContext);
+        Assert.Equal(1, fixture.Session.SweepExpiredHostActionEntryCarriers(fixture.Now.AddSeconds(2)));
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            fixture.Session.CompleteHostActionEntryCarrier(
+                expiredAuthority,
+                HostActionEntryCarrierCompletionKind.Cancelled,
+                fixture.Now.AddSeconds(2)).Code);
+
+        var cancelledContext = IssueContext(
+            fixture,
+            new RequestPrincipal("cancelled"),
+            HostActionEntryIngress.Cli);
+        var cancelledAuthority = ActivateContext(fixture, cancelledContext);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            cancelledAuthority,
+            HostActionEntryCarrierCompletionKind.Cancelled,
+            fixture.Now).Accepted);
+
+        var rotatedContext = IssueContext(
+            fixture,
+            new RequestPrincipal("rotated"),
+            HostActionEntryIngress.Cli);
+        var rotatedAuthority = ActivateContext(fixture, rotatedContext);
+        var replacement = CreateRotatedBinding(fixture, "budget-rotation");
+        fixture.BindingHashes.Add(replacement.Authentication.BindingHash);
+        Assert.True(fixture.Session.RotateBinding(replacement, fixture.Now).Accepted);
+        Assert.True(fixture.Session.TryGetActiveHostActionEntryCarrier(
+            rotatedAuthority.CapabilityId,
+            out _));
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            rotatedAuthority,
+            HostActionEntryCarrierCompletionKind.Failed,
+            fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public async Task Host_entry_carrier_concurrent_replay_consumes_one_child_only()
+    {
+        var fixture = CreateFixture(maxInFlight: 3, maxCalls: 4);
+        var rootContext = IssueContext(
+            fixture,
+            new RequestPrincipal("concurrent-root"),
+            HostActionEntryIngress.Cli);
+        ActivateContext(fixture, rootContext);
+        var rootCall = ActionCall(fixture, 1, "concurrent-root-call");
+        var rootAction = Payload(typeof(string).AssemblyQualifiedName!, "root");
+        Assert.True(fixture.Session.BeginCall(
+            rootCall,
+            SidecarCapabilityKind.Action,
+            rootAction,
+            rootAction.ByteLength,
+            fixture.Now,
+            rootContext).Accepted);
+
+        var descriptor = NestedDescriptor("budget.concurrent.child", "budget.concurrent.input");
+        var action = Payload(descriptor.InputTypeIdentity, "child");
+        var childCall = ActionCall(fixture, 2, "concurrent-child-call");
+        Assert.True(fixture.Session.IssueNestedHostActionEntryCarrier(
+            rootCall,
+            childCall,
+            descriptor,
+            action,
+            NestedContribution(descriptor),
+            fixture.Now,
+            out var carrier).Accepted);
+        Assert.NotNull(carrier);
+
+        var results = await Task.WhenAll(
+            Task.Run(() => fixture.Session.BeginNestedHostActionEntryCall(
+                carrier!,
+                childCall,
+                action,
+                action.ByteLength,
+                fixture.Now,
+                out _)),
+            Task.Run(() => fixture.Session.BeginNestedHostActionEntryCall(
+                carrier!,
+                childCall,
+                action,
+                action.ByteLength,
+                fixture.Now,
+                out _)));
+
+        Assert.Single(results, result => result.Accepted);
+        Assert.Single(results, result => result.Code == SidecarCapabilityErrors.Replay);
+        Assert.True(fixture.Session.CompleteCall(childCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(rootCall.CallId, 0).Accepted);
+    }
+
+    [Fact]
+    public void Host_entry_credit_is_removed_on_disconnect()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("disconnect-root"),
+            HostActionEntryIngress.Cli);
+        var authority = ActivateContext(fixture, context);
+
+        fixture.Session.Disconnect();
+
+        Assert.Equal(
+            SidecarCapabilityErrors.Disconnected,
+            fixture.Session.CompleteHostActionEntryCarrier(
+                authority,
+                HostActionEntryCarrierCompletionKind.Cancelled,
+                fixture.Now).Code);
+        Assert.Equal(0, fixture.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(0, fixture.Session.ActiveHostActionEntryCarrierCount);
+    }
+
+    [Fact]
     public void Host_terminal_relay_issues_one_fresh_child_carrier_and_blocks_parent_completion()
     {
         var fixture = CreateFixture(maxInFlight: 3, maxCalls: 4);
@@ -5259,6 +5580,69 @@ public sealed class SidecarCapabilityTransportTests
         return new CrossRelayAttempt(result, parent.Call, relay, target.Session, target.Binding, source.Now);
     }
 
+    private static void ConsumeStorageCalls(Fixture fixture, int count, string noncePrefix)
+    {
+        for (var index = 0; index < count; index++)
+        {
+            var call = fixture.Call with
+            {
+                CallId = Guid.NewGuid(),
+                ReplayNonce = $"{noncePrefix}-{index}",
+                Sequence = index + 1,
+            };
+            var payload = Payload("storage.request", new { value = index });
+            Assert.True(fixture.Session.BeginCall(
+                call,
+                SidecarCapabilityKind.Storage,
+                payload,
+                payload.ByteLength,
+                fixture.Now).Accepted);
+            Assert.True(fixture.Session.CompleteCall(call.CallId, 0).Accepted);
+        }
+    }
+
+    private static SidecarCapabilityCallIdentity ActionCall(
+        Fixture fixture,
+        long sequence,
+        string replayNonce) =>
+        fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = replayNonce,
+            Sequence = sequence,
+            Deadline = fixture.Now.AddMinutes(1),
+        };
+
+    private static SidecarActionDescriptorIdentity NestedDescriptor(
+        string key,
+        string inputType) =>
+        new(
+            new SharpClawActionKey(key),
+            1,
+            "budget",
+            inputType,
+            $"{inputType}-schema",
+            1,
+            $"{inputType}-result",
+            $"{inputType}-result-schema",
+            1,
+            $"{inputType}-descriptor");
+
+    private static HostActionEntryContribution NestedContribution(
+        SidecarActionDescriptorIdentity descriptor) =>
+        new(
+            new HostActionEntryIngressBinding(HostActionEntryIngress.Cli, "budget"),
+            new HostActionEntryLineage(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                null,
+                null));
+
     private static HostActionEntryRequestContext IssueContext(
         Fixture fixture,
         RequestPrincipal caller,
@@ -5266,6 +5650,7 @@ public sealed class SidecarCapabilityTransportTests
         Guid? traceId = null,
         Guid? idempotencyKey = null,
         DateTimeOffset? actionDeadline = null,
+        DateTimeOffset? contextExpiresAt = null,
         HostActionEntryLineage? lineage = null,
         bool bindPayload = false)
     {
@@ -5279,7 +5664,7 @@ public sealed class SidecarCapabilityTransportTests
             traceId ?? Guid.NewGuid(),
             idempotencyKey ?? Guid.NewGuid(),
             actionDeadline ?? fixture.Now.AddMinutes(1),
-            fixture.Binding.ExpiresAt)
+            contextExpiresAt ?? fixture.Binding.ExpiresAt)
         {
             Contribution = new HostActionEntryContribution(
                 ingress switch
