@@ -1148,8 +1148,16 @@ public static class SidecarExternalActionDispatchAuthorityValidator
         SidecarCapabilityValidationResult.Reject(code, message);
 }
 
+public interface IExternalActionAuthoritySessionRegistration : IDisposable
+{
+    Guid SessionId { get; }
+}
+
 public interface IActionDispatcher
 {
+    IExternalActionAuthoritySessionRegistration RegisterExternalAuthoritySession(
+        SidecarCapabilitySession session);
+
     ValueTask<IActionOutcome<TResult>> RunAsync<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
@@ -1163,8 +1171,7 @@ public interface IActionDispatcher
         Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         SidecarExternalActionDispatchAuthority authority,
-        CancellationToken ct,
-        ISidecarExternalActionDispatchAuthorityVerifier? authorityVerifier = null);
+        CancellationToken ct);
 
     ValueTask<TResult> RunRequiredAsync<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
@@ -1179,8 +1186,7 @@ public interface IActionDispatcher
         Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         SidecarExternalActionDispatchAuthority authority,
-        CancellationToken ct,
-        ISidecarExternalActionDispatchAuthorityVerifier? authorityVerifier = null);
+        CancellationToken ct);
 }
 
 public sealed class ActionOutcomeUncertainException : Exception
