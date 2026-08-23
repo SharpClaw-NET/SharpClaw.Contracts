@@ -1148,16 +1148,8 @@ public static class SidecarExternalActionDispatchAuthorityValidator
         SidecarCapabilityValidationResult.Reject(code, message);
 }
 
-public interface IExternalActionAuthoritySessionRegistration : IDisposable
-{
-    Guid SessionId { get; }
-}
-
 public interface IActionDispatcher
 {
-    IExternalActionAuthoritySessionRegistration RegisterExternalAuthoritySession(
-        SidecarCapabilitySession session);
-
     ValueTask<IActionOutcome<TResult>> RunAsync<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
