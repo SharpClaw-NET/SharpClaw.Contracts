@@ -2489,16 +2489,14 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _terminalReceipts.Remove(callId);
             _callPayloads.Remove(callId);
             _callEntryContexts.Remove(callId);
+            var rootsToClean = new HashSet<Guid>();
             if (_callBudgetRoots.Remove(callId, out var budgetRootId))
-            {
-                _budgetExtensionClaims.Remove(callId);
-                _peerParentBudgetRoots.Remove(callId);
-                MaybeRemoveBudgetReservation(budgetRootId);
-            }
-            else if (_peerParentBudgetRoots.Remove(callId, out var peerRootId))
-            {
-                MaybeRemoveBudgetReservation(peerRootId);
-            }
+                rootsToClean.Add(budgetRootId);
+            if (_peerParentBudgetRoots.Remove(callId, out var peerRootId))
+                rootsToClean.Add(peerRootId);
+            _budgetExtensionClaims.Remove(callId);
+            foreach (var rootId in rootsToClean)
+                MaybeRemoveBudgetReservation(rootId);
             _inFlight--;
             return SidecarCapabilityValidationResult.Accept();
         }
