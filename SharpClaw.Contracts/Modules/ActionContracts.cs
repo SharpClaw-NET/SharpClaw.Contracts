@@ -1163,7 +1163,8 @@ public interface IActionDispatcher
         Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         SidecarExternalActionDispatchAuthority authority,
-        CancellationToken ct);
+        CancellationToken ct,
+        ISidecarExternalActionDispatchAuthorityVerifier? authorityVerifier = null);
 
     ValueTask<TResult> RunRequiredAsync<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
@@ -1178,7 +1179,8 @@ public interface IActionDispatcher
         Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         SidecarExternalActionDispatchAuthority authority,
-        CancellationToken ct);
+        CancellationToken ct,
+        ISidecarExternalActionDispatchAuthorityVerifier? authorityVerifier = null);
 }
 
 public sealed class ActionOutcomeUncertainException : Exception
