@@ -184,11 +184,13 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private readonly Dictionary<Guid, SidecarCapabilityCallIdentity> _callIdentities = [];
     private readonly Dictionary<Guid, SidecarSerializedPayload?> _callPayloads = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _issuedEntryContexts = [];
+    private readonly Dictionary<Guid, HostActionEntryRequestContext> _activeEntryContexts = [];
     private readonly Dictionary<Guid, HostActionEntryCarrierAuthority> _activeEntryCarriers = [];
     private readonly Dictionary<Guid, Guid> _entryBudgetRoots = [];
     private readonly Dictionary<Guid, EntryBudgetReservation> _entryBudgetReservations = [];
     private readonly Dictionary<Guid, Guid> _peerParentBudgetRoots = [];
     private readonly Dictionary<Guid, Guid> _callBudgetRoots = [];
+    private readonly Dictionary<Guid, Guid> _receivingRootReservations = [];
     private readonly Dictionary<Guid, Guid> _budgetExtensionClaims = [];
     private readonly Dictionary<Guid, NestedCarrierState> _nestedCarrierStates = [];
     private readonly Dictionary<Guid, CrossSidecarCarrierState> _crossSidecarStates = [];
@@ -614,6 +616,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 context.ExpiresAt,
                 HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(context.CapabilityHandle));
             _issuedEntryContexts.Remove(context.CapabilityId);
+            _activeEntryContexts[context.CapabilityId] = context;
             _activeEntryCarriers.Add(context.CapabilityId, authority);
             return SidecarCapabilityValidationResult.Accept();
         }
@@ -1205,12 +1208,21 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             if (!payloadResult.Accepted)
                 return payloadResult;
 
-            if (_inFlight >= Binding.ConcurrencyLimits.MaximumInFlightCalls ||
-                _totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest)
+            var usesReceivingRootReservation =
+                _totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest;
+            if (_inFlight >= Binding.ConcurrencyLimits.MaximumInFlightCalls)
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.ConcurrencyLimit,
                     "The receiving capability session cannot reserve the root HostEntry call.");
+            }
+
+            if (usesReceivingRootReservation &&
+                !_receivingRootReservations.TryAdd(relay.RootBudgetId, relay.Context.CapabilityId))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The receiving root budget reservation was already consumed.");
             }
 
             var peerContext = relay.Context with
@@ -1242,13 +1254,15 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 new[] { peerContext.ExpiresAt, relay.PeerCall.Deadline, Binding.ExpiresAt }.Min(),
                 ExtensionAvailable: true);
             _activeEntryCarriers.Add(peerContext.CapabilityId, carrierAuthority);
+            _activeEntryContexts[peerContext.CapabilityId] = peerContext;
             _rootHostActionEntryStates.Add(
                 peerContext.CapabilityId,
                 new RootHostActionEntryState(relay, peerContext));
             _callEntryContexts[relay.PeerCall.CallId] = peerContext;
             _reservedNestedCalls.Add(relay.PeerCall.CallId, relay.PeerCall);
             _lastSequence = relay.PeerCall.Sequence;
-            _totalCalls++;
+            if (!usesReceivingRootReservation)
+                _totalCalls++;
             _inFlight++;
             _nonces.Add(relay.PeerCall.ReplayNonce);
             hostContext = peerContext;
@@ -2263,6 +2277,14 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             return _activeEntryCarriers.TryGetValue(capabilityId, out authority);
     }
 
+    public bool TryGetActiveHostActionEntryContext(
+        Guid capabilityId,
+        out HostActionEntryRequestContext? context)
+    {
+        lock (_sync)
+            return _activeEntryContexts.TryGetValue(capabilityId, out context);
+    }
+
     public SidecarCapabilityValidationResult RotateBinding(
         SidecarCapabilitySessionBinding replacement,
         DateTimeOffset now)
@@ -2338,6 +2360,28 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
             Binding = replacement;
             _bindingGeneration++;
+            foreach (var capabilityId in _activeEntryContexts.Keys.ToArray())
+            {
+                var context = _activeEntryContexts[capabilityId];
+                _activeEntryContexts[capabilityId] = context with
+                {
+                    RequestId = replacement.RequestId,
+                    CancellationId = replacement.CancellationId,
+                    ExpiresAt = new[] { context.ExpiresAt, replacement.ExpiresAt }.Min(),
+                };
+            }
+            foreach (var capabilityId in _activeEntryCarriers.Keys.ToArray())
+            {
+                var authority = _activeEntryCarriers[capabilityId];
+                _activeEntryCarriers[capabilityId] = authority with
+                {
+                    SessionId = replacement.SessionId,
+                    RequestId = replacement.RequestId,
+                    CancellationId = replacement.CancellationId,
+                    BindingGeneration = _bindingGeneration,
+                    ExpiresAt = new[] { authority.ExpiresAt, replacement.ExpiresAt }.Min(),
+                };
+            }
             _lastSequence = 0;
             _totalCalls = 0;
             _nonces.Clear();
@@ -2534,6 +2578,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
             if (hostContext is not null &&
                 (!hostContext.IsWellFormed(now) ||
+                 hostContext.RequestId != Binding.RequestId ||
+                 hostContext.CancellationId != Binding.CancellationId ||
                  !_activeEntryCarriers.TryGetValue(hostContext.CapabilityId, out var activeCarrier) ||
                  !MatchesCarrierContext(hostContext, activeCarrier)))
             {
@@ -3068,6 +3114,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _reservedNestedCalls.Add(peerCall.CallId, peerCall);
             _entryBudgetRoots[relay.Carrier.CarrierId] = rootBudgetId;
             _activeEntryCarriers[relay.Carrier.CarrierId] = carrierAuthority;
+            _activeEntryContexts[relay.Carrier.CarrierId] = childContext;
             _nestedCarrierStates[relay.Carrier.CarrierId] = new NestedCarrierState(
                 relay.Carrier,
                 parentCall,
@@ -3084,6 +3131,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private void RemoveEntryCarrier(Guid capabilityId, DateTimeOffset now)
     {
         _issuedEntryContexts.Remove(capabilityId);
+        _activeEntryContexts.Remove(capabilityId);
         if (_rootHostActionEntryStates.Remove(capabilityId, out var rootState))
         {
             if (_reservedNestedCalls.Remove(rootState.Relay.PeerCall.CallId))
@@ -3168,6 +3216,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         }
 
         _entryBudgetReservations.Remove(rootId);
+        _receivingRootReservations.Remove(rootId);
     }
 
     private void RecordCarrierTombstone(
@@ -3361,10 +3410,12 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _callEntryContexts.Clear();
             _issuedEntryContexts.Clear();
             _activeEntryCarriers.Clear();
+            _activeEntryContexts.Clear();
             _entryBudgetRoots.Clear();
             _entryBudgetReservations.Clear();
             _peerParentBudgetRoots.Clear();
             _callBudgetRoots.Clear();
+            _receivingRootReservations.Clear();
             _budgetExtensionClaims.Clear();
             _nestedCarrierStates.Clear();
             _crossSidecarStates.Clear();
