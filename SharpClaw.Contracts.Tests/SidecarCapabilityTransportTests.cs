@@ -4831,6 +4831,8 @@ public sealed class SidecarCapabilityTransportTests
             NestedCarrierRelay = issuedRelay,
             NestedCarrierOutcomeKind = SidecarNestedHostActionEntryRelayOutcomeKind.Issued,
             NestedCarrierRequestFingerprint = SidecarCapabilityTransportValidation.ComputeNestedCarrierRequestFingerprint(childRequest),
+            ReceivingRootBudgetId = hostParentContext.CapabilityId,
+            ReceivingPeerBindingGeneration = peer.Session.BindingGeneration,
         };
         authority = authority with
         {
@@ -5272,6 +5274,8 @@ public sealed class SidecarCapabilityTransportTests
             var authority = terminalRequest.Authority with
             {
                 RootPeerCall = peerCall,
+                ReceivingRootBudgetId = hostAuthority.CapabilityId,
+                ReceivingPeerBindingGeneration = peer.Session.BindingGeneration,
             };
             authority = authority with
             {
@@ -5302,6 +5306,15 @@ public sealed class SidecarCapabilityTransportTests
 
         var first = PrepareRoot("reserved.first", 1, 9, "first");
         var second = PrepareRoot("reserved.second", 2, 10, "second");
+        var third = PrepareRoot("reserved.third", 3, 11, "third");
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            first.Relay with { RootBudgetId = Guid.NewGuid() },
+            peer.Now,
+            out _).Accepted);
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            first.Relay with { PeerBindingGeneration = peer.Session.BindingGeneration + 1 },
+            peer.Now,
+            out _).Accepted);
         Assert.True(peer.Session.ImportHostActionEntryPeerRootRelay(
             first.Relay,
             peer.Now,
@@ -5328,6 +5341,12 @@ public sealed class SidecarCapabilityTransportTests
                 unrelatedPayload,
                 unrelatedPayload.ByteLength,
                 peer.Now).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.ConcurrencyLimit,
+            peer.Session.ImportHostActionEntryPeerRootRelay(
+                third.Relay,
+                peer.Now,
+                out _).Code);
 
         foreach (var root in new[]
         {
@@ -5377,6 +5396,12 @@ public sealed class SidecarCapabilityTransportTests
             second.HostAuthority,
             HostActionEntryCarrierCompletionKind.Succeeded,
             host.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.ConcurrencyLimit,
+            peer.Session.ImportHostActionEntryPeerRootRelay(
+                third.Relay,
+                peer.Now,
+                out _).Code);
         Assert.Equal(0, peer.Session.ActiveHostActionEntryCarrierCount);
         Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
             first.Relay,
@@ -5485,6 +5510,8 @@ public sealed class SidecarCapabilityTransportTests
         var authority = terminalRequest.Authority with
         {
             RootPeerCall = peerCall,
+            ReceivingRootBudgetId = hostRootAuthority.CapabilityId,
+            ReceivingPeerBindingGeneration = peer.Session.BindingGeneration,
         };
         authority = authority with
         {

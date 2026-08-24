@@ -40,9 +40,13 @@ public sealed record SidecarAuthenticationProof(
 
 public sealed record SidecarConcurrencyLimits(
     int MaximumInFlightCalls,
-    int MaximumCallsPerRequest)
+    int MaximumCallsPerRequest,
+    int MaximumReceivingRootReservations = 2)
 {
-    public bool IsValid => MaximumInFlightCalls > 0 && MaximumCallsPerRequest > 0;
+    public bool IsValid =>
+        MaximumInFlightCalls > 0 &&
+        MaximumCallsPerRequest > 0 &&
+        MaximumReceivingRootReservations > 0;
 }
 
 public sealed record SidecarSafeFailureIdentity(
@@ -190,7 +194,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private readonly Dictionary<Guid, EntryBudgetReservation> _entryBudgetReservations = [];
     private readonly Dictionary<Guid, Guid> _peerParentBudgetRoots = [];
     private readonly Dictionary<Guid, Guid> _callBudgetRoots = [];
-    private readonly Dictionary<Guid, Guid> _receivingRootReservations = [];
+    private readonly Dictionary<Guid, ReceivingRootReservation> _receivingRootReservations = [];
     private readonly Dictionary<Guid, Guid> _budgetExtensionClaims = [];
     private readonly Dictionary<Guid, NestedCarrierState> _nestedCarrierStates = [];
     private readonly Dictionary<Guid, CrossSidecarCarrierState> _crossSidecarStates = [];
@@ -224,6 +228,10 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         long BindingGeneration,
         DateTimeOffset ExpiresAt,
         bool ExtensionAvailable);
+
+    private sealed record ReceivingRootReservation(
+        Guid CapabilityId,
+        long BindingGeneration);
 
     private sealed record RootHostActionEntryState(
         SidecarHostActionEntryRootRelay Relay,
@@ -1091,6 +1099,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             if (rootBudgetId == Guid.Empty ||
                 authority.CallId != sourceCall.CallId ||
                 authority.RootPeerCall != peerCall ||
+                authority.ReceivingRootBudgetId != rootBudgetId ||
+                authority.ReceivingPeerBindingGeneration != peerGeneration ||
                 authority.SessionId != Binding.SessionId ||
                 authority.RequestId != Binding.RequestId ||
                 authority.CancellationId != Binding.CancellationId ||
@@ -1218,7 +1228,17 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             }
 
             if (usesReceivingRootReservation &&
-                !_receivingRootReservations.TryAdd(relay.RootBudgetId, relay.Context.CapabilityId))
+                _receivingRootReservations.Count >= Binding.ConcurrencyLimits.MaximumReceivingRootReservations)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.ConcurrencyLimit,
+                    "The receiving root reservation budget is exhausted for this binding generation.");
+            }
+
+            if (usesReceivingRootReservation &&
+                !_receivingRootReservations.TryAdd(
+                    relay.RootBudgetId,
+                    new ReceivingRootReservation(relay.Context.CapabilityId, _bindingGeneration)))
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Replay,
@@ -2397,6 +2417,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _entryBudgetReservations.Clear();
             _peerParentBudgetRoots.Clear();
             _budgetExtensionClaims.Clear();
+            _receivingRootReservations.Clear();
             return SidecarCapabilityValidationResult.Accept();
         }
     }
@@ -3216,7 +3237,6 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         }
 
         _entryBudgetReservations.Remove(rootId);
-        _receivingRootReservations.Remove(rootId);
     }
 
     private void RecordCarrierTombstone(
@@ -3835,6 +3855,8 @@ public sealed record SidecarHostActionEntryRootRelay(
         Authority.AuthorityId != Guid.Empty &&
         Authority.CallId == Call.CallId &&
         Authority.RootPeerCall == PeerCall &&
+        Authority.ReceivingRootBudgetId == RootBudgetId &&
+        Authority.ReceivingPeerBindingGeneration == PeerBindingGeneration &&
         Authority.TerminalId == Terminal.TerminalId &&
         Authority.ActionKey == Descriptor.Key &&
         Authority.ActionVersion == Descriptor.Version &&
@@ -4039,6 +4061,8 @@ public sealed record SidecarHostTerminalAuthority(
     public SidecarNestedHostActionEntryRelayOutcomeKind? NestedCarrierOutcomeKind { get; init; }
     public string NestedCarrierRequestFingerprint { get; init; } = string.Empty;
     public string HostContextBindingHash { get; init; } = string.Empty;
+    public Guid ReceivingRootBudgetId { get; init; }
+    public long ReceivingPeerBindingGeneration { get; init; }
 }
 
 public sealed record SidecarActionTerminalExecutionContext(
@@ -5223,6 +5247,8 @@ public static class SidecarCapabilityTransportValidation
             authority.ParentInvocationId,
             authority.Depth,
             authority.Attempt,
+            authority.ReceivingRootBudgetId,
+            authority.ReceivingPeerBindingGeneration,
             RootPeerCall = authority.RootPeerCall is null
                 ? null
                 : new
