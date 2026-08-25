@@ -3536,6 +3536,150 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void HostEntryStorageContinuationRejectsAfterIssuerCallAndCarrierComplete()
+    {
+        var source = CreateFixture(maxInFlight: 4, maxCalls: 8);
+        var target = CreateFixture(
+            maxInFlight: 4,
+            maxCalls: 8,
+            moduleId: "module-b",
+            graphId: "graph-b",
+            authenticateStorageContinuationAuthority: (authority, hash) =>
+                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority) &&
+                source.Session.IsStorageContinuationAuthorityLive(authority, source.Now));
+        ConsumeStorageCalls(source, 6, "issuer-lifetime-source");
+        ConsumeStorageCalls(target, 6, "issuer-lifetime-target");
+
+        var descriptor = NestedDescriptor("issuer.lifetime.parent", typeof(string).AssemblyQualifiedName!);
+        var action = Payload(descriptor.InputTypeIdentity, "parent");
+        var sourceContext = IssueContext(
+            source,
+            new RequestPrincipal("issuer-caller"),
+            HostActionEntryIngress.CrossModule,
+            lineage: new HostActionEntryLineage(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                null,
+                null));
+        var targetContext = IssueContext(
+            target,
+            new RequestPrincipal("target-caller"),
+            HostActionEntryIngress.CrossModule,
+            lineage: new HostActionEntryLineage(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                null,
+                null));
+        var sourceCall = ActionCall(source, 7, "issuer-lifetime-source-parent");
+        var targetCall = ActionCall(target, 7, "issuer-lifetime-target-parent");
+        var sourceCarrier = ActivateContext(source, sourceContext!);
+        var targetCarrier = ActivateContext(target, targetContext!);
+        Assert.True(source.Session.BeginCall(
+            sourceCall,
+            SidecarCapabilityKind.Action,
+            action,
+            action.ByteLength,
+            source.Now,
+            sourceContext).Accepted);
+        Assert.True(target.Session.BeginCall(
+            targetCall,
+            SidecarCapabilityKind.Action,
+            action,
+            action.ByteLength,
+            target.Now,
+            targetContext).Accepted);
+        Assert.True(source.Session.RecordTerminal(
+            sourceCall.CallId,
+            Guid.NewGuid(),
+            new SidecarTerminalReceipt(
+                "issuer-lifetime-source-receipt",
+                descriptor.Key,
+                descriptor.Version,
+                sourceCall.CallId,
+                1,
+                "issuer-lifetime-source-scope",
+                action.ContentHash)).Accepted);
+        Assert.True(target.Session.RecordTerminal(
+            targetCall.CallId,
+            Guid.NewGuid(),
+            new SidecarTerminalReceipt(
+                "issuer-lifetime-target-receipt",
+                descriptor.Key,
+                descriptor.Version,
+                targetCall.CallId,
+                1,
+                "issuer-lifetime-target-scope",
+                action.ContentHash)).Accepted);
+
+        var storageCall = target.Call with
+        {
+            Capability = SidecarCapabilityKind.Storage,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "issuer-lifetime-storage",
+            Sequence = 8,
+            Deadline = targetCall.Deadline,
+        };
+        var storagePayload = Payload("agent_job_imports.request", new { jobId = "issuer-lifetime-job" });
+        var storageRequest = SidecarStorageCapabilityRequest.Invoke(
+            storageCall,
+            target.Binding.ModuleId,
+            "agent_job_imports/get",
+            storagePayload,
+            PayloadType("agent_job_imports.result"),
+            Cancellation(target),
+            storageCall.Deadline);
+        var issue = source.Session.IssueHostEntryStorageContinuation(
+            target.Session,
+            sourceCall,
+            targetCall,
+            storageRequest,
+            source.Now,
+            (_, hash) => hash,
+            out var authority);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(authority);
+
+        Assert.True(source.Session.CompleteCall(sourceCall.CallId, 1).Accepted);
+        Assert.True(source.Session.CompleteHostActionEntryCarrier(
+            sourceCarrier,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            source.Now).Accepted);
+
+        var wireAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(authority));
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            target.Session.ImportHostEntryStorageContinuationAuthority(wireAuthority, target.Now).Code);
+
+        Assert.True(target.Session.CompleteCall(targetCall.CallId, 1).Accepted);
+        Assert.True(target.Session.CompleteHostActionEntryCarrier(
+            targetCarrier,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            target.Now).Accepted);
+        var laterCall = target.Call with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "issuer-lifetime-later",
+            Sequence = 8,
+        };
+        Assert.True(target.Session.BeginCall(
+            laterCall,
+            SidecarCapabilityKind.Storage,
+            storagePayload,
+            storagePayload.ByteLength,
+            target.Now).Accepted);
+        Assert.True(target.Session.CompleteCall(laterCall.CallId, 0).Accepted);
+    }
+
+    [Fact]
     public void Host_entry_credit_allows_two_sequential_children_without_increasing_the_limit()
     {
         var fixture = CreateFixture(maxInFlight: 3, maxCalls: 8);
@@ -4902,7 +5046,8 @@ public sealed class SidecarCapabilityTransportTests
             graphId: "graph-b",
             authenticateHostTerminalAuthority: VerifyHostProof,
             authenticateStorageContinuationAuthority: (authority, hash) =>
-                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority));
+                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority) &&
+                host.Session.IsStorageContinuationAuthorityLive(authority, host.Now));
         var parentDescriptor = NestedDescriptor("peer.parent", typeof(string).AssemblyQualifiedName!);
         var parentAction = Payload(parentDescriptor.InputTypeIdentity, "parent");
         var hostParentContext = IssueContext(

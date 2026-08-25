@@ -209,6 +209,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _callEntryContexts = [];
     private readonly Dictionary<Guid, RootHostActionEntryState> _rootHostActionEntryStates = [];
     private readonly Dictionary<Guid, StorageContinuationState> _storageContinuationStates = [];
+    private readonly Dictionary<Guid, IssuedStorageContinuationState> _issuedStorageContinuationStates = [];
     private readonly Dictionary<Guid, DateTimeOffset> _completedStorageContinuations = [];
     private readonly Dictionary<Guid, Guid> _storageContinuationParents = [];
     private readonly HashSet<Guid> _completedCalls = [];
@@ -244,6 +245,9 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private sealed record StorageContinuationState(
         SidecarHostEntryStorageContinuationAuthority Authority,
         bool Consumed);
+
+    private sealed record IssuedStorageContinuationState(
+        SidecarHostEntryStorageContinuationAuthority Authority);
 
     private sealed record NestedCarrierState(
         SidecarNestedHostActionEntryCarrier Carrier,
@@ -358,8 +362,12 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
         var expiresAt = new[]
         {
+            issuerCall.Deadline,
             request.Deadline,
             request.Cancellation.ExpiresAt,
+            issuerContext!.ExpiresAt,
+            issuerCarrier!.ExpiresAt,
+            Binding.ExpiresAt,
             targetContext.ExpiresAt,
             receivingSession.Binding.ExpiresAt,
         }.Min();
@@ -400,6 +408,24 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         {
             Proof = issueProof(candidate, candidate.CanonicalBindingHash),
         };
+
+        if (string.IsNullOrWhiteSpace(candidate.Proof))
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The host did not issue a storage continuation proof.");
+
+        lock (_sync)
+        {
+            _issuedStorageContinuationStates[candidate.AuthorityId] =
+                new IssuedStorageContinuationState(candidate);
+            if (!IsStorageContinuationIssuerLiveLocked(candidate, now))
+            {
+                _issuedStorageContinuationStates.Remove(candidate.AuthorityId);
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The issuing HostEntry authority ended before continuation issuance completed.");
+            }
+        }
 
         authority = candidate;
         return SidecarCapabilityValidationResult.Accept();
@@ -488,6 +514,35 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         }
     }
 
+    public bool IsStorageContinuationAuthorityLive(
+        SidecarHostEntryStorageContinuationAuthority authority,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(authority);
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            return IsStorageContinuationIssuerLiveLocked(authority, now);
+        }
+    }
+
+    private bool IsStorageContinuationIssuerLiveLocked(
+        SidecarHostEntryStorageContinuationAuthority authority,
+        DateTimeOffset now) =>
+        !_disconnected &&
+        authority.ExpiresAt > now &&
+        _issuedStorageContinuationStates.TryGetValue(authority.AuthorityId, out var state) &&
+        MatchesStorageContinuationAuthority(state.Authority, authority) &&
+        _calls.TryGetValue(authority.IssuerCall.CallId, out var capability) &&
+        capability == SidecarCapabilityKind.Action &&
+        _callIdentities.TryGetValue(authority.IssuerCall.CallId, out var activeCall) &&
+        activeCall == authority.IssuerCall &&
+        _callEntryContexts.TryGetValue(authority.IssuerCall.CallId, out var issuerContext) &&
+        _activeEntryCarriers.TryGetValue(authority.IssuerCarrierAuthority.CapabilityId, out var issuerCarrier) &&
+        MatchesCarrierAuthority(authority.IssuerCarrierAuthority, issuerCarrier) &&
+        MatchesCarrierContext(issuerContext, issuerCarrier) &&
+        _terminalCalls.ContainsKey(authority.IssuerCall.CallId);
+
     public SidecarCapabilityValidationResult BeginStorageContinuationCall(
         SidecarStorageCapabilityRequest request,
         int frameByteLength,
@@ -526,6 +581,12 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Replay,
                     "The storage continuation authority was already consumed.");
+
+            if (_authenticateStorageContinuationAuthority is null ||
+                !_authenticateStorageContinuationAuthority(authority, authority.CanonicalBindingHash))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The storage continuation authority is no longer live at its issuer.");
 
             var result = BeginCallCore(
                 request.Call,
@@ -2687,7 +2748,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 _reservedNestedCalls.Count != 0 ||
                 _crossSidecarStates.Count != 0 ||
                 _crossSidecarParentChildren.Count != 0 ||
-                _storageContinuationStates.Count != 0)
+                _storageContinuationStates.Count != 0 ||
+                _issuedStorageContinuationStates.Count != 0)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.InvalidBinding,
                     "The capability session cannot rotate while a carrier context is pending activation.");
@@ -2757,6 +2819,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _budgetExtensionClaims.Clear();
             _receivingRootReservations.Clear();
             _storageContinuationStates.Clear();
+            _issuedStorageContinuationStates.Clear();
             _storageContinuationParents.Clear();
             _completedStorageContinuations.Clear();
             return SidecarCapabilityValidationResult.Accept();
@@ -3214,6 +3277,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     SidecarCapabilityErrors.InvalidBinding,
                     "Storage calls cannot complete with a terminal callback.");
 
+            RevokeIssuedStorageContinuationsForCall(callId);
+
             if (_callEntryContexts.TryGetValue(callId, out var completedContext))
             {
                 RevokeNestedCarriersForParent(callId, DateTimeOffset.UtcNow);
@@ -3264,6 +3329,12 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _storageContinuationParents.Remove(state.Value.Authority.StorageCall.CallId);
             _completedStorageContinuations[state.Key] = state.Value.Authority.ExpiresAt;
             removed++;
+        }
+        foreach (var state in _issuedStorageContinuationStates
+            .Where(pair => pair.Value.Authority.ExpiresAt <= now)
+            .ToArray())
+        {
+            _issuedStorageContinuationStates.Remove(state.Key);
         }
         foreach (var capabilityId in _issuedEntryContexts
             .Where(pair => pair.Value.ExpiresAt <= now)
@@ -3547,6 +3618,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private void RemoveEntryCarrier(Guid capabilityId, DateTimeOffset now)
     {
         RevokeStorageContinuationsForCarrier(capabilityId, now);
+        RevokeIssuedStorageContinuationsForCarrier(capabilityId);
         _issuedEntryContexts.Remove(capabilityId);
         _activeEntryContexts.Remove(capabilityId);
         if (_rootHostActionEntryStates.Remove(capabilityId, out var rootState))
@@ -3604,6 +3676,28 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _completedStorageContinuations[state.Key] = state.Value.Authority.ExpiresAt > now
                 ? state.Value.Authority.ExpiresAt
                 : now + CarrierReplayRetention;
+        }
+    }
+
+    private void RevokeIssuedStorageContinuationsForCall(Guid callId)
+    {
+        foreach (var authorityId in _issuedStorageContinuationStates
+            .Where(pair => pair.Value.Authority.IssuerCall.CallId == callId)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _issuedStorageContinuationStates.Remove(authorityId);
+        }
+    }
+
+    private void RevokeIssuedStorageContinuationsForCarrier(Guid capabilityId)
+    {
+        foreach (var authorityId in _issuedStorageContinuationStates
+            .Where(pair => pair.Value.Authority.IssuerCarrierAuthority.CapabilityId == capabilityId)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _issuedStorageContinuationStates.Remove(authorityId);
         }
     }
 
@@ -3884,6 +3978,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _completedEntryCarriers.Clear();
             _consumedEntryCarriers.Clear();
             _storageContinuationStates.Clear();
+            _issuedStorageContinuationStates.Clear();
             _completedStorageContinuations.Clear();
             _storageContinuationParents.Clear();
             _terminalCalls.Clear();
