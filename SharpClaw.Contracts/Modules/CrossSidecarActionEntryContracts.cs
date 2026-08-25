@@ -60,6 +60,7 @@ public sealed record SidecarCrossSidecarActionEntryAuthority(
     Guid TargetChildInvocationId,
     Guid CapabilityId,
     string CapabilityHandle,
+    Guid RootBudgetId,
     long SourceBindingGeneration,
     long TargetBindingGeneration,
     SidecarModuleActionEntryDefinition TargetEntry,
@@ -102,6 +103,7 @@ public sealed record SidecarCrossSidecarActionEntryAuthority(
         TargetChildInvocationId != Guid.Empty &&
         CapabilityId != Guid.Empty &&
         !string.IsNullOrWhiteSpace(CapabilityHandle) &&
+        RootBudgetId != Guid.Empty &&
         SourceBindingGeneration > 0 &&
         TargetBindingGeneration > 0 &&
         TargetEntry is not null &&
@@ -231,6 +233,7 @@ public static class SidecarCrossSidecarActionEntryValidation
             authority.TargetChildInvocationId,
             authority.CapabilityId,
             authority.CapabilityHandle,
+            authority.RootBudgetId,
             authority.SourceBindingGeneration,
             authority.TargetBindingGeneration,
             TargetEntry = authority.TargetEntry,

@@ -6010,6 +6010,200 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void CrossSidecarTargetCreatesStorageContinuationCarrierState()
+    {
+        var source = CreateFixture(maxInFlight: 4, maxCalls: 8);
+        var target = CreateFixture(
+            maxInFlight: 4,
+            maxCalls: 8,
+            authenticateStorageContinuationAuthority: (authority, hash) =>
+                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority) &&
+                source.Session.IsStorageContinuationAuthorityLive(authority, source.Now),
+            moduleId: "module-b",
+            graphId: "graph-b");
+        ConsumeStorageCalls(target, 6, "cross-boundary");
+        var targetParent = PrepareCrossParent(target, "target.root", sequence: 7);
+        var cross = CreateCrossRelay(source, target);
+        var terminal = new SidecarActionTerminalRegistration(
+            Guid.NewGuid(),
+            cross.Relay.Descriptor.InputTypeIdentity,
+            cross.Relay.Descriptor.InputSchemaVersion,
+            cross.Relay.Descriptor.ResultTypeIdentity,
+            cross.Relay.Descriptor.ResultSchemaVersion,
+            cross.Relay.Descriptor.DescriptorHash);
+
+        var mutatedCarriers = new[]
+        {
+            cross.Relay.Carrier with
+            {
+                Authority = cross.Relay.Carrier.Authority with { RootBudgetId = Guid.NewGuid() },
+            },
+            cross.Relay.Carrier with
+            {
+                Authority = cross.Relay.Carrier.Authority with
+                {
+                    SourceParentCall = cross.Relay.Carrier.Authority.SourceParentCall with { CallId = Guid.NewGuid() },
+                },
+            },
+            cross.Relay.Carrier with
+            {
+                Authority = cross.Relay.Carrier.Authority with
+                {
+                    TargetChildCall = cross.Relay.Carrier.Authority.TargetChildCall with { CallId = Guid.NewGuid() },
+                },
+            },
+            cross.Relay.Carrier with
+            {
+                Authority = cross.Relay.Carrier.Authority with { Cancellation = cross.Relay.Carrier.Authority.Cancellation with { CancellationId = Guid.NewGuid() } },
+            },
+            cross.Relay.Carrier with
+            {
+                Authority = cross.Relay.Carrier.Authority with { Proof = "forged-proof" },
+            },
+            cross.Relay.Carrier with
+            {
+                Authority = cross.Relay.Carrier.Authority with { ExpiresAt = cross.Relay.Carrier.ExpiresAt.AddSeconds(1) },
+                ExpiresAt = cross.Relay.Carrier.ExpiresAt.AddSeconds(1),
+            },
+            cross.Relay.Carrier with
+            {
+                Action = Payload(cross.Relay.Carrier.Action.TypeIdentity, new { value = 99 }),
+            },
+        };
+        foreach (var mutatedCarrier in mutatedCarriers)
+        {
+            var mutation = target.Session.BeginCrossSidecarActionEntryCall(
+                mutatedCarrier,
+                terminal,
+                mutatedCarrier.Action.ByteLength,
+                cross.Now,
+                out _,
+                (authority, hash) => authority.Proof == hash);
+            Assert.False(mutation.Accepted);
+        }
+
+        Assert.True(target.Session.BeginCrossSidecarActionEntryCall(
+            cross.Relay.Carrier,
+            terminal,
+            cross.Relay.Carrier.Action.ByteLength,
+            cross.Now,
+            out var childContext,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.NotNull(childContext);
+        Assert.Equal(8, cross.Relay.Carrier.Authority.TargetChildCall.Sequence);
+        Assert.True(target.Session.TryGetActiveHostActionEntryCarrier(
+            cross.Relay.Carrier.CarrierId,
+            out var targetCarrier));
+        Assert.NotNull(targetCarrier);
+
+        var childCall = cross.Relay.Carrier.Authority.TargetChildCall;
+        var childReceipt = new SidecarTerminalReceipt(
+            "cross-storage-child",
+            cross.Relay.Descriptor.Key,
+            cross.Relay.Descriptor.Version,
+            childCall.CallId,
+            cross.Relay.Carrier.Authority.Attempt,
+            "cross-storage-scope",
+            cross.Relay.Carrier.Action.ContentHash);
+        Assert.True(target.Session.RecordTerminal(
+            childCall.CallId,
+            Guid.NewGuid(),
+            childReceipt).Accepted);
+
+        var storageCall = childCall with
+        {
+            Capability = SidecarCapabilityKind.Storage,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "cross-storage-continuation",
+            Sequence = 9,
+        };
+        var storagePayload = Payload(
+            "agent_job_imports.request",
+            new { jobId = "cross-sidecar-job" });
+        var storageRequest = SidecarStorageCapabilityRequest.Invoke(
+            storageCall,
+            target.Binding.ModuleId,
+            "agent_job_imports/get",
+            storagePayload,
+            PayloadType("agent_job_imports.result"),
+            new SidecarCancellationIdentity(
+                target.Binding.CancellationId,
+                "cross-storage-cancellation",
+                storageCall.Deadline),
+            storageCall.Deadline);
+        var issue = source.Session.IssueHostEntryStorageContinuation(
+            target.Session,
+            cross.ParentCall,
+            childCall,
+            storageRequest,
+            source.Now,
+            (_, hash) => hash,
+            out var authority);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(authority);
+
+        var wireRequest = storageRequest with
+        {
+            HostEntryContinuationAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+                SidecarCapabilityTransportCodec.Serialize(authority)),
+        };
+        Assert.True(target.Session.ImportHostEntryStorageContinuationAuthority(
+            wireRequest.HostEntryContinuationAuthority!,
+            target.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            target.Session.CompleteCall(childCall.CallId, 1).Code);
+        Assert.True(target.Session.BeginStorageContinuationCall(
+            wireRequest,
+            storagePayload.ByteLength,
+            target.Now,
+            out var storageContext).Accepted);
+        Assert.Equal(childContext!.CapabilityId, storageContext!.CapabilityId);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            target.Session.BeginStorageContinuationCall(
+                wireRequest,
+                storagePayload.ByteLength,
+                target.Now,
+                out _).Code);
+        Assert.True(target.Session.CompleteCall(storageCall.CallId, 0).Accepted);
+
+        var childResult = Payload(cross.Relay.Descriptor.ResultTypeIdentity, new { ok = true });
+        var childOutcome = new SidecarActionOutcomeEnvelope(
+            ActionOutcomeKind.Completed,
+            childResult,
+            null,
+            null,
+            null,
+            childReceipt,
+            target.Binding.SafeFailure,
+            1);
+        var childExecution = new SidecarTerminalExecutionResult(childResult, null, true);
+        var childResultIdentity = new SidecarActionResultIdentity(
+            Guid.NewGuid(),
+            childCall.CallId,
+            cross.Relay.Descriptor.Key,
+            cross.Relay.Descriptor.Version,
+            childResult.TypeIdentity,
+            childResult.ContentHash);
+        Assert.True(target.Session.CompleteCrossSidecarActionEntry(
+            cross.Relay.Carrier,
+            childOutcome,
+            childReceipt,
+            childExecution,
+            childResultIdentity,
+            target.Binding.SafeFailure,
+            target.Now,
+            (_, hash) => hash,
+            out _).Accepted);
+        Assert.False(target.Session.TryGetActiveHostActionEntryCarrier(
+            cross.Relay.Carrier.CarrierId,
+            out _));
+        Assert.True(target.Session.CompleteCall(targetParent.Call.CallId, 1).Accepted);
+        Assert.True(source.Session.CompleteCall(cross.ParentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
     public void CrossSidecarEntryIssuesResolvesConsumesAndCompletesOnce()
     {
         var fixture = CreateFixture();
@@ -6695,14 +6889,14 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     private static (SidecarCapabilityCallIdentity Call, HostActionEntryRequestContext Context, SidecarSerializedPayload Action)
-        PrepareCrossParent(Fixture fixture, string key)
+        PrepareCrossParent(Fixture fixture, string key, long sequence = 1)
     {
         var call = fixture.Call with
         {
             Capability = SidecarCapabilityKind.Action,
             CallId = Guid.NewGuid(),
             ReplayNonce = $"{key}-nonce",
-            Sequence = 1,
+            Sequence = sequence,
             Deadline = fixture.Now.AddMinutes(1),
         };
         var action = Payload($"{key}.input", new { value = 1 });
