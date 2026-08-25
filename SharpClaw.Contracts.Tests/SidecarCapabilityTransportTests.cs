@@ -3377,6 +3377,165 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public async Task HostEntryStorageContinuationUsesAuthenticatedSequenceNineAuthorityOnce()
+    {
+        var fixture = CreateFixture(
+            maxInFlight: 4,
+            maxCalls: 8,
+            authenticateStorageContinuationAuthority: (authority, hash) =>
+                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority));
+        ConsumeStorageCalls(fixture, 6, "storage-continuation-boundary");
+
+        var parentCall = ActionCall(fixture, 7, "storage-continuation-parent");
+        var parentDescriptor = NestedDescriptor("storage.parent", "storage.parent.input");
+        var parentContext = IssueContext(
+            fixture,
+            new RequestPrincipal("storage-parent-caller"),
+            HostActionEntryIngress.CrossModule,
+            lineage: new HostActionEntryLineage(
+                parentDescriptor.Key,
+                parentDescriptor.Version,
+                parentDescriptor.DescriptorHash,
+                parentDescriptor.InputTypeIdentity,
+                parentDescriptor.InputSchemaVersion,
+                parentDescriptor.InputSchemaHash,
+                null,
+                null));
+        var parentAction = Payload(parentDescriptor.InputTypeIdentity, new { value = 1 });
+        ActivateContext(fixture, parentContext);
+        Assert.True(fixture.Session.BeginCall(
+            parentCall,
+            SidecarCapabilityKind.Action,
+            parentAction,
+            parentAction.ByteLength,
+            fixture.Now,
+            parentContext).Accepted);
+        Assert.True(fixture.Session.RecordTerminal(
+            parentCall.CallId,
+            Guid.NewGuid(),
+            new SidecarTerminalReceipt(
+                "storage-parent-receipt",
+                parentDescriptor.Key,
+                parentDescriptor.Version,
+                parentCall.CallId,
+                1,
+                "storage-parent-scope",
+                parentAction.ContentHash)).Accepted);
+
+        var ordinaryCall = fixture.Call with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "storage-continuation-ordinary",
+            Sequence = 8,
+        };
+        var ordinaryPayload = Payload("storage.request", new { value = 8 });
+        Assert.True(fixture.Session.BeginCall(
+            ordinaryCall,
+            SidecarCapabilityKind.Storage,
+            ordinaryPayload,
+            ordinaryPayload.ByteLength,
+            fixture.Now).Accepted);
+        Assert.True(fixture.Session.CompleteCall(ordinaryCall.CallId, 0).Accepted);
+
+        var continuationCall = fixture.Call with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "storage-continuation-nine",
+            Sequence = 9,
+            Deadline = fixture.Now.AddMinutes(1),
+        };
+        var continuationPayload = Payload("agent_job_imports.request", new { jobId = "job-1" });
+        var continuationRequest = SidecarStorageCapabilityRequest.Invoke(
+            continuationCall,
+            fixture.Binding.ModuleId,
+            "agent_job_imports/get",
+            continuationPayload,
+            PayloadType("agent_job_imports.result"),
+            Cancellation(fixture),
+            continuationCall.Deadline);
+        var issue = fixture.Session.IssueHostEntryStorageContinuation(
+            fixture.Session,
+            parentCall,
+            parentCall,
+            continuationRequest,
+            fixture.Now,
+            (_, hash) => hash,
+            out var authority);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(authority);
+
+        var wireAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(authority));
+        var requestWithAuthority = continuationRequest with
+        {
+            HostEntryContinuationAuthority = wireAuthority,
+        };
+
+        Assert.True(fixture.Session.ImportHostEntryStorageContinuationAuthority(wireAuthority, fixture.Now).Accepted);
+
+        var changedAuthority = wireAuthority with { RootBudgetId = Guid.NewGuid() };
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.BeginStorageContinuationCall(
+                requestWithAuthority with { HostEntryContinuationAuthority = changedAuthority },
+                continuationPayload.ByteLength,
+                fixture.Now,
+                out _).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.BeginStorageContinuationCall(
+                requestWithAuthority with { RequestPayload = Payload("agent_job_imports.request", new { jobId = "job-2" }) },
+                continuationPayload.ByteLength,
+                fixture.Now,
+                out _).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.BeginStorageContinuationCall(
+                requestWithAuthority with
+                {
+                    Cancellation = requestWithAuthority.Cancellation with { AuthorityHash = "changed-cancellation" },
+                },
+                continuationPayload.ByteLength,
+                fixture.Now,
+                out _).Code);
+
+        var concurrent = await Task.WhenAll(
+            Task.Run(() =>
+            {
+                var result = fixture.Session.BeginStorageContinuationCall(
+                    requestWithAuthority,
+                    continuationPayload.ByteLength,
+                    fixture.Now,
+                    out var context);
+                return (result, context);
+            }),
+            Task.Run(() =>
+            {
+                var result = fixture.Session.BeginStorageContinuationCall(
+                    requestWithAuthority,
+                    continuationPayload.ByteLength,
+                    fixture.Now,
+                    out var context);
+                return (result, context);
+            }));
+        Assert.Single(concurrent, attempt => attempt.result.Accepted);
+        Assert.Single(concurrent, attempt => attempt.result.Code == SidecarCapabilityErrors.Replay);
+        Assert.NotNull(concurrent.Single(attempt => attempt.result.Accepted).context);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            fixture.Session.BeginStorageContinuationCall(
+                requestWithAuthority,
+                continuationPayload.ByteLength,
+                fixture.Now,
+                out _).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.CompleteCall(parentCall.CallId, 1).Code);
+        Assert.True(fixture.Session.CompleteCall(continuationCall.CallId, 0).Accepted);
+        Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
     public void Host_entry_credit_allows_two_sequential_children_without_increasing_the_limit()
     {
         var fixture = CreateFixture(maxInFlight: 3, maxCalls: 8);
@@ -4741,7 +4900,9 @@ public sealed class SidecarCapabilityTransportTests
             maxCalls: 8,
             moduleId: "module-b",
             graphId: "graph-b",
-            authenticateHostTerminalAuthority: VerifyHostProof);
+            authenticateHostTerminalAuthority: VerifyHostProof,
+            authenticateStorageContinuationAuthority: (authority, hash) =>
+                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority));
         var parentDescriptor = NestedDescriptor("peer.parent", typeof(string).AssemblyQualifiedName!);
         var parentAction = Payload(parentDescriptor.InputTypeIdentity, "parent");
         var hostParentContext = IssueContext(
@@ -5141,6 +5302,53 @@ public sealed class SidecarCapabilityTransportTests
             peerGrandchildCall.CallId,
             Guid.NewGuid(),
             grandchildReceipt).Accepted);
+
+        var storageCall = peer.Call with
+        {
+            Capability = SidecarCapabilityKind.Storage,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "peer-storage-continuation",
+            Sequence = 10,
+            Deadline = peerChildCall.Deadline,
+        };
+        var storagePayload = Payload("agent_job_imports.request", new { jobId = "nested-job" });
+        var storageRequest = SidecarStorageCapabilityRequest.Invoke(
+            storageCall,
+            peer.Binding.ModuleId,
+            "agent_job_imports/get",
+            storagePayload,
+            PayloadType("agent_job_imports.result"),
+            Cancellation(peer),
+            storageCall.Deadline);
+        var storageIssue = host.Session.IssueHostEntryStorageContinuation(
+            peer.Session,
+            issuedRelay.Call,
+            peerChildCall,
+            storageRequest,
+            host.Now,
+            (_, hash) => hash,
+            out var storageAuthority);
+        Assert.True(storageIssue.Accepted, storageIssue.Message);
+        Assert.NotNull(storageAuthority);
+        var storageWireRequest = storageRequest with
+        {
+            HostEntryContinuationAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+                SidecarCapabilityTransportCodec.Serialize(storageAuthority)),
+        };
+        Assert.True(peer.Session.ImportHostEntryStorageContinuationAuthority(
+            storageWireRequest.HostEntryContinuationAuthority!,
+            peer.Now).Accepted);
+        Assert.True(peer.Session.BeginStorageContinuationCall(
+            storageWireRequest,
+            storagePayload.ByteLength,
+            peer.Now,
+            out var storageContext).Accepted);
+        Assert.NotNull(storageContext);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            peer.Session.CompleteCall(peerChildCall.CallId, 1).Code);
+        Assert.True(peer.Session.CompleteCall(storageCall.CallId, 0).Accepted);
+
         Assert.True(peer.Session.CompleteCall(peerGrandchildCall.CallId, 1).Accepted);
         Assert.True(peer.Session.CompleteCall(peerChildCall.CallId, 1).Accepted);
         Assert.True(peer.Session.CompleteCall(peerParentCall.CallId, 1).Accepted);
@@ -5585,7 +5793,8 @@ public sealed class SidecarCapabilityTransportTests
         IReadOnlyList<SidecarCapabilityKind>? capabilities = null,
         string moduleId = "module-a",
         string graphId = "graph-a",
-        Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null)
+        Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null,
+        Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null)
     {
         var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var expires = now.AddMinutes(5);
@@ -5629,7 +5838,8 @@ public sealed class SidecarCapabilityTransportTests
             authority => bindingHashes.Contains(authority.BindingHash),
             nonces.Add,
             now,
-            authenticateHostTerminalAuthority);
+            authenticateHostTerminalAuthority,
+            authenticateStorageContinuationAuthority);
         var call = new SidecarCapabilityCallIdentity(
             binding.SessionId,
             binding.RequestId,
