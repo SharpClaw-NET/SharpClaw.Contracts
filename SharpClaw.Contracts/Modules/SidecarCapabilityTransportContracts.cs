@@ -2673,7 +2673,6 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 AbortCrossSidecarCall(state.TargetChildCall.CallId);
             if (!state.IsSource)
                 RemoveEntryCarrier(carrierId, now);
-            RemoveReceivingRootReservation(state.Carrier.CarrierId);
             RecordCarrierTombstone(carrierId, _bindingGeneration, now, state.Carrier.ExpiresAt);
             peerSession = state.PeerSession;
         }
@@ -2697,7 +2696,6 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 else
                     AbortCrossSidecarCall(state.TargetChildCall.CallId);
                 RemoveEntryCarrier(carrierId, now);
-                RemoveReceivingRootReservation(state.Carrier.CarrierId);
             }
 
             RecordCarrierTombstone(carrierId, _bindingGeneration, now, state.Carrier.ExpiresAt);
@@ -3464,7 +3462,6 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 AbortCrossSidecarCall(state.TargetChildCall.CallId);
             if (!state.IsSource)
                 RemoveEntryCarrier(state.Carrier.CarrierId, now);
-            RemoveReceivingRootReservation(state.Carrier.CarrierId);
             RecordCarrierTombstone(
                 state.Carrier.CarrierId,
                 _bindingGeneration,
@@ -3746,20 +3743,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
             MaybeRemoveBudgetReservation(budgetRootId);
         }
-        RemoveReceivingRootReservation(capabilityId);
         if (!_callEntryContexts.Values.Any(context => context.CapabilityId == capabilityId))
             _nestedCarrierParents.Remove(capabilityId);
-    }
-
-    private void RemoveReceivingRootReservation(Guid capabilityId)
-    {
-        foreach (var rootBudgetId in _receivingRootReservations
-            .Where(pair => pair.Value.IsCrossSidecar && pair.Value.CapabilityId == capabilityId)
-            .Select(pair => pair.Key)
-            .ToArray())
-        {
-            _receivingRootReservations.Remove(rootBudgetId);
-        }
     }
 
     private void RevokeStorageContinuationsForCarrier(Guid capabilityId, DateTimeOffset now)

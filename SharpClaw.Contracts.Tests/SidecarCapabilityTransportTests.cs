@@ -6204,6 +6204,125 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void CrossSidecarReceivingRootReservationsRemainConsumedAfterCompletionAndRevoke()
+    {
+        var target = CreateFixture(
+            maxInFlight: 4,
+            maxCalls: 8,
+            moduleId: "target-module",
+            graphId: "target-graph");
+        ConsumeStorageCalls(target, 8, "cross-root-budget");
+
+        var sourceOne = CreateFixture(moduleId: "source-one", graphId: "source-one-graph");
+        var sourceTwo = CreateFixture(moduleId: "source-two", graphId: "source-two-graph");
+        var sourceThree = CreateFixture(moduleId: "source-three", graphId: "source-three-graph");
+        var sourceFour = CreateFixture(moduleId: "source-four", graphId: "source-four-graph");
+        var first = CreateCrossRelayAttempt(sourceOne, target, _ => (_, hash) => hash);
+        var second = CreateCrossRelayAttempt(sourceTwo, target, _ => (_, hash) => hash);
+        Assert.True(first.Result.Accepted, first.Result.Message);
+        Assert.True(second.Result.Accepted, second.Result.Message);
+
+        var rejectedBeforeCleanup = CreateCrossRelayAttempt(sourceThree, target, _ => (_, hash) => hash);
+        Assert.Equal(
+            SidecarCapabilityErrors.ConcurrencyLimit,
+            rejectedBeforeCleanup.Result.Code);
+        Assert.True(sourceThree.Session.CompleteCall(rejectedBeforeCleanup.ParentCall.CallId, 1).Accepted);
+
+        Assert.True(target.Session.RevokeCrossSidecarActionEntry(
+            first.Relay!.Carrier.CarrierId,
+            target.Now).Accepted);
+
+        var terminal = new SidecarActionTerminalRegistration(
+            Guid.NewGuid(),
+            second.Relay!.Descriptor.InputTypeIdentity,
+            second.Relay.Descriptor.InputSchemaVersion,
+            second.Relay.Descriptor.ResultTypeIdentity,
+            second.Relay.Descriptor.ResultSchemaVersion,
+            second.Relay.Descriptor.DescriptorHash);
+        Assert.True(target.Session.BeginCrossSidecarActionEntryCall(
+            second.Relay.Carrier,
+            terminal,
+            second.Relay.Carrier.Action.ByteLength,
+            target.Now,
+            out _,
+            (authority, hash) => authority.Proof == hash).Accepted);
+        var receipt = new SidecarTerminalReceipt(
+            "cross-root-complete",
+            second.Relay.Descriptor.Key,
+            second.Relay.Descriptor.Version,
+            second.Relay.Carrier.Authority.TargetChildCall.CallId,
+            second.Relay.Carrier.Authority.Attempt,
+            "cross-root-scope",
+            second.Relay.Carrier.Action.ContentHash);
+        Assert.True(target.Session.RecordTerminal(
+            second.Relay.Carrier.Authority.TargetChildCall.CallId,
+            terminal.TerminalId,
+            receipt).Accepted);
+        var result = Payload(second.Relay.Descriptor.ResultTypeIdentity, new { value = 1 });
+        var outcome = new SidecarActionOutcomeEnvelope(
+            ActionOutcomeKind.Completed,
+            result,
+            null,
+            null,
+            null,
+            receipt,
+            target.Binding.SafeFailure,
+            1);
+        var execution = new SidecarTerminalExecutionResult(result, null, true);
+        var resultIdentity = new SidecarActionResultIdentity(
+            Guid.NewGuid(),
+            second.Relay.Carrier.Authority.TargetChildCall.CallId,
+            second.Relay.Descriptor.Key,
+            second.Relay.Descriptor.Version,
+            result.TypeIdentity,
+            result.ContentHash);
+        Assert.True(target.Session.CompleteCrossSidecarActionEntry(
+            second.Relay.Carrier,
+            outcome,
+            receipt,
+            execution,
+            resultIdentity,
+            target.Binding.SafeFailure,
+            target.Now,
+            (_, hash) => hash,
+            out _).Accepted);
+
+        var rejectedAfterCleanup = CreateCrossRelayAttempt(sourceFour, target, _ => (_, hash) => hash);
+        Assert.Equal(
+            SidecarCapabilityErrors.ConcurrencyLimit,
+            rejectedAfterCleanup.Result.Code);
+        Assert.True(sourceFour.Session.CompleteCall(rejectedAfterCleanup.ParentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarReceivingRootReservationsRemainConsumedAfterExpiryAndPeerCleanup()
+    {
+        var target = CreateFixture(
+            maxInFlight: 4,
+            maxCalls: 8,
+            moduleId: "target-expiry-module",
+            graphId: "target-expiry-graph");
+        ConsumeStorageCalls(target, 8, "cross-root-expiry");
+
+        var sourceOne = CreateFixture(moduleId: "expiry-source-one", graphId: "expiry-source-one-graph");
+        var sourceTwo = CreateFixture(moduleId: "expiry-source-two", graphId: "expiry-source-two-graph");
+        var sourceThree = CreateFixture(moduleId: "expiry-source-three", graphId: "expiry-source-three-graph");
+        var first = CreateCrossRelayAttempt(sourceOne, target, _ => (_, hash) => hash);
+        var second = CreateCrossRelayAttempt(sourceTwo, target, _ => (_, hash) => hash);
+        Assert.True(first.Result.Accepted, first.Result.Message);
+        Assert.True(second.Result.Accepted, second.Result.Message);
+
+        var expiry = second.Relay!.Carrier.ExpiresAt.AddSeconds(1);
+        Assert.Equal(2, target.Session.SweepExpiredHostActionEntryCarriers(expiry));
+        Assert.True(sourceOne.Session.CompleteCall(first.ParentCall.CallId, 1).Accepted);
+        Assert.True(sourceTwo.Session.CompleteCall(second.ParentCall.CallId, 1).Accepted);
+
+        var rejected = CreateCrossRelayAttempt(sourceThree, target, _ => (_, hash) => hash);
+        Assert.Equal(SidecarCapabilityErrors.ConcurrencyLimit, rejected.Result.Code);
+        Assert.True(sourceThree.Session.CompleteCall(rejected.ParentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
     public void CrossSidecarEntryIssuesResolvesConsumesAndCompletesOnce()
     {
         var fixture = CreateFixture();
