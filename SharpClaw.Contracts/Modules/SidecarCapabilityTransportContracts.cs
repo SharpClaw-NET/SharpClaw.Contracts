@@ -582,11 +582,24 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     SidecarCapabilityErrors.Replay,
                     "The storage continuation authority was already consumed.");
 
-            if (_authenticateStorageContinuationAuthority is null ||
-                !_authenticateStorageContinuationAuthority(authority, authority.CanonicalBindingHash))
+            var issuerLive = false;
+            try
+            {
+                issuerLive = _authenticateStorageContinuationAuthority is not null &&
+                    _authenticateStorageContinuationAuthority(authority, authority.CanonicalBindingHash);
+            }
+            catch
+            {
+                issuerLive = false;
+            }
+
+            if (!issuerLive)
+            {
+                RevokeImportedStorageContinuationLocked(authority.AuthorityId, now);
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
                     "The storage continuation authority is no longer live at its issuer.");
+            }
 
             var result = BeginCallCore(
                 request.Call,
@@ -3677,6 +3690,20 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 ? state.Value.Authority.ExpiresAt
                 : now + CarrierReplayRetention;
         }
+    }
+
+    private void RevokeImportedStorageContinuationLocked(Guid authorityId, DateTimeOffset now)
+    {
+        if (!_storageContinuationStates.Remove(authorityId, out var state))
+            return;
+
+        _storageContinuationParents.Remove(state.Authority.StorageCall.CallId);
+        if (state.Consumed)
+            AbortStorageContinuationCall(state.Authority.StorageCall.CallId);
+
+        _completedStorageContinuations[authorityId] = state.Authority.ExpiresAt > now
+            ? state.Authority.ExpiresAt
+            : now + CarrierReplayRetention;
     }
 
     private void RevokeIssuedStorageContinuationsForCall(Guid callId)

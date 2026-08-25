@@ -3647,17 +3647,27 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(issue.Accepted, issue.Message);
         Assert.NotNull(authority);
 
+        var wireAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(authority));
+        var requestWithAuthority = storageRequest with
+        {
+            HostEntryContinuationAuthority = wireAuthority,
+        };
+        Assert.True(target.Session.ImportHostEntryStorageContinuationAuthority(wireAuthority, target.Now).Accepted);
+
         Assert.True(source.Session.CompleteCall(sourceCall.CallId, 1).Accepted);
         Assert.True(source.Session.CompleteHostActionEntryCarrier(
             sourceCarrier,
             HostActionEntryCarrierCompletionKind.Succeeded,
             source.Now).Accepted);
 
-        var wireAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
-            SidecarCapabilityTransportCodec.Serialize(authority));
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
-            target.Session.ImportHostEntryStorageContinuationAuthority(wireAuthority, target.Now).Code);
+            target.Session.BeginStorageContinuationCall(
+                requestWithAuthority,
+                storagePayload.ByteLength,
+                target.Now,
+                out _).Code);
 
         Assert.True(target.Session.CompleteCall(targetCall.CallId, 1).Accepted);
         Assert.True(target.Session.CompleteHostActionEntryCarrier(
