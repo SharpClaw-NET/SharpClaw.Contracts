@@ -203,6 +203,25 @@ public sealed record SidecarCrossSidecarActionEntryRelay(
         PeerBindingGeneration == Carrier.Authority.PeerBindingGeneration;
 }
 
+/// <summary>Authenticated cancellation for a peer relay that was not imported by a terminal call.</summary>
+public sealed record SidecarCrossSidecarActionEntryPeerCancellation(
+    SidecarCrossSidecarActionEntryRelay Relay,
+    SidecarHostTerminalAuthority TerminalAuthority,
+    DateTimeOffset CancelledAt)
+{
+    public bool IsWellFormed =>
+        Relay is not null &&
+        Relay.IsWellFormed &&
+        TerminalAuthority is not null &&
+        TerminalAuthority.AuthorityId != Guid.Empty &&
+        TerminalAuthority.TerminalId != Guid.Empty &&
+        TerminalAuthority.RootPeerCall == Relay.PeerCall &&
+        !string.IsNullOrWhiteSpace(TerminalAuthority.CrossSidecarPeerRelayBindingHash) &&
+        !string.IsNullOrWhiteSpace(TerminalAuthority.CanonicalBindingHash) &&
+        !string.IsNullOrWhiteSpace(TerminalAuthority.Proof) &&
+        CancelledAt > DateTimeOffset.MinValue;
+}
+
 public enum SidecarCrossSidecarActionEntryOutcomeKind
 {
     Completed,

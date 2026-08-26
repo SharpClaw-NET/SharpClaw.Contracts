@@ -6041,6 +6041,178 @@ public sealed class SidecarCapabilityTransportTests
         return new Fixture(now, binding, session, call, safeFailure, nonces, bindingHashes);
     }
 
+    [Fact]
+    public async Task CancelledCrossSidecarPeerRelayConsumesReceivingSequenceWithoutTerminalImport()
+    {
+        static bool Authenticate(SidecarHostTerminalAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var source = CreateFixture(
+            moduleId: "source-module",
+            graphId: "source-graph",
+            authenticateHostTerminalAuthority: Authenticate);
+        var target = CreateFixture(
+            moduleId: "target-module",
+            graphId: "target-graph",
+            authenticateHostTerminalAuthority: Authenticate);
+        var cross = CreateCrossRelay(source, target);
+        var peer = CreateMirroredFixture(target, Authenticate);
+        Assert.Equal(1, cross.Relay.PeerCall!.Sequence);
+
+        var parentDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("source.parent"),
+            1,
+            "source.category",
+            "source.parent.input",
+            "source.parent-schema",
+            1,
+            "source.parent.result",
+            "source.parent-result-schema",
+            1,
+            "source.parent-descriptor");
+        var parentTerminal = new SidecarActionTerminalRegistration(
+            Guid.NewGuid(),
+            parentDescriptor.InputTypeIdentity,
+            parentDescriptor.InputSchemaVersion,
+            parentDescriptor.ResultTypeIdentity,
+            parentDescriptor.ResultSchemaVersion,
+            parentDescriptor.DescriptorHash);
+        var parentRequest = SidecarCapabilityTransportValidationRequest(
+            cross.ParentCall,
+            parentDescriptor,
+            cross.ParentAction,
+            cross.ParentContext);
+        var terminalRequest = CreateTerminalRequest(
+            source,
+            parentRequest with { Terminal = parentTerminal },
+            new ActionPipelineSnapshot("source-snapshot", []));
+        var terminalAuthority = terminalRequest.Authority with
+        {
+            RootPeerCall = cross.Relay.PeerCall,
+            CrossSidecarPeerRelayBindingHash =
+                SidecarCapabilityTransportValidation.ComputeCrossSidecarPeerRelayBindingHash(cross.Relay),
+        };
+        terminalAuthority = terminalAuthority with
+        {
+            CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                terminalAuthority),
+        };
+        terminalAuthority = terminalAuthority with { Proof = terminalAuthority.CanonicalBindingHash };
+        Assert.Equal(cross.ParentCall.CallId, terminalAuthority.CallId);
+        Assert.Equal(cross.Relay.PeerCall, terminalAuthority.RootPeerCall);
+        Assert.Equal(
+            SidecarCapabilityTransportValidation.ComputeCrossSidecarPeerRelayBindingHash(cross.Relay),
+            terminalAuthority.CrossSidecarPeerRelayBindingHash);
+        Assert.Equal(
+            SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(terminalAuthority),
+            terminalAuthority.CanonicalBindingHash);
+        Assert.True(Authenticate(terminalAuthority, terminalAuthority.CanonicalBindingHash));
+        var cancellation = new SidecarCrossSidecarActionEntryPeerCancellation(
+            cross.Relay,
+            terminalAuthority,
+            source.Now);
+        cancellation = SidecarCapabilityTransportCodec.Deserialize<SidecarCrossSidecarActionEntryPeerCancellation>(
+            SidecarCapabilityTransportCodec.Serialize(cancellation));
+        Assert.Equal(cancellation.Relay.PeerBindingGeneration, target.Session.BindingGeneration);
+        Assert.Equal(cancellation.Relay.PeerCall, cancellation.Relay.Carrier.Authority.PeerCall);
+        Assert.Equal(cancellation.Relay.Carrier.Authority.PeerBindingGeneration, target.Session.BindingGeneration);
+        Assert.Equal(cancellation.Relay.Carrier.ExpiresAt, cancellation.TerminalAuthority.ExpiresAt);
+        Assert.True(cancellation.IsWellFormed);
+        var peerCarrier = SidecarCrossSidecarActionEntryValidation.ValidatePeerCarrier(
+            cancellation.Relay.Carrier,
+            target.Binding,
+            source.Now,
+            static (authority, hash) => authority.Proof == hash);
+        Assert.True(peerCarrier.Accepted, peerCarrier.Message);
+
+        var invalidAttempts = new[]
+        {
+            cancellation with
+            {
+                TerminalAuthority = cancellation.TerminalAuthority with
+                {
+                    CallId = Guid.NewGuid(),
+                },
+            },
+            cancellation with
+            {
+                Relay = cancellation.Relay with
+                {
+                    PeerBindingGeneration = cancellation.Relay.PeerBindingGeneration + 1,
+                },
+            },
+            cancellation with
+            {
+                Relay = cancellation.Relay with
+                {
+                    Carrier = cancellation.Relay.Carrier with
+                    {
+                        Action = Payload(cancellation.Relay.Carrier.Action.TypeIdentity, new { value = 99 }),
+                    },
+                },
+            },
+        };
+        foreach (var invalid in invalidAttempts)
+        {
+            var rejected = peer.Session.ConsumeCancelledCrossSidecarActionEntryPeerRelay(
+                invalid,
+                source.Now,
+                static (authority, hash) => authority.Proof == hash);
+            Assert.False(rejected.Accepted);
+        }
+
+        var concurrent = await Task.WhenAll(
+            Task.Run(() => peer.Session.ConsumeCancelledCrossSidecarActionEntryPeerRelay(
+                cancellation,
+                source.Now,
+                static (authority, hash) => authority.Proof == hash)),
+            Task.Run(() => peer.Session.ConsumeCancelledCrossSidecarActionEntryPeerRelay(
+                cancellation,
+                source.Now,
+                static (authority, hash) => authority.Proof == hash)));
+        Assert.Equal(1, concurrent.Count(result => result.Accepted));
+
+        var replay = peer.Session.ConsumeCancelledCrossSidecarActionEntryPeerRelay(
+            cancellation,
+            source.Now,
+            static (authority, hash) => authority.Proof == hash);
+        Assert.False(replay.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Replay, replay.Code);
+
+        var changedRelay = cancellation with
+        {
+            Relay = cancellation.Relay with
+            {
+                Carrier = cancellation.Relay.Carrier with
+                {
+                    Action = Payload(cancellation.Relay.Carrier.Action.TypeIdentity, new { value = 99 }),
+                },
+            },
+        };
+        var changed = peer.Session.ConsumeCancelledCrossSidecarActionEntryPeerRelay(
+            changedRelay,
+            source.Now,
+            static (authority, hash) => authority.Proof == hash);
+        Assert.False(changed.Accepted);
+
+        var nextCall = peer.Call with
+        {
+            Capability = SidecarCapabilityKind.Storage,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "after-cancelled-peer-relay",
+            Sequence = cross.Relay.PeerCall!.Sequence + 1,
+        };
+        var nextPayload = Payload("storage.request", new { value = 4 });
+        var next = peer.Session.BeginCall(
+            nextCall,
+            SidecarCapabilityKind.Storage,
+            nextPayload,
+            nextPayload.ByteLength,
+            source.Now);
+        Assert.True(next.Accepted, next.Message);
+        Assert.True(peer.Session.CompleteCall(nextCall.CallId, 0).Accepted);
+    }
+
     [Theory]
     [InlineData(4)]
     [InlineData(7)]
@@ -7369,7 +7541,14 @@ public sealed class SidecarCapabilityTransportTests
             (authority, hash) => hash,
             out var relay);
         Assert.True(result.Accepted, result.Message);
-        return new CrossRelayFixture(parent.Call, relay!, target.Session, target.Binding, source.Now);
+        return new CrossRelayFixture(
+            parent.Call,
+            relay!,
+            target.Session,
+            target.Binding,
+            source.Now,
+            parent.Context,
+            parent.Action);
     }
 
     private static CrossRelayAttempt CreateCrossRelayAttempt(
@@ -7642,7 +7821,9 @@ public sealed class SidecarCapabilityTransportTests
         SidecarCrossSidecarActionEntryRelay Relay,
         SidecarCapabilitySession TargetSession,
         SidecarCapabilitySessionBinding TargetBinding,
-        DateTimeOffset Now);
+        DateTimeOffset Now,
+        HostActionEntryRequestContext ParentContext,
+        SidecarSerializedPayload ParentAction);
 
     private sealed record CrossRelayAttempt(
         SidecarCapabilityValidationResult Result,

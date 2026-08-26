@@ -2476,6 +2476,173 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         }
     }
 
+    public SidecarCapabilityValidationResult ConsumeCancelledCrossSidecarActionEntryPeerRelay(
+        SidecarCrossSidecarActionEntryPeerCancellation cancellation,
+        DateTimeOffset now,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, bool> authenticate)
+    {
+        ArgumentNullException.ThrowIfNull(cancellation);
+        ArgumentNullException.ThrowIfNull(authenticate);
+
+        try
+        {
+            lock (_sync)
+            {
+                SweepExpiredEntryContexts(now);
+                SweepCompletedEntryCarriers(now);
+                if (_disconnected)
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Disconnected,
+                        "The receiving capability session is disconnected.");
+
+                if (_authenticateHostTerminalAuthority is null)
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Unauthorized,
+                        "The receiving capability session has no host proof verifier.");
+
+                var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                    Binding,
+                    _authenticate,
+                    _registerAuthenticationNonce,
+                    now,
+                    RegisterAuthenticationNonce: false);
+                if (!bindingResult.Accepted)
+                    return bindingResult;
+
+                var relay = cancellation.Relay;
+                var carrier = relay?.Carrier;
+                var authority = carrier?.Authority;
+                var peerCall = relay?.PeerCall;
+                var terminalAuthority = cancellation.TerminalAuthority;
+                var peerRelayHash = relay is null
+                    ? string.Empty
+                    : SidecarCapabilityTransportValidation.ComputeCrossSidecarPeerRelayBindingHash(relay);
+                var sourceTerminalValid =
+                    terminalAuthority is not null &&
+                    terminalAuthority.CallId == authority?.SourceParentCall.CallId &&
+                    terminalAuthority.RootPeerCall == peerCall &&
+                    terminalAuthority.SessionId == authority?.SourceParentCall.SessionId &&
+                    terminalAuthority.RequestId == authority?.SourceParentCall.RequestId &&
+                    terminalAuthority.CancellationId == authority?.SourceParentCall.CancellationId &&
+                    string.Equals(
+                        terminalAuthority.CrossSidecarPeerRelayBindingHash,
+                        peerRelayHash,
+                        StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(
+                        terminalAuthority.CanonicalBindingHash,
+                        SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(terminalAuthority),
+                        StringComparison.OrdinalIgnoreCase) &&
+                    _authenticateHostTerminalAuthority(
+                        terminalAuthority,
+                        terminalAuthority.CanonicalBindingHash);
+                if (!sourceTerminalValid)
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.SpoofedIdentity,
+                        "The cancelled cross-sidecar peer relay source terminal is not authenticated.");
+                }
+                if (!cancellation.IsWellFormed ||
+                    relay is null ||
+                    carrier is null ||
+                    authority is null ||
+                    peerCall is null)
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.SpoofedIdentity,
+                        "The cancelled cross-sidecar peer relay is not bound to its source terminal.");
+                }
+
+                if (_completedEntryCarriers.ContainsKey(carrier.CarrierId))
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Replay,
+                        "The cancelled cross-sidecar peer relay was already consumed.");
+                }
+
+                if (relay.PeerBindingGeneration != _bindingGeneration ||
+                    !MatchesPeerBinding(peerCall) ||
+                    authority.PeerBindingGeneration != _bindingGeneration ||
+                    authority.PeerCall != peerCall ||
+                    peerCall.Sequence != _lastSequence + 1)
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.SpoofedIdentity,
+                        "The cancelled cross-sidecar peer relay does not match the receiving binding.");
+                }
+
+                if (cancellation.CancelledAt > now ||
+                    cancellation.CancelledAt > carrier.ExpiresAt ||
+                    peerCall.Deadline <= now ||
+                    peerCall.Deadline > Binding.ExpiresAt ||
+                    carrier.ExpiresAt <= now ||
+                    carrier.ExpiresAt > Binding.ExpiresAt)
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Expired,
+                        "The cancelled cross-sidecar peer relay is outside its lifetime.");
+                }
+
+                var carrierResult = SidecarCrossSidecarActionEntryValidation.ValidatePeerCarrier(
+                    carrier,
+                    Binding,
+                    now,
+                    authenticate);
+                if (!carrierResult.Accepted)
+                    return carrierResult;
+
+                if (_completedEntryCarriers.ContainsKey(carrier.CarrierId))
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Replay,
+                        "The cancelled cross-sidecar peer relay was already consumed.");
+                }
+
+                if (_calls.ContainsKey(peerCall.CallId) ||
+                    _reservedNestedCalls.ContainsKey(peerCall.CallId) ||
+                    _completedCalls.Contains(peerCall.CallId) ||
+                    _nonces.Contains(peerCall.ReplayNonce) ||
+                    _activeEntryCarriers.ContainsKey(carrier.CarrierId) ||
+                    _issuedEntryContexts.ContainsKey(carrier.CarrierId))
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Replay,
+                        "The cancelled cross-sidecar peer relay was already consumed.");
+                }
+
+                var usesReceivingRootReservation =
+                    _totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest;
+                if (usesReceivingRootReservation &&
+                    _receivingRootReservations.Count >= Binding.ConcurrencyLimits.MaximumReceivingRootReservations)
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.ConcurrencyLimit,
+                        "The receiving root reservation budget is exhausted for this binding.");
+                }
+
+                if (usesReceivingRootReservation &&
+                    !_receivingRootReservations.TryAdd(
+                        authority.RootBudgetId,
+                        new ReceivingRootReservation(carrier.CarrierId, _bindingGeneration, IsCrossSidecar: true)))
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Replay,
+                        "The cancelled cross-sidecar root budget was already consumed.");
+                }
+
+                _lastSequence = peerCall.Sequence;
+                if (!usesReceivingRootReservation)
+                    _totalCalls++;
+                _nonces.Add(peerCall.ReplayNonce);
+                RecordCarrierTombstone(carrier.CarrierId, _bindingGeneration, now, carrier.ExpiresAt);
+                return SidecarCapabilityValidationResult.Accept();
+            }
+        }
+        finally
+        {
+            DrainCrossSidecarPeerCleanup(now);
+        }
+    }
+
     public SidecarCapabilityValidationResult BeginCrossSidecarActionEntryCall(
         SidecarCrossSidecarActionEntryCarrier carrier,
         SidecarActionTerminalRegistration terminal,
