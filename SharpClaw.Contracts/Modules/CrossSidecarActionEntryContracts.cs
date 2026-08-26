@@ -132,8 +132,8 @@ public sealed record SidecarCrossSidecarActionEntryAuthority(
             ? PeerBindingGeneration == 0
             : PeerCall.IsValid &&
               PeerCall.Capability == SidecarCapabilityKind.Action &&
-              PeerCall.CallId == TargetChildCall.CallId &&
-              PeerCall.ReplayNonce == TargetChildCall.ReplayNonce &&
+              PeerCall.CallId != TargetChildCall.CallId &&
+              !string.Equals(PeerCall.ReplayNonce, TargetChildCall.ReplayNonce, StringComparison.Ordinal) &&
               PeerCall.Sequence == TargetChildCall.Sequence &&
               PeerCall.Deadline == TargetChildCall.Deadline &&
               PeerBindingGeneration > 0) &&
@@ -366,6 +366,7 @@ public static class SidecarCrossSidecarActionEntryValidation
         var authority = carrier.Authority;
         var peerCall = authority?.PeerCall;
         if (!carrier.IsWellFormed ||
+            authority is null ||
             peerCall is null ||
             authority.PeerBindingGeneration <= 0 ||
             peerCall.SessionId != peerBinding.SessionId ||

@@ -5942,6 +5942,38 @@ public sealed class SidecarCapabilityTransportTests
             out _).Accepted);
     }
 
+    private static Fixture CreateMirroredFixture(
+        Fixture template,
+        Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null,
+        Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null)
+    {
+        var binding = template.Binding;
+        var nonces = new HashSet<string>(StringComparer.Ordinal);
+        var bindingHashes = new HashSet<string>(StringComparer.Ordinal)
+        {
+            binding.Authentication.BindingHash,
+        };
+        var session = new SidecarCapabilitySession(
+            binding,
+            authority => bindingHashes.Contains(authority.BindingHash),
+            nonces.Add,
+            template.Now,
+            authenticateHostTerminalAuthority,
+            authenticateStorageContinuationAuthority);
+        var call = new SidecarCapabilityCallIdentity(
+            binding.SessionId,
+            binding.RequestId,
+            binding.CancellationId,
+            Guid.NewGuid(),
+            "mirrored-call-nonce-1",
+            binding.ModuleId,
+            binding.GraphId,
+            SidecarCapabilityKind.Storage,
+            1,
+            template.Now.AddMinutes(1));
+        return new Fixture(template.Now, binding, session, call, template.SafeFailure, nonces, bindingHashes);
+    }
+
     private static Fixture CreateFixture(
         int maxInFlight = 2,
         int maxCalls = 4,
@@ -6009,17 +6041,19 @@ public sealed class SidecarCapabilityTransportTests
         return new Fixture(now, binding, session, call, safeFailure, nonces, bindingHashes);
     }
 
-    [Fact]
-    public void CrossSidecarPeerRelayImportsTargetCarrierThroughTerminalExchange()
+    [Theory]
+    [InlineData(4)]
+    [InlineData(7)]
+    public void CrossSidecarPeerRelayImportsTargetCarrierThroughTerminalExchange(int priorCalls)
     {
         var source = CreateFixture(maxInFlight: 4, maxCalls: 8, moduleId: "source-module", graphId: "source-graph");
         var hostTarget = CreateFixture(maxInFlight: 4, maxCalls: 8, moduleId: "target-module", graphId: "target-graph");
-        var targetPeer = CreateFixture(
-            maxInFlight: 4,
-            maxCalls: 8,
-            moduleId: hostTarget.Binding.ModuleId,
-            graphId: hostTarget.Binding.GraphId,
-            authenticateHostTerminalAuthority: static (authority, hash) => authority.Proof == hash);
+        var targetPeer = CreateMirroredFixture(
+            hostTarget,
+            static (authority, hash) => authority.Proof == hash,
+            static (authority, hash) => hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority));
+        ConsumeStorageCalls(hostTarget, priorCalls, "peer-host-prior");
+        ConsumeStorageCalls(targetPeer, priorCalls, "peer-module-prior");
         var parent = PrepareCrossParent(source, "peer-source.parent");
         var descriptor = new SidecarActionDescriptorIdentity(
             new SharpClawActionKey("peer-target.action"),
@@ -6053,11 +6087,11 @@ public sealed class SidecarCapabilityTransportTests
             new ActionPipelineSnapshot("peer-target-snapshot", []),
             source.Now,
             static (_, hash) => hash,
-            out var relay,
-            targetPeer.Session);
+            out var relay);
         Assert.True(issue.Accepted, issue.Message);
         Assert.NotNull(relay);
         Assert.NotNull(relay!.PeerCall);
+        Assert.Equal(priorCalls + 1, relay.PeerCall!.Sequence);
 
         var terminal = new SidecarActionTerminalRegistration(
             Guid.NewGuid(),
@@ -6143,13 +6177,14 @@ public sealed class SidecarCapabilityTransportTests
                 Authority = terminalRequest.Authority with { Proof = "forged-peer-proof" },
             },
         };
-        foreach (var invalidRequest in invalidRequests)
+        foreach (var (invalidRequest, index) in invalidRequests.Select((request, index) => (request, index)))
         {
-            Assert.False(targetPeer.Session.ImportCrossSidecarActionEntryPeerRelay(
+            var invalidResult = targetPeer.Session.ImportCrossSidecarActionEntryPeerRelay(
                 invalidRequest,
                 source.Now,
                 static (authority, hash) => authority.Proof == hash,
-                out _).Accepted);
+                out _);
+            Assert.False(invalidResult.Accepted, $"Mutation index {index} was accepted: {invalidResult.Code}");
         }
 
         var import = targetPeer.Session.ImportCrossSidecarActionEntryPeerRelay(
@@ -6179,13 +6214,66 @@ public sealed class SidecarCapabilityTransportTests
             Sequence = relay.PeerCall.Sequence + 1,
         };
         var storagePayload = Payload("peer-storage.request", new { value = 3 });
-        Assert.True(targetPeer.Session.BeginCall(
-            storageCall,
-            SidecarCapabilityKind.Storage,
-            storagePayload,
-            storagePayload.ByteLength,
-            source.Now).Accepted);
-        Assert.True(targetPeer.Session.CompleteCall(storageCall.CallId, 0).Accepted);
+        Assert.Equal(priorCalls + 2, storageCall.Sequence);
+        if (priorCalls < 7)
+        {
+            Assert.True(targetPeer.Session.BeginCall(
+                storageCall,
+                SidecarCapabilityKind.Storage,
+                storagePayload,
+                storagePayload.ByteLength,
+                source.Now).Accepted);
+            Assert.True(targetPeer.Session.CompleteCall(storageCall.CallId, 0).Accepted);
+        }
+        else
+        {
+            var peerReceipt = new SidecarTerminalReceipt(
+                "peer-target-terminal-receipt",
+                descriptor.Key,
+                descriptor.Version,
+                relay.PeerCall.CallId,
+                relay.Carrier.Authority.Attempt,
+                "peer-target-terminal-scope",
+                relay.Carrier.Action.ContentHash);
+            Assert.True(targetPeer.Session.RecordTerminal(
+                relay.PeerCall.CallId,
+                terminal.TerminalId,
+                peerReceipt).Accepted);
+            var storageRequest = SidecarStorageCapabilityRequest.Invoke(
+                storageCall,
+                targetPeer.Binding.ModuleId,
+                "peer-storage/get",
+                storagePayload,
+                PayloadType("peer-storage.result"),
+                new SidecarCancellationIdentity(
+                    targetPeer.Binding.CancellationId,
+                    "peer-storage-cancellation",
+                    storageCall.Deadline),
+                storageCall.Deadline);
+            var storageIssue = source.Session.IssueHostEntryStorageContinuation(
+                targetPeer.Session,
+                parent.Call,
+                relay.PeerCall,
+                storageRequest,
+                source.Now,
+                (_, hash) => hash,
+                out var storageAuthority);
+            Assert.True(storageIssue.Accepted, storageIssue.Message);
+            var wireStorageRequest = storageRequest with
+            {
+                HostEntryContinuationAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+                    SidecarCapabilityTransportCodec.Serialize(storageAuthority)),
+            };
+            Assert.True(targetPeer.Session.ImportHostEntryStorageContinuationAuthority(
+                wireStorageRequest.HostEntryContinuationAuthority!,
+                source.Now).Accepted);
+            Assert.True(targetPeer.Session.BeginStorageContinuationCall(
+                wireStorageRequest,
+                storagePayload.ByteLength,
+                source.Now,
+                out _).Accepted);
+            Assert.True(targetPeer.Session.CompleteCall(storageCall.CallId, 0).Accepted);
+        }
         Assert.False(targetPeer.Session.ImportCrossSidecarActionEntryPeerRelay(
             terminalRequest,
             source.Now,

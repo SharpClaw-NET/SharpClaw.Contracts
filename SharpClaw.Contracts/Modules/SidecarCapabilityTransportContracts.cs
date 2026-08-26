@@ -1911,8 +1911,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         ActionPipelineSnapshot targetSnapshot,
         DateTimeOffset now,
         Func<SidecarCrossSidecarActionEntryAuthority, string, string> issueProof,
-        out SidecarCrossSidecarActionEntryRelay? relay,
-        SidecarCapabilitySession? peerSession = null)
+        out SidecarCrossSidecarActionEntryRelay? relay)
     {
         ArgumentNullException.ThrowIfNull(parentCall);
         ArgumentNullException.ThrowIfNull(request);
@@ -1955,8 +1954,6 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 return requestResult;
 
             if (targetSession == this ||
-                peerSession == this ||
-                peerSession == targetSession ||
                 !targetEntry.IsWellFormed ||
                 !string.Equals(targetEntry.ModuleId, targetSession.Binding.ModuleId, StringComparison.Ordinal) ||
                 !string.Equals(targetEntry.GraphId, targetSession.Binding.GraphId, StringComparison.Ordinal) ||
@@ -1985,7 +1982,6 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             targetSnapshot,
             now,
             issueProof,
-            peerSession,
             out var reservedCarrier);
         if (!reservation.Accepted || reservedCarrier is null)
             return reservation;
@@ -2061,7 +2057,6 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         ActionPipelineSnapshot targetSnapshot,
         DateTimeOffset now,
         Func<SidecarCrossSidecarActionEntryAuthority, string, string> issueProof,
-        SidecarCapabilitySession? peerSession,
         out SidecarCrossSidecarActionEntryCarrier? carrier)
     {
         carrier = null;
@@ -2149,16 +2144,16 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 SidecarCapabilityKind.Action,
                 _lastSequence + 1,
                 request.Deadline);
-            var peerCall = peerSession is null
-                ? null
-                : childCall with
-                {
-                    SessionId = peerSession.Binding.SessionId,
-                    RequestId = peerSession.Binding.RequestId,
-                    CancellationId = peerSession.Binding.CancellationId,
-                    ModuleId = peerSession.Binding.ModuleId,
-                    GraphId = peerSession.Binding.GraphId,
-                };
+            var peerCall = childCall with
+            {
+                CallId = Guid.NewGuid(),
+                ReplayNonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)),
+                SessionId = Binding.SessionId,
+                RequestId = Binding.RequestId,
+                CancellationId = Binding.CancellationId,
+                ModuleId = Binding.ModuleId,
+                GraphId = Binding.GraphId,
+            };
             var childInvocationId = Guid.NewGuid();
             var capabilityId = Guid.NewGuid();
             var capabilityHandle = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
@@ -2197,7 +2192,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             {
                 CanonicalBindingHash = string.Empty,
                 PeerCall = peerCall,
-                PeerBindingGeneration = peerSession?.BindingGeneration ?? 0,
+                PeerBindingGeneration = _bindingGeneration,
             };
             var canonicalHash = SidecarCrossSidecarActionEntryValidation.ComputeAuthorityHash(unsigned);
             var signed = unsigned with
@@ -2531,7 +2526,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     "The cross-sidecar carrier is unknown or already consumed.");
             }
 
-            var isPeerCarrier = state.Carrier.Authority.PeerCall is not null &&
+            var isPeerCarrier = state.PeerSession is null &&
+                state.Carrier.Authority.PeerCall is not null &&
                 state.TargetChildCall == state.Carrier.Authority.PeerCall;
             var carrierResult = isPeerCarrier
                 ? SidecarCrossSidecarActionEntryValidation.ValidatePeerCarrier(
