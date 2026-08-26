@@ -3778,54 +3778,67 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
             if (capability == SidecarCapabilityKind.Action &&
                 _terminalCalls.ContainsKey(callId) != (terminalCallCount == 1))
-                return SidecarCapabilityValidationResult.Reject(
+            {
+                var rejection = SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.TerminalAlreadyCalled,
                     "The action completion count does not match the recorded terminal authority.");
+                ReleaseCompletedCallState(callId, DateTimeOffset.UtcNow);
+                return rejection;
+            }
 
             if (capability == SidecarCapabilityKind.Storage && terminalCallCount != 0)
-                return SidecarCapabilityValidationResult.Reject(
+            {
+                var rejection = SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.InvalidBinding,
                     "Storage calls cannot complete with a terminal callback.");
-
-            RevokeIssuedStorageContinuationsForCall(callId);
-
-            if (_callEntryContexts.TryGetValue(callId, out var completedContext))
-            {
-                RevokeNestedCarriersForParent(callId, DateTimeOffset.UtcNow);
-                if (_nestedCarrierIds.Remove(completedContext.CapabilityId))
-                    RemoveEntryCarrier(completedContext.CapabilityId, DateTimeOffset.UtcNow);
-                _nestedCarrierParents.Remove(completedContext.CapabilityId);
+                ReleaseCompletedCallState(callId, DateTimeOffset.UtcNow);
+                return rejection;
             }
 
-            _calls.Remove(callId);
-            _callIdentities.Remove(callId);
-
-            _completedCalls.Add(callId);
-            _terminalCalls.Remove(callId);
-            _terminalReceipts.Remove(callId);
-            _callPayloads.Remove(callId);
-            _callEntryContexts.Remove(callId);
-            if (_storageContinuationParents.Remove(callId, out _))
-            {
-                foreach (var state in _storageContinuationStates
-                    .Where(pair => pair.Value.Authority.StorageCall.CallId == callId)
-                    .ToArray())
-                {
-                    _completedStorageContinuations[state.Key] = state.Value.Authority.ExpiresAt;
-                    _storageContinuationStates.Remove(state.Key);
-                }
-            }
-            var rootsToClean = new HashSet<Guid>();
-            if (_callBudgetRoots.Remove(callId, out var budgetRootId))
-                rootsToClean.Add(budgetRootId);
-            if (_peerParentBudgetRoots.Remove(callId, out var peerRootId))
-                rootsToClean.Add(peerRootId);
-            _budgetExtensionClaims.Remove(callId);
-            foreach (var rootId in rootsToClean)
-                MaybeRemoveBudgetReservation(rootId);
-            _inFlight--;
+            ReleaseCompletedCallState(callId, DateTimeOffset.UtcNow);
             return SidecarCapabilityValidationResult.Accept();
         }
+    }
+
+    private void ReleaseCompletedCallState(Guid callId, DateTimeOffset now)
+    {
+        RevokeIssuedStorageContinuationsForCall(callId);
+
+        if (_callEntryContexts.TryGetValue(callId, out var completedContext))
+        {
+            RevokeNestedCarriersForParent(callId, now);
+            if (_nestedCarrierIds.Remove(completedContext.CapabilityId))
+                RemoveEntryCarrier(completedContext.CapabilityId, now);
+            _nestedCarrierParents.Remove(completedContext.CapabilityId);
+        }
+
+        _calls.Remove(callId);
+        _callIdentities.Remove(callId);
+
+        _completedCalls.Add(callId);
+        _terminalCalls.Remove(callId);
+        _terminalReceipts.Remove(callId);
+        _callPayloads.Remove(callId);
+        _callEntryContexts.Remove(callId);
+        if (_storageContinuationParents.Remove(callId, out _))
+        {
+            foreach (var state in _storageContinuationStates
+                .Where(pair => pair.Value.Authority.StorageCall.CallId == callId)
+                .ToArray())
+            {
+                _completedStorageContinuations[state.Key] = state.Value.Authority.ExpiresAt;
+                _storageContinuationStates.Remove(state.Key);
+            }
+        }
+        var rootsToClean = new HashSet<Guid>();
+        if (_callBudgetRoots.Remove(callId, out var budgetRootId))
+            rootsToClean.Add(budgetRootId);
+        if (_peerParentBudgetRoots.Remove(callId, out var peerRootId))
+            rootsToClean.Add(peerRootId);
+        _budgetExtensionClaims.Remove(callId);
+        foreach (var rootId in rootsToClean)
+            MaybeRemoveBudgetReservation(rootId);
+        _inFlight = Math.Max(0, _inFlight - 1);
     }
 
     private int SweepExpiredEntryContexts(DateTimeOffset now)

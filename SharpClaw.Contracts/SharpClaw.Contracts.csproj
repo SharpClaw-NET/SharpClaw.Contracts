@@ -7,10 +7,10 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <IsPackable>true</IsPackable>
     <PackageId>SharpClaw.Contracts</PackageId>
-    <Version>0.5.0-beta.29</Version>
+    <Version>0.5.0-beta.30</Version>
     <AssemblyVersion>0.5.0.0</AssemblyVersion>
     <FileVersion>0.5.0.0</FileVersion>
-    <InformationalVersion>0.5.0-beta.29</InformationalVersion>
+    <InformationalVersion>0.5.0-beta.30</InformationalVersion>
     <Authors>mkn8rn</Authors>
     <Description>Neutral contracts for SharpClaw direct chat, unified tools, module features, action and event hooks, continuations, and sidecar messages.</Description>
     <PackageTags>sharpclaw;modules;contracts;sdk</PackageTags>

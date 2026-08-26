@@ -1323,23 +1323,102 @@ public sealed class SidecarCapabilityTransportTests
 
         var terminalCall = actionCall with { CallId = Guid.NewGuid(), ReplayNonce = "terminal-nonce", Sequence = 2 };
         Assert.True(fixture.Session.BeginCall(terminalCall, SidecarCapabilityKind.Action, action, action.ByteLength, fixture.Now).Accepted);
+        var mismatch = fixture.Session.CompleteCall(terminalCall.CallId, 1);
+        Assert.Equal(SidecarCapabilityErrors.TerminalAlreadyCalled, mismatch.Code);
         Assert.Equal(
-            SidecarCapabilityErrors.TerminalAlreadyCalled,
-            fixture.Session.CompleteCall(terminalCall.CallId, 1).Code);
-        var authorityId = Guid.NewGuid();
-        var terminalReceipt = new SidecarTerminalReceipt(
-            "terminal-receipt",
-            new SharpClawActionKey("sample.action"),
-            1,
-            terminalCall.CallId,
-            1,
-            "terminal-scope",
-            "terminal-hash");
-        Assert.True(fixture.Session.RecordTerminal(terminalCall.CallId, authorityId, terminalReceipt).Accepted);
+            "The action completion count does not match the recorded terminal authority.",
+            mismatch.Message);
         Assert.Equal(
-            SidecarCapabilityErrors.TerminalAlreadyCalled,
-            fixture.Session.RecordTerminal(terminalCall.CallId, authorityId, terminalReceipt).Code);
-        Assert.True(fixture.Session.CompleteCall(terminalCall.CallId, 1).Accepted);
+            SidecarCapabilityErrors.InvalidBinding,
+            fixture.Session.RecordTerminal(
+                terminalCall.CallId,
+                Guid.NewGuid(),
+                new SidecarTerminalReceipt(
+                    "terminal-receipt",
+                    new SharpClawActionKey("sample.action"),
+                    1,
+                    terminalCall.CallId,
+                    1,
+                    "terminal-scope",
+                    "terminal-hash")).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Duplicate,
+            fixture.Session.CompleteCall(terminalCall.CallId, 0).Code);
+    }
+
+    [Fact]
+    public void Non_retryable_completion_rejection_releases_call_but_leaves_outer_carrier_completable()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("failed-entry"),
+            HostActionEntryIngress.Cli);
+        var carrier = ActivateContext(fixture, context);
+        var call = ActionCall(fixture, 1, "failed-entry-call");
+        var action = Payload(typeof(string).AssemblyQualifiedName!, "failed-entry");
+
+        Assert.True(fixture.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            action,
+            action.ByteLength,
+            fixture.Now,
+            context).Accepted);
+
+        var rejection = fixture.Session.CompleteCall(call.CallId, 1);
+
+        Assert.Equal(SidecarCapabilityErrors.TerminalAlreadyCalled, rejection.Code);
+        Assert.Equal(
+            "The action completion count does not match the recorded terminal authority.",
+            rejection.Message);
+        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+            carrier,
+            HostActionEntryCarrierCompletionKind.Failed,
+            fixture.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Duplicate,
+            fixture.Session.CompleteCall(call.CallId, 0).Code);
+    }
+
+    [Fact]
+    public void Unknown_and_completed_call_completion_does_not_remove_another_active_call()
+    {
+        var fixture = CreateFixture(maxInFlight: 2);
+        var first = fixture.Call with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "completion-first",
+            Sequence = 1,
+        };
+        var second = first with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "completion-second",
+            Sequence = 2,
+        };
+        var payload = Payload("sample.input", new { value = 1 });
+
+        Assert.True(fixture.Session.BeginCall(
+            first,
+            SidecarCapabilityKind.Storage,
+            payload,
+            payload.ByteLength,
+            fixture.Now).Accepted);
+        Assert.True(fixture.Session.BeginCall(
+            second,
+            SidecarCapabilityKind.Storage,
+            payload,
+            payload.ByteLength,
+            fixture.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Duplicate,
+            fixture.Session.CompleteCall(Guid.NewGuid(), 0).Code);
+        Assert.True(fixture.Session.CompleteCall(first.CallId, 0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Duplicate,
+            fixture.Session.CompleteCall(first.CallId, 0).Code);
+        Assert.True(fixture.Session.CompleteCall(second.CallId, 0).Accepted);
     }
 
     [Fact]
