@@ -1372,10 +1372,11 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Equal(
             "The action completion count does not match the recorded terminal authority.",
             rejection.Message);
-        Assert.True(fixture.Session.CompleteHostActionEntryCarrier(
+        var carrierCompletion = fixture.Session.CompleteHostActionEntryCarrier(
             carrier,
             HostActionEntryCarrierCompletionKind.Failed,
-            fixture.Now).Accepted);
+            fixture.Now);
+        Assert.True(carrierCompletion.Accepted, $"{carrierCompletion.Code}: {carrierCompletion.Message}");
         Assert.Equal(
             SidecarCapabilityErrors.Duplicate,
             fixture.Session.CompleteCall(call.CallId, 0).Code);
@@ -1419,6 +1420,159 @@ public sealed class SidecarCapabilityTransportTests
             SidecarCapabilityErrors.Duplicate,
             fixture.Session.CompleteCall(first.CallId, 0).Code);
         Assert.True(fixture.Session.CompleteCall(second.CallId, 0).Accepted);
+    }
+
+    [Fact]
+    public void Invalid_action_count_releases_call_and_keeps_outer_carrier_completable()
+    {
+        var fixture = CreateFixture();
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("invalid-count-entry"),
+            HostActionEntryIngress.Cli);
+        var carrier = ActivateContext(fixture, context);
+        var call = ActionCall(fixture, 1, "invalid-count-call");
+        var action = Payload(typeof(string).AssemblyQualifiedName!, "invalid-count");
+
+        Assert.True(fixture.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            action,
+            action.ByteLength,
+            fixture.Now,
+            context).Accepted);
+
+        var rejection = fixture.Session.CompleteCall(call.CallId, 2);
+
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, rejection.Code);
+        Assert.Equal("The terminal call count must be zero or one.", rejection.Message);
+        var carrierCompletion = fixture.Session.CompleteHostActionEntryCarrier(
+            carrier,
+            HostActionEntryCarrierCompletionKind.Failed,
+            fixture.Now);
+        Assert.True(carrierCompletion.Accepted, $"{carrierCompletion.Code}: {carrierCompletion.Message}");
+        Assert.Equal(SidecarCapabilityErrors.Duplicate, fixture.Session.CompleteCall(call.CallId, 2).Code);
+
+        var laterCall = ActionCall(fixture, 2, "invalid-count-later");
+        Assert.True(fixture.Session.BeginCall(
+            laterCall,
+            SidecarCapabilityKind.Action,
+            action,
+            action.ByteLength,
+            fixture.Now).Accepted);
+        Assert.True(fixture.Session.CompleteCall(laterCall.CallId, 0).Accepted);
+    }
+
+    [Fact]
+    public async Task Concurrent_invalid_completion_attempts_clean_once_and_preserve_other_call()
+    {
+        var fixture = CreateFixture(maxInFlight: 2);
+        var first = ActionCall(fixture, 1, "concurrent-invalid-first");
+        var second = ActionCall(fixture, 2, "concurrent-invalid-second");
+        var action = Payload("concurrent.invalid.input", new { value = 1 });
+        Assert.True(fixture.Session.BeginCall(
+            first,
+            SidecarCapabilityKind.Action,
+            action,
+            action.ByteLength,
+            fixture.Now).Accepted);
+        Assert.True(fixture.Session.BeginCall(
+            second,
+            SidecarCapabilityKind.Action,
+            action,
+            action.ByteLength,
+            fixture.Now).Accepted);
+
+        var results = await Task.WhenAll(
+            Task.Run(() => fixture.Session.CompleteCall(first.CallId, 2)),
+            Task.Run(() => fixture.Session.CompleteCall(first.CallId, 2)));
+
+        Assert.Single(results, result => result.Code == SidecarCapabilityErrors.InvalidBinding);
+        Assert.Single(results, result => result.Code == SidecarCapabilityErrors.Duplicate);
+        Assert.True(fixture.Session.CompleteCall(second.CallId, 0).Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Duplicate, fixture.Session.CompleteCall(first.CallId, 0).Code);
+    }
+
+    [Fact]
+    public void Invalid_action_count_with_active_child_is_retryable_and_preserves_state()
+    {
+        var fixture = CreateFixture(maxInFlight: 2, maxCalls: 4);
+        var rootContext = IssueContext(
+            fixture,
+            new RequestPrincipal("count-parent"),
+            HostActionEntryIngress.Cli,
+            lineage: new HostActionEntryLineage(
+                new SharpClawActionKey("count.parent"),
+                1,
+                "count-parent-descriptor",
+                typeof(string).AssemblyQualifiedName!,
+                1,
+                "count-parent-schema",
+                null,
+                null));
+        var rootAuthority = ActivateContext(fixture, rootContext);
+        var parentCall = ActionCall(fixture, 1, "count-parent-call");
+        var parentAction = Payload(typeof(string).AssemblyQualifiedName!, "parent");
+        Assert.True(fixture.Session.BeginCall(
+            parentCall,
+            SidecarCapabilityKind.Action,
+            parentAction,
+            parentAction.ByteLength,
+            fixture.Now,
+            rootContext).Accepted);
+
+        var childDescriptor = NestedDescriptor("count.child", typeof(string).AssemblyQualifiedName!);
+        var childAction = Payload(childDescriptor.InputTypeIdentity, "child");
+        var childCall = ActionCall(fixture, 2, "count-child-call");
+        var issued = fixture.Session.IssueNestedHostActionEntryCarrier(
+            parentCall,
+            childCall,
+            childDescriptor,
+            childAction,
+            NestedContribution(childDescriptor),
+            fixture.Now,
+            out var carrier);
+        Assert.True(issued.Accepted, issued.Message);
+        Assert.NotNull(carrier);
+        var childRequest = SidecarActionCapabilityRequest.HostEntryNested(
+            childCall,
+            childDescriptor,
+            childAction,
+            new SidecarCancellationIdentity(
+                childCall.CancellationId,
+                "count-child-cancellation",
+                childCall.Deadline),
+            childCall.Deadline,
+            carrier!,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                childDescriptor.InputTypeIdentity,
+                childDescriptor.InputSchemaVersion,
+                childDescriptor.ResultTypeIdentity,
+                childDescriptor.ResultSchemaVersion,
+                childDescriptor.DescriptorHash));
+        Assert.True(fixture.Session.BeginActionCall(
+            childRequest,
+            childAction.ByteLength,
+            fixture.Now,
+            out _).Accepted);
+
+        var retryable = fixture.Session.CompleteCall(parentCall.CallId, 2);
+
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, retryable.Code);
+        Assert.Equal("A parent action cannot complete while a nested action is active.", retryable.Message);
+        Assert.True(fixture.Session.CompleteCall(childCall.CallId, 0).Accepted);
+
+        var final = fixture.Session.CompleteCall(parentCall.CallId, 2);
+
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, final.Code);
+        Assert.Equal("The terminal call count must be zero or one.", final.Message);
+        var rootCarrierCompletion = fixture.Session.CompleteHostActionEntryCarrier(
+            rootAuthority,
+            HostActionEntryCarrierCompletionKind.Failed,
+            fixture.Now);
+        Assert.True(rootCarrierCompletion.Accepted, $"{rootCarrierCompletion.Code}: {rootCarrierCompletion.Message}");
+        Assert.Equal(SidecarCapabilityErrors.Duplicate, fixture.Session.CompleteCall(parentCall.CallId, 0).Code);
     }
 
     [Fact]

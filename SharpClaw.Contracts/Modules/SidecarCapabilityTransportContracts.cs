@@ -3762,11 +3762,6 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     SidecarCapabilityErrors.Duplicate,
                     "The call was already completed or was never active.");
 
-            if (terminalCallCount is < 0 or > 1)
-                return SidecarCapabilityValidationResult.Reject(
-                    SidecarCapabilityErrors.InvalidBinding,
-                    "The terminal call count must be zero or one.");
-
             if (_nestedCarrierParents.Values.Contains(callId) ||
                 _nestedCarrierStates.Values.Any(state => state.ParentCall.CallId == callId) ||
                 _crossSidecarParentChildren.Values.Contains(callId) ||
@@ -3775,6 +3770,15 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.InvalidBinding,
                     "A parent action cannot complete while a nested action is active.");
+
+            if (terminalCallCount is < 0 or > 1)
+            {
+                var rejection = SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The terminal call count must be zero or one.");
+                ReleaseCompletedCallState(callId, DateTimeOffset.UtcNow);
+                return rejection;
+            }
 
             if (capability == SidecarCapabilityKind.Action &&
                 _terminalCalls.ContainsKey(callId) != (terminalCallCount == 1))
