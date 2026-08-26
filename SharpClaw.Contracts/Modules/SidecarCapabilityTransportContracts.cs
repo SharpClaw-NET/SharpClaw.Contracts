@@ -799,6 +799,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     SidecarCapabilityTransportValidation.ComputeHostActionEntryContextBindingHash(
                         authority.InitiatingHostContext),
                     StringComparison.OrdinalIgnoreCase) ||
+                !SidecarCapabilityTransportValidation.IsExecutableTerminalAuthorityDomain(hostAuthority) ||
                 _authenticateHostTerminalAuthority is null ||
                 !_authenticateHostTerminalAuthority(
                     hostAuthority,
@@ -1530,6 +1531,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     context,
                     authority.HostContextBindingHash) ||
                 !string.Equals(authority.SnapshotContentHash, SidecarCapabilityTransportValidation.ComputeSnapshotHash(snapshot), StringComparison.OrdinalIgnoreCase) ||
+                !SidecarCapabilityTransportValidation.IsExecutableTerminalAuthorityDomain(authority) ||
                 string.IsNullOrWhiteSpace(authority.Proof) ||
                 !string.Equals(authority.CanonicalBindingHash, SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority), StringComparison.OrdinalIgnoreCase) ||
                 !_authenticateHostTerminalAuthority(authority, authority.CanonicalBindingHash))
@@ -1615,6 +1617,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 _activeEntryCarriers.ContainsKey(relay.Context.CapabilityId) ||
                 _issuedEntryContexts.ContainsKey(relay.Context.CapabilityId) ||
                 _completedEntryCarriers.ContainsKey(relay.Context.CapabilityId) ||
+                !SidecarCapabilityTransportValidation.IsExecutableTerminalAuthorityDomain(relay.Authority) ||
                 !string.Equals(relay.Authority.CanonicalBindingHash, SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(relay.Authority), StringComparison.OrdinalIgnoreCase) ||
                 !_authenticateHostTerminalAuthority(relay.Authority, relay.Authority.CanonicalBindingHash))
             {
@@ -2325,10 +2328,11 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                      request.Authority.CrossSidecarPeerRelayBindingHash,
                      SidecarCapabilityTransportValidation.ComputeCrossSidecarPeerRelayBindingHash(relay),
                      StringComparison.OrdinalIgnoreCase) ||
-                 !string.Equals(
+                !string.Equals(
                     request.Authority.CanonicalBindingHash,
                     SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(request.Authority),
                     StringComparison.OrdinalIgnoreCase) ||
+                !SidecarCapabilityTransportValidation.IsExecutableTerminalAuthorityDomain(request.Authority) ||
                 !_authenticateHostTerminalAuthority(
                     request.Authority,
                     request.Authority.CanonicalBindingHash))
@@ -3973,6 +3977,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 authority.NestedCarrierRelay != relay ||
                 authority.NestedCarrierOutcomeKind != SidecarNestedHostActionEntryRelayOutcomeKind.Issued ||
                 !string.Equals(authority.NestedCarrierRequestFingerprint, expectedFingerprint, StringComparison.OrdinalIgnoreCase) ||
+                !SidecarCapabilityTransportValidation.IsExecutableTerminalAuthorityDomain(authority) ||
                 !string.Equals(authority.CanonicalBindingHash, SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority), StringComparison.OrdinalIgnoreCase) ||
                 !_authenticateHostTerminalAuthority(authority, authority.CanonicalBindingHash) ||
                 !MatchesPeerBinding(peerCall) ||
@@ -5990,6 +5995,7 @@ public static class SidecarCapabilityTransportValidation
               nestedOutcome.IsWellFormed &&
               request.NestedCarrierRequest.IsWellFormed &&
               nestedAuthority is not null &&
+              IsExecutableTerminalAuthorityDomain(nestedAuthority) &&
               nestedAuthority.NestedCarrierOutcomeKind == nestedKind &&
               SameNestedCarrierAuthorityBinding(request, response.NestedCarrierRelay, nestedKind!.Value, nestedAuthority) &&
               authenticateNestedCarrierAuthority is not null &&
@@ -6112,6 +6118,7 @@ public static class SidecarCapabilityTransportValidation
         var relay = response.CrossSidecarRelay;
         if (!MatchesBinding(request.Call, sourceBinding, SidecarCapabilityKind.Action) ||
             request.TerminalId == Guid.Empty ||
+            !IsExecutableTerminalAuthorityDomain(request.Authority) ||
             request.Receipt is null ||
             request.Receipt.CallId != request.Call.CallId ||
             response.TerminalId != request.TerminalId ||
@@ -6573,6 +6580,7 @@ public static class SidecarCapabilityTransportValidation
         var authority = request.Authority;
         var context = request.Context;
         return authority is not null &&
+            IsExecutableTerminalAuthorityDomain(authority) &&
             context is not null &&
             context.IsWellFormed &&
             authority.AuthorityId != Guid.Empty &&
@@ -6633,6 +6641,12 @@ public static class SidecarCapabilityTransportValidation
                 StringComparison.OrdinalIgnoreCase) &&
             authenticate(authority, authority.CanonicalBindingHash);
     }
+
+    internal static bool IsExecutableTerminalAuthorityDomain(
+        SidecarHostTerminalAuthority? authority) =>
+        authority is not null &&
+        authority.CancellationState == SidecarHostTerminalCancellationState.None &&
+        authority.CancellationAt == DateTimeOffset.MinValue;
 
     private static SidecarCapabilityValidationResult ValidateNestedOutcome(
         SidecarActionOutcomeEnvelope outcome,

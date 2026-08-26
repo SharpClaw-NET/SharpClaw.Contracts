@@ -6118,6 +6118,7 @@ public sealed class SidecarCapabilityTransportTests
             SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(terminalAuthority),
             terminalAuthority.CanonicalBindingHash);
         Assert.True(Authenticate(terminalAuthority, terminalAuthority.CanonicalBindingHash));
+
         var cancellation = new SidecarCrossSidecarActionEntryPeerCancellation(
             cross.Relay,
             terminalAuthority,
@@ -6129,6 +6130,36 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Equal(cancellation.Relay.Carrier.Authority.PeerBindingGeneration, target.Session.BindingGeneration);
         Assert.Equal(cancellation.Relay.Carrier.ExpiresAt, cancellation.TerminalAuthority.ExpiresAt);
         Assert.True(cancellation.IsWellFormed);
+        var cancelledNormalRequest = terminalRequest with
+        {
+            Authority = terminalAuthority,
+        };
+        var normalRejected = SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
+            parentRequest,
+            cancelledNormalRequest,
+            source.Binding,
+            source.Now,
+            Authenticate);
+        Assert.False(normalRejected.Accepted);
+
+        var rotatedPeer = CreateMirroredFixture(target, Authenticate);
+        var rotatedBinding = CreateRotatedBinding(rotatedPeer, "cancelled-peer-rotation");
+        rotatedPeer.BindingHashes.Add(rotatedBinding.Authentication.BindingHash);
+        Assert.True(rotatedPeer.Session.RotateBinding(rotatedBinding, rotatedPeer.Now).Accepted);
+        var rotatedRejected = rotatedPeer.Session.ConsumeCancelledCrossSidecarActionEntryPeerRelay(
+            cancellation,
+            source.Now,
+            static (authority, hash) => authority.Proof == hash);
+        Assert.False(rotatedRejected.Accepted);
+
+        var disconnectedPeer = CreateMirroredFixture(target, Authenticate);
+        disconnectedPeer.Session.Disconnect();
+        var disconnectedRejected = disconnectedPeer.Session.ConsumeCancelledCrossSidecarActionEntryPeerRelay(
+            cancellation,
+            source.Now,
+            static (authority, hash) => authority.Proof == hash);
+        Assert.False(disconnectedRejected.Accepted);
+
         var peerCarrier = SidecarCrossSidecarActionEntryValidation.ValidatePeerCarrier(
             cancellation.Relay.Carrier,
             target.Binding,
