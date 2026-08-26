@@ -84,6 +84,8 @@ public sealed record SidecarCrossSidecarActionEntryAuthority(
     public SidecarActionDescriptorIdentity Descriptor => TargetEntry.Descriptor;
 
     public string CanonicalBindingHash { get; init; } = string.Empty;
+    public SidecarCapabilityCallIdentity? PeerCall { get; init; }
+    public long PeerBindingGeneration { get; init; }
     public Guid TerminalId { get; init; }
     public SidecarActionOutcomeEnvelope? OutcomeEnvelope { get; init; }
     public SidecarActionResultIdentity? ResultIdentity { get; init; }
@@ -126,6 +128,15 @@ public sealed record SidecarCrossSidecarActionEntryAuthority(
         !string.IsNullOrWhiteSpace(TerminalOwnerGraphId) &&
         string.Equals(TerminalOwnerModuleId, TargetEntry.ModuleId, StringComparison.Ordinal) &&
         string.Equals(TerminalOwnerGraphId, TargetEntry.GraphId, StringComparison.Ordinal) &&
+        (PeerCall is null
+            ? PeerBindingGeneration == 0
+            : PeerCall.IsValid &&
+              PeerCall.Capability == SidecarCapabilityKind.Action &&
+              PeerCall.CallId == TargetChildCall.CallId &&
+              PeerCall.ReplayNonce == TargetChildCall.ReplayNonce &&
+              PeerCall.Sequence == TargetChildCall.Sequence &&
+              PeerCall.Deadline == TargetChildCall.Deadline &&
+              PeerBindingGeneration > 0) &&
         IssuedAt <= ExpiresAt &&
         Deadline > IssuedAt &&
         Deadline <= ExpiresAt &&
@@ -178,6 +189,8 @@ public sealed record SidecarCrossSidecarActionEntryRelay(
     SidecarCrossSidecarActionEntryCarrier Carrier,
     SidecarModuleActionEntryDefinition TargetEntry)
 {
+    public SidecarCapabilityCallIdentity? PeerCall { get; init; }
+    public long PeerBindingGeneration { get; init; }
     public SidecarActionDescriptorIdentity Descriptor => TargetEntry.Descriptor;
 
     public bool IsWellFormed =>
@@ -185,7 +198,9 @@ public sealed record SidecarCrossSidecarActionEntryRelay(
         Carrier.IsWellFormed &&
         TargetEntry is not null &&
         TargetEntry.IsWellFormed &&
-        TargetEntry == Carrier.Authority.TargetEntry;
+        TargetEntry == Carrier.Authority.TargetEntry &&
+        PeerCall == Carrier.Authority.PeerCall &&
+        PeerBindingGeneration == Carrier.Authority.PeerBindingGeneration;
 }
 
 public enum SidecarCrossSidecarActionEntryOutcomeKind
@@ -251,6 +266,8 @@ public static class SidecarCrossSidecarActionEntryValidation
             authority.SnapshotContentHash,
             authority.TerminalOwnerModuleId,
             authority.TerminalOwnerGraphId,
+            PeerCall = authority.PeerCall,
+            authority.PeerBindingGeneration,
             ResultReceipt = authority.ResultReceipt,
             authority.TerminalId,
             OutcomeEnvelope = authority.OutcomeEnvelope,
@@ -334,6 +351,45 @@ public static class SidecarCrossSidecarActionEntryValidation
             carrier.Action,
             required: true,
             targetBinding.PayloadLimits.ActionInputBytes);
+    }
+
+    public static SidecarCapabilityValidationResult ValidatePeerCarrier(
+        SidecarCrossSidecarActionEntryCarrier carrier,
+        SidecarCapabilitySessionBinding peerBinding,
+        DateTimeOffset now,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, bool> authenticate)
+    {
+        ArgumentNullException.ThrowIfNull(carrier);
+        ArgumentNullException.ThrowIfNull(peerBinding);
+        ArgumentNullException.ThrowIfNull(authenticate);
+
+        var authority = carrier.Authority;
+        var peerCall = authority?.PeerCall;
+        if (!carrier.IsWellFormed ||
+            peerCall is null ||
+            authority.PeerBindingGeneration <= 0 ||
+            peerCall.SessionId != peerBinding.SessionId ||
+            peerCall.RequestId != peerBinding.RequestId ||
+            peerCall.CancellationId != peerBinding.CancellationId ||
+            !string.Equals(peerCall.ModuleId, peerBinding.ModuleId, StringComparison.Ordinal) ||
+            !string.Equals(peerCall.GraphId, peerBinding.GraphId, StringComparison.Ordinal) ||
+            authority.PeerBindingGeneration <= 0 ||
+            peerCall.Deadline != authority.Deadline ||
+            authority.ExpiresAt <= now ||
+            authority.Deadline <= now ||
+            authority.ExpiresAt > peerBinding.ExpiresAt ||
+            !string.Equals(authority.CanonicalBindingHash, ComputeAuthorityHash(authority), StringComparison.OrdinalIgnoreCase) ||
+            !authenticate(authority, authority.CanonicalBindingHash))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The cross-sidecar peer carrier is not authenticated for the receiving session.");
+        }
+
+        return SidecarCapabilityTransportValidation.ValidateSerializedPayload(
+            carrier.Action,
+            required: true,
+            peerBinding.PayloadLimits.ActionInputBytes);
     }
 
     public static SidecarCapabilityValidationResult ValidateOutcome(

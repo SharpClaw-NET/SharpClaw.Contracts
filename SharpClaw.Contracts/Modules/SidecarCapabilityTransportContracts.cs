@@ -1911,7 +1911,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         ActionPipelineSnapshot targetSnapshot,
         DateTimeOffset now,
         Func<SidecarCrossSidecarActionEntryAuthority, string, string> issueProof,
-        out SidecarCrossSidecarActionEntryRelay? relay)
+        out SidecarCrossSidecarActionEntryRelay? relay,
+        SidecarCapabilitySession? peerSession = null)
     {
         ArgumentNullException.ThrowIfNull(parentCall);
         ArgumentNullException.ThrowIfNull(request);
@@ -1954,6 +1955,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 return requestResult;
 
             if (targetSession == this ||
+                peerSession == this ||
+                peerSession == targetSession ||
                 !targetEntry.IsWellFormed ||
                 !string.Equals(targetEntry.ModuleId, targetSession.Binding.ModuleId, StringComparison.Ordinal) ||
                 !string.Equals(targetEntry.GraphId, targetSession.Binding.GraphId, StringComparison.Ordinal) ||
@@ -1982,6 +1985,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             targetSnapshot,
             now,
             issueProof,
+            peerSession,
             out var reservedCarrier);
         if (!reservation.Accepted || reservedCarrier is null)
             return reservation;
@@ -2038,7 +2042,11 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 "The target session did not confirm the child authority after source commit.");
         }
 
-        relay = new SidecarCrossSidecarActionEntryRelay(reservedCarrier, targetEntry);
+        relay = new SidecarCrossSidecarActionEntryRelay(reservedCarrier, targetEntry)
+        {
+            PeerCall = reservedCarrier.Authority.PeerCall,
+            PeerBindingGeneration = reservedCarrier.Authority.PeerBindingGeneration,
+        };
         return SidecarCapabilityValidationResult.Accept();
     }
 
@@ -2053,6 +2061,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         ActionPipelineSnapshot targetSnapshot,
         DateTimeOffset now,
         Func<SidecarCrossSidecarActionEntryAuthority, string, string> issueProof,
+        SidecarCapabilitySession? peerSession,
         out SidecarCrossSidecarActionEntryCarrier? carrier)
     {
         carrier = null;
@@ -2140,6 +2149,16 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 SidecarCapabilityKind.Action,
                 _lastSequence + 1,
                 request.Deadline);
+            var peerCall = peerSession is null
+                ? null
+                : childCall with
+                {
+                    SessionId = peerSession.Binding.SessionId,
+                    RequestId = peerSession.Binding.RequestId,
+                    CancellationId = peerSession.Binding.CancellationId,
+                    ModuleId = peerSession.Binding.ModuleId,
+                    GraphId = peerSession.Binding.GraphId,
+                };
             var childInvocationId = Guid.NewGuid();
             var capabilityId = Guid.NewGuid();
             var capabilityHandle = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
@@ -2177,6 +2196,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 string.Empty)
             {
                 CanonicalBindingHash = string.Empty,
+                PeerCall = peerCall,
+                PeerBindingGeneration = peerSession?.BindingGeneration ?? 0,
             };
             var canonicalHash = SidecarCrossSidecarActionEntryValidation.ComputeAuthorityHash(unsigned);
             var signed = unsigned with
@@ -2258,6 +2279,208 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         return confirmed;
     }
 
+    public SidecarCapabilityValidationResult ImportCrossSidecarActionEntryPeerRelay(
+        SidecarActionTerminalTransportRequest request,
+        DateTimeOffset now,
+        Func<SidecarCrossSidecarActionEntryAuthority, string, bool> authenticate,
+        out SidecarCrossSidecarActionEntryCarrier? importedCarrier)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(authenticate);
+        importedCarrier = null;
+
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The receiving capability session is disconnected.");
+
+            if (_authenticateHostTerminalAuthority is null)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthorized,
+                    "The receiving capability session has no host proof verifier.");
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            var relay = request.CrossSidecarPeerRelay;
+            var peerCall = relay?.PeerCall;
+            var authority = relay?.Carrier.Authority;
+            if (relay is null ||
+                peerCall is null ||
+                authority is null ||
+                !relay.IsWellFormed ||
+                relay.PeerBindingGeneration != _bindingGeneration ||
+                !MatchesPeerBinding(peerCall) ||
+                request.Call != authority.TargetChildCall ||
+                request.CrossSidecarActionRequest is null ||
+                 request.TerminalId == Guid.Empty ||
+                 request.Authority.TerminalId != request.TerminalId ||
+                 request.Authority.RootPeerCall != peerCall ||
+                 !string.Equals(
+                     request.Authority.CrossSidecarPeerRelayBindingHash,
+                     SidecarCapabilityTransportValidation.ComputeCrossSidecarPeerRelayBindingHash(relay),
+                     StringComparison.OrdinalIgnoreCase) ||
+                 !string.Equals(
+                    request.Authority.CanonicalBindingHash,
+                    SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(request.Authority),
+                    StringComparison.OrdinalIgnoreCase) ||
+                !_authenticateHostTerminalAuthority(
+                    request.Authority,
+                    request.Authority.CanonicalBindingHash))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The cross-sidecar peer relay is not bound to the authenticated terminal request.");
+            }
+
+            var childRequest = request.CrossSidecarActionRequest;
+            if (childRequest.ActionKey != authority.TargetEntry.Descriptor.Key ||
+                childRequest.ActionVersion != authority.TargetEntry.Descriptor.Version ||
+                childRequest.Deadline != authority.Deadline ||
+                 childRequest.ExpiresAt < authority.ExpiresAt ||
+                childRequest.Action.ContentHash != relay.Carrier.Action.ContentHash ||
+                childRequest.Action.ByteLength != relay.Carrier.Action.ByteLength ||
+                childRequest.Action.TypeIdentity != relay.Carrier.Action.TypeIdentity ||
+                childRequest.Action.SchemaVersion != relay.Carrier.Action.SchemaVersion)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The cross-sidecar peer relay does not match the child request.");
+            }
+
+            var carrierResult = SidecarCrossSidecarActionEntryValidation.ValidatePeerCarrier(
+                relay.Carrier,
+                Binding,
+                now,
+                authenticate);
+            if (!carrierResult.Accepted)
+                return carrierResult;
+
+            if (_calls.ContainsKey(peerCall.CallId) ||
+                _reservedNestedCalls.ContainsKey(peerCall.CallId) ||
+                _completedCalls.Contains(peerCall.CallId) ||
+                _nonces.Contains(peerCall.ReplayNonce) ||
+                _activeEntryCarriers.ContainsKey(relay.Carrier.CarrierId) ||
+                _issuedEntryContexts.ContainsKey(relay.Carrier.CarrierId) ||
+                _completedEntryCarriers.ContainsKey(relay.Carrier.CarrierId) ||
+                peerCall.Sequence != _lastSequence + 1 ||
+                peerCall.Deadline <= now ||
+                peerCall.Deadline > Binding.ExpiresAt ||
+                _inFlight >= Binding.ConcurrencyLimits.MaximumInFlightCalls)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The cross-sidecar peer relay call is already used or outside the receiving budget.");
+            }
+
+            var usesReceivingRootReservation =
+                _totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest;
+            if (usesReceivingRootReservation &&
+                _receivingRootReservations.Count >= Binding.ConcurrencyLimits.MaximumReceivingRootReservations)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.ConcurrencyLimit,
+                    "The receiving root reservation budget is exhausted for this binding generation.");
+            }
+
+            if (usesReceivingRootReservation &&
+                !_receivingRootReservations.TryAdd(
+                    authority.RootBudgetId,
+                    new ReceivingRootReservation(relay.Carrier.CarrierId, _bindingGeneration, IsCrossSidecar: true)))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The cross-sidecar receiving root budget was already consumed.");
+            }
+
+            var contribution = new HostActionEntryContribution(
+                new HostActionEntryIngressBinding(
+                    HostActionEntryIngress.CrossModule,
+                    authority.TargetEntry.ModuleId,
+                    authority.TargetEntry.GraphId),
+                new HostActionEntryLineage(
+                    authority.TargetEntry.Descriptor.Key,
+                    authority.TargetEntry.Descriptor.Version,
+                    authority.TargetEntry.Descriptor.DescriptorHash,
+                    authority.TargetEntry.Descriptor.InputTypeIdentity,
+                    authority.TargetEntry.Descriptor.InputSchemaVersion,
+                    authority.TargetEntry.Descriptor.InputSchemaHash,
+                    relay.Carrier.Action.ContentHash,
+                    relay.Carrier.Action.ByteLength));
+            var context = new HostActionEntryRequestContext(
+                relay.Carrier.CarrierId,
+                relay.Carrier.Handle,
+                HostActionEntryIngress.CrossModule,
+                authority.TargetChildInvocationId,
+                Binding.RequestId,
+                Binding.CancellationId,
+                authority.Caller,
+                authority.Features,
+                authority.TraceId,
+                authority.IdempotencyKey,
+                peerCall.Deadline,
+                relay.Carrier.ExpiresAt)
+            {
+                Contribution = contribution,
+                ParentInvocationId = authority.SourceParentInvocationId,
+                Depth = authority.Depth,
+                Attempt = authority.Attempt,
+            };
+            var carrierAuthority = new HostActionEntryCarrierAuthority(
+                Binding.ModuleId,
+                Binding.GraphId,
+                Binding.SessionId,
+                Binding.RequestId,
+                Binding.CancellationId,
+                relay.Carrier.CarrierId,
+                new HostActionEntryCarrierIdentity(
+                    context.Ingress,
+                    context.InvocationId,
+                    contribution.IngressBinding),
+                _bindingGeneration,
+                now,
+                relay.Carrier.ExpiresAt,
+                HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(relay.Carrier.Handle));
+
+            _entryBudgetRoots[relay.Carrier.CarrierId] = authority.RootBudgetId;
+            _entryBudgetReservations[authority.RootBudgetId] = new EntryBudgetReservation(
+                context,
+                _bindingGeneration,
+                new[] { context.ExpiresAt, Binding.ExpiresAt }.Min(),
+                ExtensionAvailable: true);
+            _activeEntryCarriers[relay.Carrier.CarrierId] = carrierAuthority;
+            _activeEntryContexts[relay.Carrier.CarrierId] = context;
+            _callEntryContexts[peerCall.CallId] = context;
+            _reservedNestedCalls[peerCall.CallId] = peerCall;
+            _crossSidecarStates[relay.Carrier.CarrierId] = new CrossSidecarCarrierState(
+                relay.Carrier,
+                authority.SourceParentCall,
+                peerCall,
+                authority.TargetEntry,
+                Active: false,
+                Terminal: null,
+                PeerSession: null,
+                IsSource: false);
+            _lastSequence = peerCall.Sequence;
+            if (!usesReceivingRootReservation)
+                _totalCalls++;
+            _inFlight++;
+            _nonces.Add(peerCall.ReplayNonce);
+            importedCarrier = relay.Carrier;
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
     public SidecarCapabilityValidationResult BeginCrossSidecarActionEntryCall(
         SidecarCrossSidecarActionEntryCarrier carrier,
         SidecarActionTerminalRegistration terminal,
@@ -2299,18 +2522,28 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             if (!_crossSidecarStates.TryGetValue(carrier.CarrierId, out var state) ||
                 state.Active ||
                 state.Carrier != carrier ||
-                carrier.BindingGeneration != _bindingGeneration)
+                (state.Carrier.Authority.PeerCall is null
+                    ? carrier.BindingGeneration != _bindingGeneration
+                    : state.Carrier.Authority.PeerBindingGeneration != _bindingGeneration))
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Replay,
                     "The cross-sidecar carrier is unknown or already consumed.");
             }
 
-            var carrierResult = SidecarCrossSidecarActionEntryValidation.ValidateCarrier(
-                carrier,
-                Binding,
-                now,
-                authenticate);
+            var isPeerCarrier = state.Carrier.Authority.PeerCall is not null &&
+                state.TargetChildCall == state.Carrier.Authority.PeerCall;
+            var carrierResult = isPeerCarrier
+                ? SidecarCrossSidecarActionEntryValidation.ValidatePeerCarrier(
+                    carrier,
+                    Binding,
+                    now,
+                    authenticate)
+                : SidecarCrossSidecarActionEntryValidation.ValidateCarrier(
+                    carrier,
+                    Binding,
+                    now,
+                    authenticate);
             if (!carrierResult.Accepted ||
                 !terminal.IsWellFormed ||
                 terminal.ActionTypeIdentity != state.TargetEntry.Descriptor.InputTypeIdentity ||
@@ -2345,38 +2578,41 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 return requestResult;
 
             var rootBudgetId = carrier.Authority.RootBudgetId;
-            var targetContext = new HostActionEntryRequestContext(
-                carrier.Authority.CapabilityId,
-                carrier.Authority.CapabilityHandle,
-                HostActionEntryIngress.CrossModule,
-                carrier.Authority.TargetChildInvocationId,
-                Binding.RequestId,
-                Binding.CancellationId,
-                carrier.Authority.Caller,
-                carrier.Authority.Features,
-                carrier.Authority.TraceId,
-                carrier.Authority.IdempotencyKey,
-                carrier.Authority.Deadline,
-                carrier.Authority.ExpiresAt)
-            {
-                Contribution = new HostActionEntryContribution(
-                    new HostActionEntryIngressBinding(
-                        HostActionEntryIngress.CrossModule,
-                        state.TargetEntry.ModuleId,
-                        state.TargetEntry.GraphId),
-                    new HostActionEntryLineage(
-                        state.TargetEntry.Descriptor.Key,
-                        state.TargetEntry.Descriptor.Version,
-                        state.TargetEntry.Descriptor.DescriptorHash,
-                        state.TargetEntry.Descriptor.InputTypeIdentity,
-                        state.TargetEntry.Descriptor.InputSchemaVersion,
-                        state.TargetEntry.Descriptor.InputSchemaHash,
-                        carrier.Action.ContentHash,
-                        carrier.Action.ByteLength)),
-                ParentInvocationId = carrier.Authority.SourceParentInvocationId,
-                Depth = carrier.Authority.Depth,
-                Attempt = carrier.Authority.Attempt,
-            };
+            var targetContext = isPeerCarrier &&
+                _activeEntryContexts.TryGetValue(carrier.CarrierId, out var importedContext)
+                ? importedContext
+                : new HostActionEntryRequestContext(
+                isPeerCarrier ? carrier.CarrierId : carrier.Authority.CapabilityId,
+                    carrier.Authority.CapabilityHandle,
+                    HostActionEntryIngress.CrossModule,
+                    carrier.Authority.TargetChildInvocationId,
+                    Binding.RequestId,
+                    Binding.CancellationId,
+                    carrier.Authority.Caller,
+                    carrier.Authority.Features,
+                    carrier.Authority.TraceId,
+                    carrier.Authority.IdempotencyKey,
+                    carrier.Authority.Deadline,
+                    carrier.Authority.ExpiresAt)
+                {
+                    Contribution = new HostActionEntryContribution(
+                        new HostActionEntryIngressBinding(
+                            HostActionEntryIngress.CrossModule,
+                            state.TargetEntry.ModuleId,
+                            state.TargetEntry.GraphId),
+                        new HostActionEntryLineage(
+                            state.TargetEntry.Descriptor.Key,
+                            state.TargetEntry.Descriptor.Version,
+                            state.TargetEntry.Descriptor.DescriptorHash,
+                            state.TargetEntry.Descriptor.InputTypeIdentity,
+                            state.TargetEntry.Descriptor.InputSchemaVersion,
+                            state.TargetEntry.Descriptor.InputSchemaHash,
+                            carrier.Action.ContentHash,
+                            carrier.Action.ByteLength)),
+                    ParentInvocationId = carrier.Authority.SourceParentInvocationId,
+                    Depth = carrier.Authority.Depth,
+                    Attempt = carrier.Authority.Attempt,
+                };
             var targetCarrier = new HostActionEntryCarrierAuthority(
                 Binding.ModuleId,
                 Binding.GraphId,
@@ -2392,21 +2628,32 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 now,
                 carrier.ExpiresAt,
                 HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(carrier.Handle));
-            if (!_entryBudgetReservations.TryAdd(
-                    rootBudgetId,
-                    new EntryBudgetReservation(
-                        targetContext,
-                        _bindingGeneration,
-                        new[] { targetContext.ExpiresAt, Binding.ExpiresAt }.Min(),
-                        ExtensionAvailable: true)) ||
-                !_entryBudgetRoots.TryAdd(carrier.CarrierId, rootBudgetId) ||
-                !_activeEntryCarriers.TryAdd(carrier.CarrierId, targetCarrier) ||
-                !_activeEntryContexts.TryAdd(carrier.CarrierId, targetContext))
+            var stateReady = isPeerCarrier
+                ? _activeEntryCarriers.TryGetValue(carrier.CarrierId, out var importedCarrierAuthority) &&
+                  _activeEntryContexts.TryGetValue(carrier.CarrierId, out var activeImportedContext) &&
+                  importedCarrierAuthority == targetCarrier &&
+                  activeImportedContext == targetContext &&
+                  _entryBudgetRoots.TryGetValue(carrier.CarrierId, out var importedRoot) &&
+                  importedRoot == rootBudgetId
+                : _entryBudgetReservations.TryAdd(
+                      rootBudgetId,
+                      new EntryBudgetReservation(
+                          targetContext,
+                          _bindingGeneration,
+                          new[] { targetContext.ExpiresAt, Binding.ExpiresAt }.Min(),
+                          ExtensionAvailable: true)) &&
+                  _entryBudgetRoots.TryAdd(carrier.CarrierId, rootBudgetId) &&
+                  _activeEntryCarriers.TryAdd(carrier.CarrierId, targetCarrier) &&
+                  _activeEntryContexts.TryAdd(carrier.CarrierId, targetContext);
+            if (!stateReady)
             {
-                _entryBudgetReservations.Remove(rootBudgetId);
-                _entryBudgetRoots.Remove(carrier.CarrierId);
-                _activeEntryCarriers.Remove(carrier.CarrierId);
-                _activeEntryContexts.Remove(carrier.CarrierId);
+                if (!isPeerCarrier)
+                {
+                    _entryBudgetReservations.Remove(rootBudgetId);
+                    _entryBudgetRoots.Remove(carrier.CarrierId);
+                    _activeEntryCarriers.Remove(carrier.CarrierId);
+                    _activeEntryContexts.Remove(carrier.CarrierId);
+                }
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Duplicate,
                     "The cross-sidecar target carrier state already exists.");
@@ -2421,10 +2668,13 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 targetContext);
             if (!beginResult.Accepted)
             {
-                _entryBudgetReservations.Remove(rootBudgetId);
-                _entryBudgetRoots.Remove(carrier.CarrierId);
-                _activeEntryCarriers.Remove(carrier.CarrierId);
-                _activeEntryContexts.Remove(carrier.CarrierId);
+                if (!isPeerCarrier)
+                {
+                    _entryBudgetReservations.Remove(rootBudgetId);
+                    _entryBudgetRoots.Remove(carrier.CarrierId);
+                    _activeEntryCarriers.Remove(carrier.CarrierId);
+                    _activeEntryContexts.Remove(carrier.CarrierId);
+                }
                 return beginResult;
             }
 
@@ -4759,6 +5009,7 @@ public sealed record SidecarHostTerminalAuthority(
     public SidecarNestedHostActionEntryRelay? NestedCarrierRelay { get; init; }
     public SidecarNestedHostActionEntryRelayOutcomeKind? NestedCarrierOutcomeKind { get; init; }
     public string NestedCarrierRequestFingerprint { get; init; } = string.Empty;
+    public string CrossSidecarPeerRelayBindingHash { get; init; } = string.Empty;
     public string HostContextBindingHash { get; init; } = string.Empty;
     public Guid ReceivingRootBudgetId { get; init; }
     public long ReceivingPeerBindingGeneration { get; init; }
@@ -4817,6 +5068,7 @@ public sealed record SidecarActionTerminalTransportRequest(
     public SidecarActionTerminalExecutionContext? Context { get; init; }
     public SidecarNestedHostActionEntryRequest? NestedCarrierRequest { get; init; }
     public SidecarCrossSidecarActionEntryRequest? CrossSidecarActionRequest { get; init; }
+    public SidecarCrossSidecarActionEntryRelay? CrossSidecarPeerRelay { get; init; }
     public Guid TerminalId { get; init; }
 }
 
@@ -5102,9 +5354,10 @@ public static class SidecarCapabilityTransportValidation
              crossSidecarEntry && request.HostContext is not null ||
              crossSidecarEntry && request.NestedCarrier is not null ||
              crossSidecarEntry && request.Terminal is null ||
-             crossSidecarEntry && request.CrossSidecarCarrier is not null &&
-                 (request.CrossSidecarCarrier.Authority.TargetChildCall != request.Call ||
-                  request.CrossSidecarCarrier.Descriptor != request.Descriptor) ||
+               crossSidecarEntry && request.CrossSidecarCarrier is not null &&
+                   (request.Call != request.CrossSidecarCarrier.Authority.TargetChildCall &&
+                    request.CrossSidecarCarrier.Authority.PeerCall != request.Call ||
+                    request.CrossSidecarCarrier.Descriptor != request.Descriptor) ||
                request.Terminal is null ||
                !request.Terminal.IsWellFormed) ||
              !requiresEntryAuthority &&
@@ -5457,6 +5710,18 @@ public static class SidecarCapabilityTransportValidation
              request.NestedCarrierRequest is not null &&
              (initiatingRequest.Invocation != SidecarActionInvocationKind.HostEntry ||
               !MatchesNestedRequest(initiatingRequest, request, request.NestedCarrierRequest, binding)) ||
+             initiatingRequest.CrossSidecarCarrier?.Authority.PeerCall is not null &&
+             (request.CrossSidecarPeerRelay is null ||
+              request.CrossSidecarActionRequest is null ||
+              request.CrossSidecarPeerRelay.Carrier != initiatingRequest.CrossSidecarCarrier ||
+              request.CrossSidecarPeerRelay.PeerCall != initiatingRequest.CrossSidecarCarrier.Authority.PeerCall ||
+              request.CrossSidecarPeerRelay.PeerBindingGeneration != initiatingRequest.CrossSidecarCarrier.Authority.PeerBindingGeneration ||
+              request.Call != request.CrossSidecarPeerRelay.Carrier.Authority.TargetChildCall ||
+              request.Authority.RootPeerCall != request.CrossSidecarPeerRelay.PeerCall ||
+              request.CrossSidecarActionRequest.ActionKey != request.CrossSidecarPeerRelay.Descriptor.Key ||
+              request.CrossSidecarActionRequest.ActionVersion != request.CrossSidecarPeerRelay.Descriptor.Version ||
+              request.CrossSidecarActionRequest.Action.ContentHash != request.CrossSidecarPeerRelay.Carrier.Action.ContentHash ||
+              request.CrossSidecarActionRequest.Action.ByteLength != request.CrossSidecarPeerRelay.Carrier.Action.ByteLength) ||
             !ValidateHostTerminalAuthority(
                 request,
                 binding,
@@ -5965,6 +6230,7 @@ public static class SidecarCapabilityTransportValidation
                 },
             authority.NestedCarrierOutcomeKind,
             authority.NestedCarrierRequestFingerprint,
+            authority.CrossSidecarPeerRelayBindingHash,
             NestedCarrierRelay = authority.NestedCarrierRelay is null
                 ? null
                 : new
@@ -6038,6 +6304,14 @@ public static class SidecarCapabilityTransportValidation
 
         return SidecarCapabilityTransportCodec.ComputeSha256(
             SidecarCapabilityTransportCodec.Serialize(canonical));
+    }
+
+    public static string ComputeCrossSidecarPeerRelayBindingHash(
+        SidecarCrossSidecarActionEntryRelay relay)
+    {
+        ArgumentNullException.ThrowIfNull(relay);
+        return SidecarCapabilityTransportCodec.ComputeSha256(
+            SidecarCapabilityTransportCodec.Serialize(relay));
     }
 
     public static string ComputeStorageContinuationBindingHash(
@@ -6164,8 +6438,14 @@ public static class SidecarCapabilityTransportValidation
             authority.ReceiptAttempt == request.Receipt.Attempt &&
             string.Equals(authority.ReceiptIdempotencyScope, request.Receipt.IdempotencyScope, StringComparison.Ordinal) &&
             string.Equals(authority.ReceiptContentHash, request.Receipt.ContentHash, StringComparison.OrdinalIgnoreCase) &&
-            authority.Deadline == request.Deadline &&
-            authority.IssuedAt <= now &&
+             authority.Deadline == request.Deadline &&
+             (request.CrossSidecarPeerRelay is null ||
+              (!string.IsNullOrWhiteSpace(authority.CrossSidecarPeerRelayBindingHash) &&
+               string.Equals(
+                   authority.CrossSidecarPeerRelayBindingHash,
+                   ComputeCrossSidecarPeerRelayBindingHash(request.CrossSidecarPeerRelay),
+                   StringComparison.OrdinalIgnoreCase))) &&
+             authority.IssuedAt <= now &&
             authority.ExpiresAt >= request.Deadline &&
             authority.ExpiresAt <= binding.ExpiresAt &&
             !string.IsNullOrWhiteSpace(authority.Proof) &&
