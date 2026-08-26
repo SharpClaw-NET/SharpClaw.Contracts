@@ -2500,6 +2500,13 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                         SidecarCapabilityErrors.Unauthorized,
                         "The receiving capability session has no host proof verifier.");
 
+                if (!cancellation.IsWellFormed)
+                {
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.SpoofedIdentity,
+                        "The cancelled cross-sidecar peer relay event is not authenticated.");
+                }
+
                 var bindingResult = SidecarCapabilitySessionValidator.Validate(
                     Binding,
                     _authenticate,
@@ -2541,8 +2548,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                         SidecarCapabilityErrors.SpoofedIdentity,
                         "The cancelled cross-sidecar peer relay source terminal is not authenticated.");
                 }
-                if (!cancellation.IsWellFormed ||
-                    relay is null ||
+                if (relay is null ||
                     carrier is null ||
                     authority is null ||
                     peerCall is null)
@@ -2571,6 +2577,10 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 }
 
                 if (cancellation.CancelledAt > now ||
+                    terminalAuthority.IssuedAt > now ||
+                    terminalAuthority.ExpiresAt <= now ||
+                    cancellation.CancelledAt < terminalAuthority.IssuedAt ||
+                    cancellation.CancelledAt > terminalAuthority.ExpiresAt ||
                     cancellation.CancelledAt > carrier.ExpiresAt ||
                     peerCall.Deadline <= now ||
                     peerCall.Deadline > Binding.ExpiresAt ||
@@ -5168,6 +5178,8 @@ public sealed record SidecarHostTerminalAuthority(
     public Guid? ParentInvocationId { get; init; }
     public int Depth { get; init; }
     public int Attempt { get; init; }
+    public SidecarHostTerminalCancellationState CancellationState { get; init; }
+    public DateTimeOffset CancellationAt { get; init; }
     public SidecarCapabilityCallIdentity? RootPeerCall { get; init; }
     public SidecarNestedHostActionEntryRelay? NestedCarrierRelay { get; init; }
     public SidecarNestedHostActionEntryRelayOutcomeKind? NestedCarrierOutcomeKind { get; init; }
@@ -6374,6 +6386,8 @@ public static class SidecarCapabilityTransportValidation
             authority.ParentInvocationId,
             authority.Depth,
             authority.Attempt,
+            authority.CancellationState,
+            authority.CancellationAt,
             authority.ReceivingRootBudgetId,
             authority.ReceivingPeerBindingGeneration,
             RootPeerCall = authority.RootPeerCall is null

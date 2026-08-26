@@ -6047,6 +6047,12 @@ public sealed class SidecarCapabilityTransportTests
         static bool Authenticate(SidecarHostTerminalAuthority authority, string hash) =>
             authority.Proof == hash;
 
+        static SidecarHostTerminalAuthority Sign(SidecarHostTerminalAuthority authority)
+        {
+            var hash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(authority);
+            return authority with { CanonicalBindingHash = hash, Proof = hash };
+        }
+
         var source = CreateFixture(
             moduleId: "source-module",
             graphId: "source-graph",
@@ -6091,6 +6097,11 @@ public sealed class SidecarCapabilityTransportTests
             RootPeerCall = cross.Relay.PeerCall,
             CrossSidecarPeerRelayBindingHash =
                 SidecarCapabilityTransportValidation.ComputeCrossSidecarPeerRelayBindingHash(cross.Relay),
+        };
+        terminalAuthority = terminalAuthority with
+        {
+            CancellationState = SidecarHostTerminalCancellationState.Cancelled,
+            CancellationAt = source.Now,
         };
         terminalAuthority = terminalAuthority with
         {
@@ -6150,6 +6161,46 @@ public sealed class SidecarCapabilityTransportTests
                         Action = Payload(cancellation.Relay.Carrier.Action.TypeIdentity, new { value = 99 }),
                     },
                 },
+            },
+            cancellation with
+            {
+                CancelledAt = cancellation.CancelledAt.AddSeconds(1),
+            },
+            cancellation with
+            {
+                TerminalAuthority = cancellation.TerminalAuthority with
+                {
+                    CancellationState = SidecarHostTerminalCancellationState.None,
+                },
+            },
+            cancellation with
+            {
+                TerminalAuthority = Sign(cancellation.TerminalAuthority with
+                {
+                    IssuedAt = source.Now.AddMinutes(1),
+                    CancellationAt = source.Now.AddMinutes(2),
+                    ExpiresAt = source.Now.AddMinutes(3),
+                }),
+                CancelledAt = source.Now.AddMinutes(2),
+            },
+            cancellation with
+            {
+                TerminalAuthority = Sign(cancellation.TerminalAuthority with
+                {
+                    IssuedAt = source.Now.AddMinutes(-3),
+                    CancellationAt = source.Now.AddMinutes(-2),
+                    ExpiresAt = source.Now.AddMinutes(-1),
+                }),
+                CancelledAt = source.Now.AddMinutes(-2),
+            },
+            cancellation with
+            {
+                TerminalAuthority = Sign(cancellation.TerminalAuthority with
+                {
+                    ExpiresAt = source.Now.AddMinutes(1),
+                    CancellationAt = source.Now.AddMinutes(2),
+                }),
+                CancelledAt = source.Now.AddMinutes(2),
             },
         };
         foreach (var invalid in invalidAttempts)
