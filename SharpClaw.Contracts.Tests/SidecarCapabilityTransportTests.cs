@@ -5225,6 +5225,24 @@ public sealed class SidecarCapabilityTransportTests
             },
             peer.Now,
             out _).Accepted);
+        var cancelledRootAuthority = wireRootRelay.Authority with
+        {
+            CancellationState = SidecarHostTerminalCancellationState.Cancelled,
+            CancellationAt = peer.Now,
+        };
+        cancelledRootAuthority = cancelledRootAuthority with
+        {
+            CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                cancelledRootAuthority),
+        };
+        cancelledRootAuthority = cancelledRootAuthority with
+        {
+            Proof = cancelledRootAuthority.CanonicalBindingHash,
+        };
+        Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
+            wireRootRelay with { Authority = cancelledRootAuthority },
+            peer.Now,
+            out _).Accepted);
         Assert.False(peer.Session.ImportHostActionEntryPeerRootRelay(
             wireRootRelay,
             wireRootRelay.PeerCall.Deadline,
