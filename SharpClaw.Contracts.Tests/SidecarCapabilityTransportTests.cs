@@ -6988,6 +6988,865 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void CrossSidecarStorageContinuationResolvesPeerParentToTargetChild()
+    {
+        static bool Authenticate(SidecarHostTerminalAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var source = CreateFixture(
+            moduleId: "source-module",
+            graphId: "source-graph");
+        var hostTarget = CreateFixture(
+            maxInFlight: 4,
+            maxCalls: 8,
+            moduleId: "target-module",
+            graphId: "target-graph",
+            authenticateHostTerminalAuthority: Authenticate,
+            authenticateStorageContinuationAuthority: (authority, hash) =>
+                authority.Proof == hash &&
+                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority));
+        var targetPeer = CreateMirroredFixture(
+            hostTarget,
+            (authority, hash) => authority.Proof == hash,
+            (authority, hash) =>
+                authority.Proof == hash &&
+                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority));
+        ConsumeStorageCalls(hostTarget, 7, "cross-target-host-prior");
+        ConsumeStorageCalls(targetPeer, 7, "cross-target-peer-prior");
+
+        var cross = CreateCrossRelay(source, hostTarget);
+        var hostActivation = cross.Now.AddSeconds(1);
+        var peerImportTime = cross.Now.AddSeconds(2);
+        var peerActivation = cross.Now.AddSeconds(3);
+        var continuationIssued = cross.Now.AddSeconds(4);
+        var peerContinuationImport = cross.Now.AddSeconds(5);
+        var peerStorageBegin = cross.Now.AddSeconds(6);
+        var hostImport = cross.Now.AddSeconds(7);
+        var hostStorageBegin = cross.Now.AddSeconds(8);
+        var descriptor = cross.Relay.Descriptor;
+        var terminal = new SidecarActionTerminalRegistration(
+            Guid.NewGuid(),
+            descriptor.InputTypeIdentity,
+            descriptor.InputSchemaVersion,
+            descriptor.ResultTypeIdentity,
+            descriptor.ResultSchemaVersion,
+            descriptor.DescriptorHash);
+        var hostBegin = hostTarget.Session.BeginCrossSidecarActionEntryCall(
+            cross.Relay.Carrier,
+            terminal,
+            cross.Relay.Carrier.Action.ByteLength,
+            hostActivation,
+            out var hostContext,
+            (authority, hash) => authority.Proof == hash);
+        Assert.True(hostBegin.Accepted, hostBegin.Message);
+        Assert.NotNull(hostContext);
+
+        var hostActionRequest = SidecarActionCapabilityRequest.HostEntry(
+            cross.Relay.Carrier.Authority.TargetChildCall,
+            descriptor,
+            cross.Relay.Carrier.Action,
+            new SidecarCancellationIdentity(
+                hostTarget.Binding.CancellationId,
+                "cross-target-host-cancellation",
+                cross.Relay.Carrier.Authority.Deadline),
+            cross.Relay.Carrier.Authority.Deadline,
+            hostContext!,
+            terminal);
+        var hostReceipt = new SidecarTerminalReceipt(
+            "cross-target-host-receipt",
+            descriptor.Key,
+            descriptor.Version,
+            cross.Relay.Carrier.Authority.TargetChildCall.CallId,
+            cross.Relay.Carrier.Authority.Attempt,
+            "cross-target-host-scope",
+            cross.Relay.Carrier.Action.ContentHash);
+        Assert.True(hostTarget.Session.RecordTerminal(
+            cross.Relay.Carrier.Authority.TargetChildCall.CallId,
+            terminal.TerminalId,
+            hostReceipt).Accepted);
+
+        var terminalRequest = CreateTerminalRequest(
+            hostTarget,
+            hostActionRequest,
+            new ActionPipelineSnapshot("target-snapshot", []),
+            hostReceipt) with
+        {
+            CrossSidecarPeerRelay = cross.Relay,
+            CrossSidecarActionRequest = new SidecarCrossSidecarActionEntryRequest(
+                descriptor.Key,
+                descriptor.Version,
+                cross.Relay.Carrier.Action,
+                cross.Relay.Carrier.Authority.Deadline,
+                cross.Now.AddMinutes(2)),
+        };
+        var terminalAuthority = terminalRequest.Authority with
+        {
+            RootPeerCall = cross.Relay.PeerCall,
+            CrossSidecarPeerRelayBindingHash =
+                SidecarCapabilityTransportValidation.ComputeCrossSidecarPeerRelayBindingHash(cross.Relay),
+        };
+        terminalAuthority = terminalAuthority with
+        {
+            CanonicalBindingHash =
+                SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(terminalAuthority),
+            Proof = string.Empty,
+        };
+        terminalAuthority = terminalAuthority with
+        {
+            Proof = terminalAuthority.CanonicalBindingHash,
+        };
+        terminalRequest = terminalRequest with { Authority = terminalAuthority };
+        terminalRequest = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportRequest>(
+            SidecarCapabilityTransportCodec.Serialize(terminalRequest));
+        Assert.NotNull(terminalRequest.Authority);
+        Assert.Equal(terminalRequest.TerminalId, terminalRequest.Authority.TerminalId);
+        Assert.Equal(cross.Relay.PeerCall, terminalRequest.Authority.RootPeerCall);
+        Assert.Equal(
+            SidecarCapabilityTransportValidation.ComputeCrossSidecarPeerRelayBindingHash(terminalRequest.CrossSidecarPeerRelay!),
+            terminalRequest.Authority.CrossSidecarPeerRelayBindingHash);
+        Assert.Equal(
+            SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(terminalRequest.Authority),
+            terminalRequest.Authority.CanonicalBindingHash);
+        Assert.Equal(terminalAuthority.CanonicalBindingHash, terminalRequest.Authority.CanonicalBindingHash);
+        Assert.Equal(terminalRequest.Authority.CanonicalBindingHash, terminalRequest.Authority.Proof);
+        Assert.Equal(
+            terminalRequest.Call,
+            terminalRequest.CrossSidecarPeerRelay!.Carrier.Authority.TargetChildCall);
+
+        var peerImport = targetPeer.Session.ImportCrossSidecarActionEntryPeerRelay(
+            terminalRequest,
+            peerImportTime,
+            (authority, hash) => authority.Proof == hash,
+            out var importedCarrier);
+        Assert.True(peerImport.Accepted, peerImport.Message);
+        Assert.NotNull(importedCarrier);
+        var peerBegin = targetPeer.Session.BeginCrossSidecarActionEntryCall(
+            importedCarrier!,
+            terminal,
+            importedCarrier!.Action.ByteLength,
+            peerActivation,
+            out _,
+            (authority, hash) => authority.Proof == hash);
+        Assert.True(peerBegin.Accepted, peerBegin.Message);
+        var peerReceipt = hostReceipt with
+        {
+            ReceiptId = "cross-target-peer-receipt",
+            CallId = cross.Relay.PeerCall!.CallId,
+            IdempotencyScope = "cross-target-peer-scope",
+        };
+        Assert.True(targetPeer.Session.RecordTerminal(
+            cross.Relay.PeerCall.CallId,
+            terminal.TerminalId,
+            peerReceipt).Accepted);
+
+        var storageCall = cross.Relay.PeerCall with
+        {
+            Capability = SidecarCapabilityKind.Storage,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "cross-target-storage-continuation",
+            Sequence = cross.Relay.PeerCall.Sequence + 1,
+        };
+        var storagePayload = Payload("cross-target-storage.request", new { value = 4 });
+        var storageRequest = SidecarStorageCapabilityRequest.Invoke(
+            storageCall,
+            hostTarget.Binding.ModuleId,
+            "cross-target-storage/get",
+            storagePayload,
+            PayloadType("cross-target-storage.result"),
+            new SidecarCancellationIdentity(
+                hostTarget.Binding.CancellationId,
+                "cross-target-storage-cancellation",
+                storageCall.Deadline),
+            storageCall.Deadline);
+        var issue = targetPeer.Session.IssueHostEntryStorageContinuation(
+            targetPeer.Session,
+            cross.Relay.PeerCall,
+            cross.Relay.PeerCall,
+            storageRequest,
+            continuationIssued,
+            (_, hash) => hash,
+            out var authority);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(authority);
+        var wireAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(authority));
+        var targetChildCall = cross.Relay.Carrier.Authority.TargetChildCall;
+        var wireRequest = storageRequest with { HostEntryContinuationAuthority = wireAuthority };
+        Assert.True(targetPeer.Session.ImportHostEntryStorageContinuationAuthority(
+            wireAuthority,
+            peerContinuationImport).Accepted);
+        var peerBlocked = targetPeer.Session.CompleteCall(cross.Relay.PeerCall!.CallId, 1);
+        Assert.False(peerBlocked.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, peerBlocked.Code);
+        Assert.True(targetPeer.Session.BeginStorageContinuationCall(
+            wireRequest,
+            storagePayload.ByteLength,
+            peerStorageBegin,
+            out _).Accepted);
+        Assert.True(hostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            wireAuthority,
+            hostImport).Accepted);
+        var hostBlocked = hostTarget.Session.CompleteCall(targetChildCall.CallId, 1);
+        Assert.False(hostBlocked.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, hostBlocked.Code);
+        Assert.True(hostTarget.Session.BeginStorageContinuationCall(
+            wireRequest,
+            storagePayload.ByteLength,
+            hostStorageBegin,
+            out _).Accepted);
+        Assert.True(hostTarget.Session.CompleteCall(storageCall.CallId, 0).Accepted);
+        Assert.False(targetPeer.Session.CompleteCall(cross.Relay.PeerCall.CallId, 1).Accepted);
+        Assert.True(targetPeer.Session.CompleteCall(storageCall.CallId, 0).Accepted);
+        Assert.True(targetPeer.Session.CompleteCall(cross.Relay.PeerCall.CallId, 1).Accepted);
+        Assert.True(hostTarget.Session.CompleteCall(targetChildCall.CallId, 1).Accepted);
+        Assert.False(targetPeer.Session.ImportHostEntryStorageContinuationAuthority(
+            wireAuthority,
+            peerStorageBegin).Accepted);
+        Assert.False(hostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            wireAuthority,
+            hostStorageBegin).Accepted);
+
+        Assert.True(targetPeer.Session.RevokeCrossSidecarActionEntry(
+            cross.Relay.Carrier.CarrierId,
+            hostStorageBegin).Accepted);
+        Assert.True(hostTarget.Session.RevokeCrossSidecarActionEntry(
+            cross.Relay.Carrier.CarrierId,
+            hostStorageBegin).Accepted);
+        Assert.False(hostTarget.Session.TryGetActiveHostActionEntryCarrier(
+            cross.Relay.Carrier.CarrierId,
+            out _));
+        Assert.False(targetPeer.Session.TryGetActiveHostActionEntryCarrier(
+            cross.Relay.Carrier.CarrierId,
+            out _));
+        var sourceRevocation = source.Session.RevokeCrossSidecarActionEntry(
+            cross.Relay.Carrier.CarrierId,
+            hostStorageBegin);
+        Assert.False(sourceRevocation.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Duplicate, sourceRevocation.Code);
+        Assert.True(source.Session.CompleteCall(cross.ParentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarStorageContinuationRejectsMissingHostTerminalBeforeImport()
+    {
+        var attempt = PrepareHostReceiptContinuationCase(
+            null,
+            null,
+            importPeerContinuation: false,
+            recordHostReceipt: false);
+
+        var import = attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime);
+        Assert.False(import.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, import.Code);
+
+        var begin = attempt.HostTarget.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _);
+        Assert.False(begin.Accepted);
+        Assert.True(attempt.HostTarget.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.HostImportTime).Accepted);
+        Assert.True(attempt.TargetPeer.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.PeerImportTime).Accepted);
+        Assert.True(attempt.Source.Session.CompleteCall(
+            attempt.SourceParentCall.CallId,
+            1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarStorageContinuationRejectsCompletedTargetBeforeImport()
+    {
+        var attempt = PrepareHostReceiptContinuationCase(null, null, importPeerContinuation: false);
+
+        Assert.True(attempt.HostTarget.Session.CompleteCall(
+            attempt.TargetChildCall.CallId,
+            attempt.TargetAttempt).Accepted);
+        var import = attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime);
+        Assert.False(import.Accepted);
+        var begin = attempt.HostTarget.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _);
+        Assert.False(begin.Accepted);
+        Assert.True(attempt.HostTarget.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.HostImportTime).Accepted);
+        Assert.True(attempt.TargetPeer.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.PeerImportTime).Accepted);
+        Assert.True(attempt.Source.Session.CompleteCall(
+            attempt.SourceParentCall.CallId,
+            1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarStorageContinuationRevocationBeforeBeginReleasesReservation()
+    {
+        var attempt = PrepareHostReceiptContinuationCase(null, null);
+        Assert.True(attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime).Accepted);
+
+        Assert.True(attempt.HostTarget.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.HostImportTime).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Duplicate,
+            attempt.HostTarget.Session.RevokeCrossSidecarActionEntry(
+                attempt.Authority.CarrierId,
+                attempt.HostImportTime).Code);
+        Assert.True(attempt.TargetPeer.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.PeerImportTime).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Duplicate,
+            attempt.TargetPeer.Session.CompleteCall(
+                attempt.Request.Call.CallId,
+                0).Code);
+        Assert.False(attempt.HostTarget.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _).Accepted);
+        Assert.False(attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime).Accepted);
+        Assert.False(attempt.TargetPeer.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.PeerImportTime).Accepted);
+        Assert.False(attempt.HostTarget.Session.CompleteCall(
+            attempt.TargetChildCall.CallId,
+            attempt.TargetAttempt).Accepted);
+        Assert.True(attempt.Source.Session.CompleteCall(
+            attempt.SourceParentCall.CallId,
+            1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarStorageContinuationRevocationAfterBeginAbortsStorage()
+    {
+        var attempt = PrepareHostReceiptContinuationCase(null, null);
+        Assert.True(attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime).Accepted);
+        Assert.True(attempt.HostTarget.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _).Accepted);
+
+        Assert.True(attempt.HostTarget.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.HostImportTime).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Duplicate,
+            attempt.HostTarget.Session.CompleteCall(
+                attempt.Request.Call.CallId,
+                0).Code);
+        Assert.True(attempt.TargetPeer.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.PeerImportTime).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Duplicate,
+            attempt.TargetPeer.Session.CompleteCall(
+                attempt.Request.Call.CallId,
+                0).Code);
+        Assert.False(attempt.HostTarget.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _).Accepted);
+        Assert.False(attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime).Accepted);
+        Assert.False(attempt.TargetPeer.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.PeerImportTime).Accepted);
+        Assert.False(attempt.HostTarget.Session.CompleteCall(
+            attempt.TargetChildCall.CallId,
+            attempt.TargetAttempt).Accepted);
+        Assert.True(attempt.Source.Session.CompleteCall(
+            attempt.SourceParentCall.CallId,
+            1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarStorageContinuationInvalidCompletionReleasesParent()
+    {
+        var attempt = PrepareHostReceiptContinuationCase(null, null);
+        Assert.True(attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime).Accepted);
+        Assert.True(attempt.HostTarget.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _).Accepted);
+
+        var completion = attempt.HostTarget.Session.CompleteCall(
+            attempt.Request.Call.CallId,
+            1);
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, completion.Code);
+        Assert.Equal(
+            "Storage calls cannot complete with a terminal callback.",
+            completion.Message);
+        Assert.False(attempt.HostTarget.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _).Accepted);
+        Assert.False(attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime).Accepted);
+        Assert.True(attempt.TargetPeer.Session.CompleteCall(
+            attempt.Request.Call.CallId,
+            0).Accepted);
+        Assert.True(attempt.TargetPeer.Session.CompleteCall(
+            attempt.Authority.ParentCall.CallId,
+            1).Accepted);
+        Assert.True(attempt.HostTarget.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.HostImportTime).Accepted);
+        Assert.True(attempt.TargetPeer.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.PeerImportTime).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+                attempt.Authority,
+                attempt.HostImportTime).Code);
+        Assert.False(attempt.HostTarget.Session.CompleteCall(
+            attempt.TargetChildCall.CallId,
+            attempt.TargetAttempt).Accepted);
+        Assert.True(attempt.Source.Session.CompleteCall(
+            attempt.SourceParentCall.CallId,
+            1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarStorageContinuationHostDisconnectDrainsPeerCleanup()
+    {
+        var attempt = PrepareHostReceiptContinuationCase(null, null);
+        Assert.True(attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime).Accepted);
+        Assert.True(attempt.HostTarget.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _).Accepted);
+
+        attempt.HostTarget.Session.Disconnect();
+        attempt.TargetPeer.Session.Disconnect();
+        Assert.False(attempt.HostTarget.Session.BeginStorageContinuationCall(
+                attempt.Request,
+                attempt.Request.RequestPayload!.ByteLength,
+                attempt.HostImportTime,
+                out _).Accepted);
+        Assert.False(attempt.TargetPeer.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.PeerImportTime,
+            out _).Accepted);
+        Assert.True(attempt.Source.Session.CompleteCall(
+            attempt.SourceParentCall.CallId,
+            1).Accepted);
+    }
+
+    [Fact]
+    public void CrossSidecarStorageContinuationRotationSucceedsAfterCleanup()
+    {
+        var attempt = PrepareHostReceiptContinuationCase(null, null);
+        Assert.True(attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime).Accepted);
+        Assert.True(attempt.HostTarget.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _).Accepted);
+
+        var activeRotation = CreateRotatedBinding(attempt.HostTarget, "lifecycle-active-rotation");
+        attempt.HostTarget.BindingHashes.Add(activeRotation.Authentication.BindingHash);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidBinding,
+            attempt.HostTarget.Session.RotateBinding(
+                activeRotation,
+                attempt.HostImportTime).Code);
+
+        Assert.True(attempt.HostTarget.Session.CompleteCall(
+            attempt.Request.Call.CallId,
+            0).Accepted);
+        Assert.True(attempt.TargetPeer.Session.CompleteCall(
+            attempt.Request.Call.CallId,
+            0).Accepted);
+        Assert.True(attempt.TargetPeer.Session.CompleteCall(
+            attempt.Authority.ParentCall.CallId,
+            1).Accepted);
+
+        Assert.True(attempt.HostTarget.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.HostImportTime).Accepted);
+        Assert.True(attempt.TargetPeer.Session.RevokeCrossSidecarActionEntry(
+            attempt.Authority.CarrierId,
+            attempt.HostImportTime).Accepted);
+        Assert.False(attempt.HostTarget.Session.CompleteCall(
+            attempt.TargetChildCall.CallId,
+            attempt.TargetAttempt).Accepted);
+        Assert.True(attempt.Source.Session.CompleteCall(
+            attempt.SourceParentCall.CallId,
+            1).Accepted);
+        var rotated = CreateRotatedBinding(attempt.HostTarget, "lifecycle-clean-rotation");
+        attempt.HostTarget.BindingHashes.Add(rotated.Authentication.BindingHash);
+        Assert.True(attempt.HostTarget.Session.RotateBinding(
+            rotated,
+            attempt.HostImportTime).Accepted);
+        Assert.False(attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.HostImportTime).Accepted);
+    }
+
+    [Theory]
+    [InlineData("key")]
+    [InlineData("version")]
+    [InlineData("attempt")]
+    [InlineData("content")]
+    public void CrossSidecarStorageContinuationRejectsMismatchedHostReceipt(string mutation)
+    {
+        static SidecarTerminalReceipt Mutate(
+            SidecarTerminalReceipt receipt,
+            string mutation) => mutation switch
+            {
+                "key" => receipt with { ActionKey = new SharpClawActionKey("wrong.receipt.key") },
+                "version" => receipt with { ActionVersion = receipt.ActionVersion + 1 },
+                "attempt" => receipt with { Attempt = receipt.Attempt + 1 },
+                "content" => receipt with { ContentHash = "wrong-receipt-content" },
+                _ => throw new ArgumentOutOfRangeException(nameof(mutation)),
+            };
+
+        var attempt = PrepareHostReceiptContinuationCase(
+            receipt => Mutate(receipt, mutation));
+        var wireAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(attempt.Authority));
+        var rejected = attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            wireAuthority,
+            attempt.HostImportTime);
+
+        Assert.False(rejected.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, rejected.Code);
+        var begin = attempt.HostTarget.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _);
+        Assert.False(begin.Accepted);
+        Assert.True(attempt.HostTarget.Session.CompleteCall(
+            attempt.TargetChildCall.CallId,
+            attempt.TargetAttempt).Accepted);
+    }
+
+    [Theory]
+    [InlineData("key")]
+    [InlineData("version")]
+    [InlineData("attempt")]
+    [InlineData("content")]
+    public void CrossSidecarStorageContinuationRejectsMismatchedPeerReceipt(string mutation)
+    {
+        static SidecarTerminalReceipt Mutate(
+            SidecarTerminalReceipt receipt,
+            string mutation) => mutation switch
+            {
+                "key" => receipt with { ActionKey = new SharpClawActionKey("wrong.peer.receipt.key") },
+                "version" => receipt with { ActionVersion = receipt.ActionVersion + 1 },
+                "attempt" => receipt with { Attempt = receipt.Attempt + 1 },
+                "content" => receipt with { ContentHash = "wrong-peer-receipt-content" },
+                _ => throw new ArgumentOutOfRangeException(nameof(mutation)),
+            };
+
+        var attempt = PrepareHostReceiptContinuationCase(
+            null,
+            receipt => Mutate(receipt, mutation),
+            importPeerContinuation: false);
+        var rejected = attempt.TargetPeer.Session.ImportHostEntryStorageContinuationAuthority(
+            attempt.Authority,
+            attempt.PeerImportTime);
+
+        Assert.False(rejected.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, rejected.Code);
+        var begin = attempt.TargetPeer.Session.BeginStorageContinuationCall(
+            attempt.Request,
+            attempt.Request.RequestPayload!.ByteLength,
+            attempt.PeerImportTime,
+            out _);
+        Assert.False(begin.Accepted);
+        Assert.True(attempt.TargetPeer.Session.CompleteCall(
+            attempt.Authority.ParentCall.CallId,
+            1).Accepted);
+    }
+
+    [Theory]
+    [InlineData("parent-call")]
+    [InlineData("carrier")]
+    [InlineData("carrier-capability")]
+    [InlineData("context-capability")]
+    [InlineData("root")]
+    [InlineData("target-generation")]
+    [InlineData("issuer-generation")]
+    [InlineData("issuer-session")]
+    [InlineData("proof")]
+    public void CrossSidecarStorageContinuationRejectsStructuralAuthorityMutation(string mutation)
+    {
+        var attempt = PrepareHostReceiptContinuationCase(
+            null,
+            null,
+            importPeerContinuation: false);
+        var mutated = mutation switch
+        {
+            "parent-call" => attempt.Authority with
+            {
+                ParentCall = attempt.Authority.ParentCall with { CallId = Guid.NewGuid() },
+            },
+            "carrier" => attempt.Authority with { CarrierId = Guid.NewGuid() },
+            "carrier-capability" => attempt.Authority with
+            {
+                CarrierAuthority = attempt.Authority.CarrierAuthority with { CapabilityId = Guid.NewGuid() },
+            },
+            "context-capability" => attempt.Authority with
+            {
+                ParentContext = attempt.Authority.ParentContext with { CapabilityId = Guid.NewGuid() },
+            },
+            "root" => attempt.Authority with { RootBudgetId = Guid.NewGuid() },
+            "target-generation" => attempt.Authority with
+            {
+                TargetBindingGeneration = attempt.Authority.TargetBindingGeneration + 1,
+            },
+            "issuer-generation" => attempt.Authority with
+            {
+                IssuerBindingGeneration = attempt.Authority.IssuerBindingGeneration + 1,
+            },
+            "issuer-session" => attempt.Authority with { IssuerSessionId = Guid.NewGuid() },
+            "proof" => attempt.Authority with { Proof = "forged-storage-proof" },
+            _ => throw new ArgumentOutOfRangeException(nameof(mutation)),
+        };
+        if (mutation is not "proof")
+        {
+            mutated = mutated with
+            {
+                CanonicalBindingHash =
+                    SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(mutated),
+                Proof = string.Empty,
+            };
+            mutated = mutated with { Proof = mutated.CanonicalBindingHash };
+        }
+        mutated = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(mutated));
+        var invalidRequest = attempt.Request with { HostEntryContinuationAuthority = mutated };
+        var rejected = attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            mutated,
+            attempt.HostImportTime);
+        Assert.False(rejected.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, rejected.Code);
+        Assert.False(attempt.HostTarget.Session.BeginStorageContinuationCall(
+            invalidRequest,
+            invalidRequest.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _).Accepted);
+
+        var validAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(attempt.Authority));
+        var validRequest = attempt.Request with { HostEntryContinuationAuthority = validAuthority };
+        var validPeerImport = attempt.TargetPeer.Session.ImportHostEntryStorageContinuationAuthority(
+            validAuthority,
+            attempt.PeerImportTime);
+        Assert.True(validPeerImport.Accepted, validPeerImport.Message);
+        Assert.True(attempt.TargetPeer.Session.BeginStorageContinuationCall(
+            validRequest,
+            validRequest.RequestPayload!.ByteLength,
+            attempt.PeerImportTime,
+            out _).Accepted);
+        var validHostImport = attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            validAuthority,
+            attempt.HostImportTime);
+        Assert.True(validHostImport.Accepted, validHostImport.Message);
+        Assert.True(attempt.HostTarget.Session.BeginStorageContinuationCall(
+            validRequest,
+            validRequest.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _).Accepted);
+        Assert.True(attempt.HostTarget.Session.CompleteCall(validRequest.Call.CallId, 0).Accepted);
+        Assert.True(attempt.TargetPeer.Session.CompleteCall(validRequest.Call.CallId, 0).Accepted);
+        Assert.True(attempt.TargetPeer.Session.CompleteCall(
+            attempt.Authority.ParentCall.CallId,
+            1).Accepted);
+        Assert.True(attempt.HostTarget.Session.CompleteCall(
+            attempt.TargetChildCall.CallId,
+            attempt.TargetAttempt).Accepted);
+    }
+
+    [Theory]
+    [InlineData("carrier-issued-before-relay", "sidecar_spoofed_identity")]
+    [InlineData("carrier-issued-after-continuation", "sidecar_spoofed_identity")]
+    [InlineData("carrier-expiry", "sidecar_spoofed_identity")]
+    [InlineData("continuation-issued-after-import", "sidecar_expired")]
+    [InlineData("continuation-expiry-after-storage", "sidecar_expired")]
+    [InlineData("storage-deadline-after-parent", "sidecar_expired")]
+    [InlineData("storage-deadline-after-context", "sidecar_expired")]
+    [InlineData("storage-sequence", "sidecar_concurrency_limit")]
+    [InlineData("storage-cancellation", "sidecar_spoofed_identity")]
+    [InlineData("cancellation-expiry-before-storage", "sidecar_expired")]
+    public void CrossSidecarStorageContinuationRejectsAuthorityDerivedRequestMutation(
+        string mutation,
+        string expectedCode)
+    {
+        var attempt = PrepareHostReceiptContinuationCase(
+            null,
+            null,
+            importPeerContinuation: false);
+        var mutated = mutation switch
+        {
+            "carrier-issued-before-relay" => attempt.Authority with
+            {
+                CarrierAuthority = attempt.Authority.CarrierAuthority with
+                {
+                    IssuedAt = attempt.SignedCarrierIssuedAt.AddSeconds(-1),
+                },
+            },
+            "carrier-issued-after-continuation" => attempt.Authority with
+            {
+                CarrierAuthority = attempt.Authority.CarrierAuthority with
+                {
+                    IssuedAt = attempt.ContinuationIssuedAt.AddSeconds(1),
+                },
+            },
+            "carrier-expiry" => attempt.Authority with
+            {
+                CarrierAuthority = attempt.Authority.CarrierAuthority with
+                {
+                    ExpiresAt = attempt.Authority.CarrierAuthority.ExpiresAt.AddSeconds(1),
+                },
+            },
+            "continuation-issued-after-import" => attempt.Authority with
+            {
+                IssuedAt = attempt.HostImportTime.AddSeconds(1),
+            },
+            "continuation-expiry-after-storage" => attempt.Authority with
+            {
+                ExpiresAt = attempt.Authority.StorageCall.Deadline.AddSeconds(1),
+            },
+            "storage-deadline-after-parent" => attempt.Authority with
+            {
+                StorageCall = attempt.Authority.StorageCall with
+                {
+                    Deadline = attempt.Authority.ParentCall.Deadline.AddSeconds(1),
+                },
+            },
+            "storage-deadline-after-context" => CreateAuthorityWithShorterParentContext(attempt),
+            "storage-sequence" => attempt.Authority with
+            {
+                StorageCall = attempt.Authority.StorageCall with
+                {
+                    Sequence = attempt.Authority.StorageCall.Sequence + 1,
+                },
+            },
+            "storage-cancellation" =>
+                CreateAuthorityWithStorageCancellationMutation(attempt),
+            "cancellation-expiry-before-storage" => attempt.Authority with
+            {
+                Cancellation = attempt.Authority.Cancellation with
+                {
+                    ExpiresAt = attempt.ContinuationIssuedAt.AddSeconds(1),
+                },
+            },
+            _ => throw new ArgumentOutOfRangeException(nameof(mutation)),
+        };
+        mutated = mutated with
+        {
+            CanonicalBindingHash =
+                SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(mutated),
+            Proof = string.Empty,
+        };
+        mutated = mutated with { Proof = mutated.CanonicalBindingHash };
+        mutated = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(mutated));
+
+        var invalidRequest = attempt.Request with { HostEntryContinuationAuthority = mutated };
+        var rejected = attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            mutated,
+            attempt.HostImportTime);
+        Assert.False(rejected.Accepted);
+        Assert.Equal(expectedCode, rejected.Code);
+        var begin = attempt.HostTarget.Session.BeginStorageContinuationCall(
+            invalidRequest,
+            invalidRequest.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _);
+        Assert.False(begin.Accepted);
+
+        var validAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(attempt.Authority));
+        var validRequest = attempt.Request with { HostEntryContinuationAuthority = validAuthority };
+        var validPeerImport = attempt.TargetPeer.Session.ImportHostEntryStorageContinuationAuthority(
+            validAuthority,
+            attempt.PeerImportTime);
+        Assert.True(validPeerImport.Accepted, validPeerImport.Message);
+        Assert.True(attempt.TargetPeer.Session.BeginStorageContinuationCall(
+            validRequest,
+            validRequest.RequestPayload!.ByteLength,
+            attempt.PeerImportTime,
+            out _).Accepted);
+        var validHostImport = attempt.HostTarget.Session.ImportHostEntryStorageContinuationAuthority(
+            validAuthority,
+            attempt.HostImportTime);
+        Assert.True(validHostImport.Accepted, validHostImport.Message);
+        Assert.True(attempt.HostTarget.Session.BeginStorageContinuationCall(
+            validRequest,
+            validRequest.RequestPayload!.ByteLength,
+            attempt.HostImportTime,
+            out _).Accepted);
+        Assert.True(attempt.TargetPeer.Session.CompleteCall(validRequest.Call.CallId, 0).Accepted);
+        Assert.True(attempt.HostTarget.Session.CompleteCall(validRequest.Call.CallId, 0).Accepted);
+        Assert.True(attempt.TargetPeer.Session.CompleteCall(
+            attempt.Authority.ParentCall.CallId,
+            1).Accepted);
+        Assert.True(attempt.HostTarget.Session.CompleteCall(
+            attempt.TargetChildCall.CallId,
+            attempt.TargetAttempt).Accepted);
+    }
+
+    private static SidecarHostEntryStorageContinuationAuthority CreateAuthorityWithStorageCancellationMutation(
+        HostReceiptContinuationCase attempt)
+    {
+        var cancellationId = Guid.NewGuid();
+        return attempt.Authority with
+        {
+            StorageCall = attempt.Authority.StorageCall with { CancellationId = cancellationId },
+            Cancellation = attempt.Authority.Cancellation with { CancellationId = cancellationId },
+        };
+    }
+
+    private static SidecarHostEntryStorageContinuationAuthority CreateAuthorityWithShorterParentContext(
+        HostReceiptContinuationCase attempt)
+    {
+        var contextDeadline = attempt.Authority.ParentCall.Deadline.AddSeconds(-2);
+        return attempt.Authority with
+        {
+            ParentContext = attempt.Authority.ParentContext with { Deadline = contextDeadline },
+            StorageCall = attempt.Authority.StorageCall with
+            {
+                Deadline = contextDeadline.AddSeconds(1),
+            },
+        };
+    }
+
+    [Fact]
     public void CrossSidecarReceivingRootReservationsRemainConsumedAfterCompletionAndRevoke()
     {
         var target = CreateFixture(
@@ -7884,6 +8743,216 @@ public sealed class SidecarCapabilityTransportTests
             parent.Action);
     }
 
+    private static HostReceiptContinuationCase PrepareHostReceiptContinuationCase(
+        Func<SidecarTerminalReceipt, SidecarTerminalReceipt>? mutateHostReceipt,
+        Func<SidecarTerminalReceipt, SidecarTerminalReceipt>? mutatePeerReceipt = null,
+        bool importPeerContinuation = true,
+        bool recordHostReceipt = true)
+    {
+        var source = CreateFixture(
+            moduleId: "source-module",
+            graphId: "source-graph");
+        var hostTarget = CreateFixture(
+            maxInFlight: 4,
+            maxCalls: 8,
+            moduleId: "target-module",
+            graphId: "target-graph",
+            authenticateHostTerminalAuthority: static (authority, hash) => authority.Proof == hash,
+            authenticateStorageContinuationAuthority: static (authority, hash) =>
+                authority.Proof == hash &&
+                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority));
+        var targetPeer = CreateMirroredFixture(
+            hostTarget,
+            static (authority, hash) => authority.Proof == hash,
+            static (authority, hash) =>
+                authority.Proof == hash &&
+                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority));
+        ConsumeStorageCalls(hostTarget, 7, "receipt-host-prior");
+        ConsumeStorageCalls(targetPeer, 7, "receipt-peer-prior");
+
+        var cross = CreateCrossRelay(source, hostTarget);
+        var hostActivation = cross.Now.AddSeconds(1);
+        var peerImportTime = cross.Now.AddSeconds(2);
+        var peerActivation = cross.Now.AddSeconds(3);
+        var continuationIssued = cross.Now.AddSeconds(4);
+        var peerContinuationImport = cross.Now.AddSeconds(5);
+        var peerStorageBegin = cross.Now.AddSeconds(6);
+        var hostImport = cross.Now.AddSeconds(7);
+        var descriptor = cross.Relay.Descriptor;
+        var terminal = new SidecarActionTerminalRegistration(
+            Guid.NewGuid(),
+            descriptor.InputTypeIdentity,
+            descriptor.InputSchemaVersion,
+            descriptor.ResultTypeIdentity,
+            descriptor.ResultSchemaVersion,
+            descriptor.DescriptorHash);
+        Assert.True(hostTarget.Session.BeginCrossSidecarActionEntryCall(
+            cross.Relay.Carrier,
+            terminal,
+            cross.Relay.Carrier.Action.ByteLength,
+            hostActivation,
+            out var hostContext,
+            static (authority, hash) => authority.Proof == hash).Accepted);
+        Assert.NotNull(hostContext);
+
+        var hostActionRequest = SidecarActionCapabilityRequest.HostEntry(
+            cross.Relay.Carrier.Authority.TargetChildCall,
+            descriptor,
+            cross.Relay.Carrier.Action,
+            new SidecarCancellationIdentity(
+                hostTarget.Binding.CancellationId,
+                "receipt-host-cancellation",
+                cross.Relay.Carrier.Authority.Deadline),
+            cross.Relay.Carrier.Authority.Deadline,
+            hostContext!,
+            terminal);
+        var hostReceipt = new SidecarTerminalReceipt(
+            "receipt-host",
+            descriptor.Key,
+            descriptor.Version,
+            cross.Relay.Carrier.Authority.TargetChildCall.CallId,
+            cross.Relay.Carrier.Authority.Attempt,
+            "receipt-host-scope",
+            cross.Relay.Carrier.Action.ContentHash);
+        var storedHostReceipt = mutateHostReceipt is null
+            ? hostReceipt
+            : mutateHostReceipt(hostReceipt);
+        if (recordHostReceipt)
+        {
+            Assert.True(hostTarget.Session.RecordTerminal(
+                cross.Relay.Carrier.Authority.TargetChildCall.CallId,
+                terminal.TerminalId,
+                storedHostReceipt).Accepted);
+        }
+
+        var terminalRequest = CreateTerminalRequest(
+            hostTarget,
+            hostActionRequest,
+            new ActionPipelineSnapshot("receipt-snapshot", []),
+            hostReceipt) with
+        {
+            CrossSidecarPeerRelay = cross.Relay,
+            CrossSidecarActionRequest = new SidecarCrossSidecarActionEntryRequest(
+                descriptor.Key,
+                descriptor.Version,
+                cross.Relay.Carrier.Action,
+                cross.Relay.Carrier.Authority.Deadline,
+                cross.Now.AddMinutes(2)),
+        };
+        terminalRequest = terminalRequest with
+        {
+            Authority = terminalRequest.Authority with
+            {
+                RootPeerCall = cross.Relay.PeerCall,
+                CrossSidecarPeerRelayBindingHash =
+                    SidecarCapabilityTransportValidation.ComputeCrossSidecarPeerRelayBindingHash(cross.Relay),
+            },
+        };
+        terminalRequest = terminalRequest with
+        {
+            Authority = terminalRequest.Authority with
+            {
+                CanonicalBindingHash =
+                    SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(terminalRequest.Authority),
+                Proof = string.Empty,
+            },
+        };
+        terminalRequest = terminalRequest with
+        {
+            Authority = terminalRequest.Authority with
+            {
+                Proof = terminalRequest.Authority.CanonicalBindingHash,
+            },
+        };
+        terminalRequest = SidecarCapabilityTransportCodec.Deserialize<SidecarActionTerminalTransportRequest>(
+            SidecarCapabilityTransportCodec.Serialize(terminalRequest));
+
+        var peerImport = targetPeer.Session.ImportCrossSidecarActionEntryPeerRelay(
+            terminalRequest,
+            peerImportTime,
+            static (authority, hash) => authority.Proof == hash,
+            out var importedCarrier);
+        Assert.True(peerImport.Accepted, peerImport.Message);
+        Assert.NotNull(importedCarrier);
+        Assert.True(targetPeer.Session.BeginCrossSidecarActionEntryCall(
+            importedCarrier!,
+            terminal,
+            importedCarrier!.Action.ByteLength,
+            peerActivation,
+            out _,
+            static (authority, hash) => authority.Proof == hash).Accepted);
+        var peerReceipt = new SidecarTerminalReceipt(
+            "receipt-peer",
+            descriptor.Key,
+            descriptor.Version,
+            cross.Relay.PeerCall!.CallId,
+            cross.Relay.Carrier.Authority.Attempt,
+            "receipt-peer-scope",
+            cross.Relay.Carrier.Action.ContentHash);
+        Assert.True(targetPeer.Session.RecordTerminal(
+            cross.Relay.PeerCall.CallId,
+            terminal.TerminalId,
+            mutatePeerReceipt is null ? peerReceipt : mutatePeerReceipt(peerReceipt)).Accepted);
+
+        var storageCall = cross.Relay.PeerCall with
+        {
+            Capability = SidecarCapabilityKind.Storage,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "receipt-storage-continuation",
+            Sequence = cross.Relay.PeerCall.Sequence + 1,
+        };
+        var storagePayload = Payload("receipt-storage.request", new { value = 4 });
+        var storageRequest = SidecarStorageCapabilityRequest.Invoke(
+            storageCall,
+            hostTarget.Binding.ModuleId,
+            "receipt-storage/get",
+            storagePayload,
+            PayloadType("receipt-storage.result"),
+            new SidecarCancellationIdentity(
+                hostTarget.Binding.CancellationId,
+                "receipt-storage-cancellation",
+                storageCall.Deadline),
+            storageCall.Deadline);
+        var issue = targetPeer.Session.IssueHostEntryStorageContinuation(
+            targetPeer.Session,
+            cross.Relay.PeerCall,
+            cross.Relay.PeerCall,
+            storageRequest,
+            continuationIssued,
+            static (_, hash) => hash,
+            out var authority);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(authority);
+        var wireAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
+            SidecarCapabilityTransportCodec.Serialize(authority));
+        var wireRequest = storageRequest with { HostEntryContinuationAuthority = wireAuthority };
+        if (importPeerContinuation)
+        {
+            Assert.True(targetPeer.Session.ImportHostEntryStorageContinuationAuthority(
+                wireAuthority,
+                peerContinuationImport).Accepted);
+            Assert.True(targetPeer.Session.BeginStorageContinuationCall(
+                wireRequest,
+                storagePayload.ByteLength,
+                peerStorageBegin,
+                out _).Accepted);
+        }
+
+        return new HostReceiptContinuationCase(
+            source,
+            cross.ParentCall,
+            hostTarget,
+            targetPeer,
+            wireRequest,
+            wireAuthority,
+            hostImport,
+            peerContinuationImport,
+            cross.Relay.Carrier.Authority.IssuedAt,
+            continuationIssued,
+            cross.Relay.Carrier.Authority.TargetChildCall,
+            cross.Relay.Carrier.Authority.Attempt);
+    }
+
     private static CrossRelayAttempt CreateCrossRelayAttempt(
         Fixture source,
         Fixture target,
@@ -8165,6 +9234,20 @@ public sealed class SidecarCapabilityTransportTests
         SidecarCapabilitySession TargetSession,
         SidecarCapabilitySessionBinding TargetBinding,
         DateTimeOffset Now);
+
+    private sealed record HostReceiptContinuationCase(
+        Fixture Source,
+        SidecarCapabilityCallIdentity SourceParentCall,
+        Fixture HostTarget,
+        Fixture TargetPeer,
+        SidecarStorageCapabilityRequest Request,
+        SidecarHostEntryStorageContinuationAuthority Authority,
+        DateTimeOffset HostImportTime,
+        DateTimeOffset PeerImportTime,
+        DateTimeOffset SignedCarrierIssuedAt,
+        DateTimeOffset ContinuationIssuedAt,
+        SidecarCapabilityCallIdentity TargetChildCall,
+        int TargetAttempt);
 
     private sealed class SessionHostActionEntryProxy(
         SidecarCapabilitySession session,
