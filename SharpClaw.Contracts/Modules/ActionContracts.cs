@@ -414,15 +414,24 @@ public sealed record HostEndpointRouteRequest(
             ? -1
             : CanonicalInvocationBytes(Invocation).Length;
 
-    public bool IsWellFormed(DateTimeOffset now) =>
-        Invocation is not null &&
-        Invocation.IsWellFormed(now) &&
-        Route is not null &&
-        Route.IsWellFormed &&
-        string.Equals(Route.HandlerIdentity, Invocation.Endpoint, StringComparison.Ordinal) &&
-        HostEndpointRouteAuthorityValidator.IsHeaderMetadataWellFormed(Headers) &&
-        HostEndpointRouteAuthorityValidator.IsQueryMetadataWellFormed(Query) &&
-        Body is not null;
+    public bool IsWellFormed(DateTimeOffset now)
+    {
+        try
+        {
+            return Invocation is not null &&
+                Invocation.IsWellFormed(now) &&
+                Route is not null &&
+                Route.IsWellFormed &&
+                string.Equals(Route.HandlerIdentity, Invocation.Endpoint, StringComparison.Ordinal) &&
+                HostEndpointRouteAuthorityValidator.IsHeaderMetadataWellFormed(Headers) &&
+                HostEndpointRouteAuthorityValidator.IsQueryMetadataWellFormed(Query) &&
+                Body is not null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     private static byte[] CanonicalInvocationBytes(HostEndpointInvocation invocation)
     {
@@ -654,12 +663,15 @@ public static class HostEndpointRouteAuthorityValidator
     }
 
     private static bool IsMetadataWithinLimits(
-        IReadOnlyDictionary<string, string[]> metadata) =>
+        IReadOnlyDictionary<string, string[]>? metadata) =>
+        metadata is not null &&
         metadata.Count <= 128 &&
         metadata.All(pair =>
+            pair.Key is not null &&
+            pair.Value is not null &&
             pair.Key.Length <= 256 &&
             pair.Value.Length <= 64 &&
-            pair.Value.All(value => value.Length <= 8192));
+            pair.Value.All(value => value is not null && value.Length <= 8192));
 
     private static bool SameRoute(
         HostEndpointRouteIdentity left,

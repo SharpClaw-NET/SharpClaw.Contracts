@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using SharpClaw.Contracts.Modules;
@@ -988,6 +989,1621 @@ public sealed class SidecarCapabilityTransportTests
         fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
         var rotation = fixture.Session.RotateBinding(rotated, fixture.Now);
         Assert.True(rotation.Accepted, rotation.Message);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_route_relay_imports_exact_invocation_and_allows_authenticated_nested_action(
+        HostEndpointTransport transport)
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var sourceContext = IssueContext(
+            source,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(source, sourceContext, transport);
+        var sourceCall = ActionCall(source, 1, "endpoint-relay-source");
+        var receivingCall = ActionCall(receiving, 1, "endpoint-relay-receiving");
+
+        var issued = source.Session.IssueHostEndpointRouteRelay(
+            request,
+            sourceCall,
+            receivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (relay, hash) => KeyedEndpointProof("relay", hash),
+            out var relay);
+        Assert.True(issued.Accepted, issued.Message);
+        Assert.NotNull(relay);
+        var wireRelay = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteRelay>(
+            SidecarCapabilityTransportCodec.Serialize(relay));
+
+        var imported = receiving.Session.ImportHostEndpointRouteRelay(
+            wireRelay,
+            receiving.Now,
+            out var receivingContext);
+        Assert.True(imported.Accepted, imported.Message);
+        Assert.NotNull(receivingContext);
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            receiving.Session.ImportHostEndpointRouteRelay(
+                wireRelay,
+                receiving.Now,
+                out _).Code);
+        Assert.False(
+            receiving.Session.BeginHostActionEntryCarrier(
+                receivingContext!,
+                receivingContext.Contribution is null
+                    ? throw new InvalidOperationException("The relay context has no contribution.")
+                    : new HostActionEntryCarrierIdentity(
+                        HostActionEntryIngress.Endpoint,
+                        receivingContext.InvocationId,
+                        receivingContext.Contribution.IngressBinding),
+                receiving.Now,
+                out _).Accepted);
+
+        var endpointPayload = EndpointInvocationPayload(
+            typeof(HostEndpointInvocation).AssemblyQualifiedName!,
+            wireRelay.Request.Invocation);
+        Assert.True(
+            receiving.Session.BeginCall(
+                receivingCall,
+                SidecarCapabilityKind.Action,
+                endpointPayload,
+                endpointPayload.ByteLength,
+                receiving.Now,
+                receivingContext).Accepted);
+
+        var childDescriptor = NestedDescriptor(
+            "endpoint.nested.action",
+            typeof(string).AssemblyQualifiedName!);
+        var childAction = Payload(childDescriptor.InputTypeIdentity, "nested-result");
+        var childCall = receivingCall with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "endpoint-relay-child",
+            Sequence = 2,
+        };
+        Assert.True(
+            receiving.Session.IssueNestedHostActionEntryCarrier(
+                receivingCall,
+                childCall,
+                childDescriptor,
+                childAction,
+                NestedContribution(childDescriptor),
+                receiving.Now,
+                out var childRelay).Accepted);
+        Assert.NotNull(childRelay);
+        Assert.True(
+            receiving.Session.BeginNestedHostActionEntryCall(
+                childRelay!,
+                childCall,
+                childAction,
+                childAction.ByteLength,
+                receiving.Now,
+                out _).Accepted);
+        Assert.True(receiving.Session.CompleteCall(childCall.CallId, 0).Accepted);
+        Assert.True(receiving.Session.TryGetActiveHostActionEntryCarrier(
+            receivingContext!.CapabilityId,
+            out var receivingCarrier));
+        Assert.True(receiving.Session.CompleteCall(receivingCall.CallId, 0).Accepted);
+        Assert.True(
+            receiving.Session.CompleteHostActionEntryCarrier(
+                receivingCarrier!,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                receiving.Now).Accepted);
+        Assert.True(source.Session.CompleteHostEndpointRouteRelay(relay!, source.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            source.Session.CompleteHostEndpointRouteRelay(relay!, source.Now).Code);
+        Assert.Equal(0, source.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
+        var rotated = CreateRotatedBinding(receiving, "endpoint-relay-rotation");
+        receiving.BindingHashes.Add(rotated.Authentication.BindingHash);
+        var rotation = receiving.Session.RotateBinding(rotated, receiving.Now);
+        Assert.True(rotation.Accepted, rotation.Message);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_round_trip_preserves_roles_and_features()
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var features = new ExtensionFeatureSet([
+            new ExtensionFeature(
+                "endpoint.test",
+                1,
+                "module-a",
+                128,
+                JsonDocument.Parse("{\"mode\":\"wire\"}").RootElement.Clone()),
+        ]);
+        var inputs = CreateEndpointRelayInputs(
+            source,
+            receiving,
+            "codec",
+            new RequestPrincipal(
+                "endpoint-user",
+                Roles: new HashSet<string>(["reader", "writer"], StringComparer.Ordinal)),
+            features);
+        var issue = source.Session.IssueHostEndpointRouteRelay(
+            inputs.Request,
+            inputs.SourceCall,
+            inputs.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (relay, hash) => KeyedEndpointProof("relay", hash),
+            out var relay);
+
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(relay);
+        var wireRelay = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteRelay>(
+            SidecarCapabilityTransportCodec.Serialize(relay));
+        var imported = receiving.Session.ImportHostEndpointRouteRelay(
+            wireRelay,
+            receiving.Now,
+            out var context);
+
+        Assert.True(imported.Accepted, imported.Message);
+        Assert.NotNull(context);
+        Assert.Equal(inputs.Request.Invocation.HostActionContext.Caller.SubjectId, context!.Caller.SubjectId);
+        Assert.True(context.Caller.Roles!.SetEquals(["reader", "writer"]));
+        Assert.Equal(
+            SidecarCapabilityTransportCodec.Serialize(inputs.Request.Invocation.HostActionContext.Features),
+            SidecarCapabilityTransportCodec.Serialize(context.Features));
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_import_detaches_input_and_returned_context()
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var features = new ExtensionFeatureSet([
+            new ExtensionFeature(
+                "endpoint.test",
+                1,
+                "module-a",
+                128,
+                JsonDocument.Parse("{\"mode\":\"owned\"}").RootElement.Clone()),
+        ]);
+        var inputs = CreateEndpointRelayInputs(
+            source,
+            receiving,
+            "detached-import",
+            new RequestPrincipal(
+                "endpoint-user",
+                Roles: new HashSet<string>(["reader"], StringComparer.Ordinal)),
+            features);
+        var issue = source.Session.IssueHostEndpointRouteRelay(
+            inputs.Request,
+            inputs.SourceCall,
+            inputs.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (relay, hash) => KeyedEndpointProof("relay", hash),
+            out var relay);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(relay);
+
+        var wireRelay = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteRelay>(
+            SidecarCapabilityTransportCodec.Serialize(relay));
+        var pristineRelay = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteRelay>(
+            SidecarCapabilityTransportCodec.Serialize(wireRelay));
+        var pristineContext = SidecarCapabilityTransportCodec.Deserialize<HostActionEntryRequestContext>(
+            SidecarCapabilityTransportCodec.Serialize(wireRelay.ReceivingContext));
+        var imported = receiving.Session.ImportHostEndpointRouteRelay(
+            wireRelay,
+            receiving.Now,
+            out var returnedContext);
+        Assert.True(imported.Accepted, imported.Message);
+        Assert.NotNull(returnedContext);
+
+        var sequence = receiving.Session.LastSequence;
+        var contexts = receiving.Session.IssuedHostActionEntryContextCount;
+        var carriers = receiving.Session.ActiveHostActionEntryCarrierCount;
+        ((ISet<string>)wireRelay.ReceivingContext.Caller.Roles!).Add("mutated-input-role");
+        ((IList<ExtensionFeature>)wireRelay.ReceivingContext.Features.Items).Add(
+            new ExtensionFeature(
+                "mutated.input.feature",
+                1,
+                "module-a",
+                1,
+                JsonDocument.Parse("{}").RootElement.Clone()));
+        ((ISet<string>)returnedContext!.Caller.Roles!).Add("mutated-returned-role");
+        ((IList<ExtensionFeature>)returnedContext.Features.Items).Add(
+            new ExtensionFeature(
+                "mutated.returned.feature",
+                1,
+                "module-a",
+                1,
+                JsonDocument.Parse("{}").RootElement.Clone()));
+        wireRelay.Request.Headers["x-request"][0] = "mutated-input-header";
+        wireRelay.Request.Query["tag"][0] = "mutated-input-query";
+        wireRelay.Request.Body[0] = 99;
+
+        var endpointPayload = EndpointInvocationPayload(
+            typeof(HostEndpointInvocation).AssemblyQualifiedName!,
+            wireRelay.Request.Invocation);
+        var rejected = receiving.Session.BeginCall(
+            wireRelay.ReceivingParentCall,
+            SidecarCapabilityKind.Action,
+            endpointPayload,
+            endpointPayload.ByteLength,
+            receiving.Now,
+            returnedContext);
+        Assert.False(rejected.Accepted, rejected.Message);
+        Assert.Equal(sequence, receiving.Session.LastSequence);
+        Assert.Equal(contexts, receiving.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(carriers, receiving.Session.ActiveHostActionEntryCarrierCount);
+
+        Assert.True(
+            receiving.Session.BeginCall(
+                wireRelay.ReceivingParentCall,
+                SidecarCapabilityKind.Action,
+                endpointPayload,
+                endpointPayload.ByteLength,
+                receiving.Now,
+                pristineContext).Accepted);
+        Assert.True(receiving.Session.CompleteCall(wireRelay.ReceivingParentCall.CallId, 0).Accepted);
+        Assert.True(receiving.Session.TryGetActiveHostActionEntryCarrier(
+            wireRelay.ReceivingContext.CapabilityId,
+            out var carrier));
+        Assert.True(
+            receiving.Session.CompleteHostActionEntryCarrier(
+                carrier!,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                receiving.Now).Accepted);
+        Assert.True(source.Session.CompleteHostEndpointRouteRelay(pristineRelay, source.Now).Accepted);
+        var rotated = CreateRotatedBinding(receiving, "detached-import-rotation");
+        receiving.BindingHashes.Add(rotated.Authentication.BindingHash);
+        Assert.True(receiving.Session.RotateBinding(rotated, receiving.Now).Accepted);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_collision_ignores_remote_session_call_identity()
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(
+            moduleId: "module-source",
+            graphId: "graph-source");
+        var remote = CreateFixture(
+            moduleId: "module-remote",
+            graphId: "graph-remote",
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var receiving = CreateFixture(
+            moduleId: "module-receiving",
+            graphId: "graph-receiving",
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var remoteInputs = CreateEndpointRelayInputs(receiving, remote, "remote") with
+        {
+            ReceivingCall = CreateEndpointRelayInputs(receiving, remote, "remote-call").ReceivingCall with
+            {
+                ReplayNonce = "shared-peer-and-local-nonce",
+            },
+        };
+        var remoteIssue = receiving.Session.IssueHostEndpointRouteRelay(
+            remoteInputs.Request,
+            remoteInputs.SourceCall,
+            remoteInputs.ReceivingCall,
+            remote.Session,
+            receiving.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (relay, hash) => KeyedEndpointProof("relay", hash),
+            out var remoteRelay);
+        Assert.True(remoteIssue.Accepted, remoteIssue.Message);
+        Assert.NotNull(remoteRelay);
+
+        var localInputs = CreateEndpointRelayInputs(source, receiving, "local");
+        localInputs = localInputs with
+        {
+            ReceivingCall = localInputs.ReceivingCall with
+            {
+                ReplayNonce = "shared-peer-and-local-nonce",
+            },
+        };
+        var localIssue = source.Session.IssueHostEndpointRouteRelay(
+            localInputs.Request,
+            localInputs.SourceCall,
+            localInputs.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (relay, hash) => KeyedEndpointProof("relay", hash),
+            out var localRelay);
+        Assert.True(localIssue.Accepted, localIssue.Message);
+        Assert.NotNull(localRelay);
+
+        var imported = receiving.Session.ImportHostEndpointRouteRelay(
+            SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteRelay>(
+                SidecarCapabilityTransportCodec.Serialize(localRelay)),
+            receiving.Now,
+            out _);
+
+        Assert.True(imported.Accepted, imported.Message);
+    }
+
+    [Theory]
+    [InlineData("roles")]
+    [InlineData("features")]
+    [InlineData("headers")]
+    [InlineData("query")]
+    public void Endpoint_route_authority_signer_cannot_mutate_shared_input(string mutation)
+    {
+        var fixture = CreateFixture();
+        var features = new ExtensionFeatureSet([
+            new ExtensionFeature(
+                "endpoint.test",
+                1,
+                "module-a",
+                128,
+                JsonDocument.Parse("{\"mode\":\"sign\"}").RootElement.Clone()),
+        ]);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal(
+                "endpoint-user",
+                Roles: new HashSet<string>(["reader"], StringComparer.Ordinal)),
+            HostActionEntryIngress.Endpoint,
+            features: features);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var call = ActionCall(fixture, 1, "detached-route-signer");
+
+        var rejected = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            call,
+            fixture.Now,
+            authority =>
+            {
+                switch (mutation)
+                {
+                    case "roles":
+                        ((ISet<string>)authority.HostActionContext.Caller.Roles!).Add("mutated");
+                        break;
+                    case "features":
+                        ((IList<ExtensionFeature>)authority.HostActionContext.Features.Items)
+                            .Add(new ExtensionFeature(
+                                "mutated.feature",
+                                1,
+                                "module-a",
+                                1,
+                                JsonDocument.Parse("{}").RootElement.Clone()));
+                        break;
+                    case "headers":
+                        authority.Headers["x-request"][0] = "mutated";
+                        break;
+                    case "query":
+                        authority.Query["tag"][0] = "mutated";
+                        break;
+                }
+
+                return HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority);
+            },
+            out var rejectedAuthority);
+
+        Assert.False(rejected.Accepted, rejected.Message);
+        Assert.Null(rejectedAuthority);
+        var retry = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            call,
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out var authority);
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.NotNull(authority);
+    }
+
+    [Theory]
+    [InlineData("roles")]
+    [InlineData("features")]
+    [InlineData("headers")]
+    [InlineData("query")]
+    [InlineData("body")]
+    public void Endpoint_route_relay_signer_cannot_mutate_shared_input(string mutation)
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture();
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var features = new ExtensionFeatureSet([
+            new ExtensionFeature(
+                "endpoint.test",
+                1,
+                "module-a",
+                128,
+                JsonDocument.Parse("{\"mode\":\"relay\"}").RootElement.Clone()),
+        ]);
+        var inputs = CreateEndpointRelayInputs(
+            source,
+            receiving,
+            "detached-relay-signer",
+            new RequestPrincipal(
+                "endpoint-user",
+                Roles: new HashSet<string>(["reader"], StringComparer.Ordinal)),
+            features);
+        var rejected = source.Session.IssueHostEndpointRouteRelay(
+            inputs.Request,
+            inputs.SourceCall,
+            inputs.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (relay, hash) =>
+            {
+                switch (mutation)
+                {
+                    case "roles":
+                        ((ISet<string>)relay.Request.Invocation.HostActionContext.Caller.Roles!).Add("mutated");
+                        break;
+                    case "features":
+                        ((IList<ExtensionFeature>)relay.Request.Invocation.HostActionContext.Features.Items)
+                            .Add(new ExtensionFeature(
+                                "mutated.feature",
+                                1,
+                                "module-a",
+                                1,
+                                JsonDocument.Parse("{}").RootElement.Clone()));
+                        break;
+                    case "headers":
+                        relay.Request.Headers["x-request"][0] = "mutated";
+                        break;
+                    case "query":
+                        relay.Request.Query["tag"][0] = "mutated";
+                        break;
+                    case "body":
+                        relay.Request.Body[0] = 99;
+                        break;
+                }
+
+                return KeyedEndpointProof("relay", hash);
+            },
+            out var rejectedRelay);
+
+        Assert.False(rejected.Accepted, rejected.Message);
+        Assert.Null(rejectedRelay);
+        var retry = source.Session.IssueHostEndpointRouteRelay(
+            inputs.Request,
+            inputs.SourceCall,
+            inputs.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (relay, hash) => KeyedEndpointProof("relay", hash),
+            out var relay);
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.NotNull(relay);
+    }
+
+    [Theory]
+    [InlineData("invocation")]
+    [InlineData("route")]
+    [InlineData("headers")]
+    [InlineData("query")]
+    [InlineData("metadata-array")]
+    [InlineData("metadata-value")]
+    [InlineData("body")]
+    public void Endpoint_route_relay_malformed_input_rejects_without_throw(string mutation)
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var issueSource = CreateFixture();
+        var issueReceiving = CreateMirroredFixture(
+            issueSource,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var issueInputs = CreateEndpointRelayInputs(issueSource, issueReceiving, $"malformed-issue-{mutation}");
+        var malformedIssueRequest = MalformedEndpointRouteRequest(issueInputs.Request, mutation);
+        SidecarHostEndpointRouteRelay? issueRelay = null;
+        var issueException = Record.Exception(() =>
+        {
+            var result = issueSource.Session.IssueHostEndpointRouteRelay(
+                malformedIssueRequest,
+                issueInputs.SourceCall,
+                issueInputs.ReceivingCall,
+                issueReceiving.Session,
+                issueSource.Now,
+                authority => KeyedEndpointProof(
+                    "route",
+                    HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+                (relay, hash) => KeyedEndpointProof("relay", hash),
+                out issueRelay);
+            Assert.False(result.Accepted, result.Message);
+        });
+        Assert.Null(issueException);
+        Assert.Null(issueRelay);
+
+        var source = CreateFixture();
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var valid = CreateEndpointRelay(source, receiving, $"malformed-import-{mutation}");
+        var malformedRelay = valid.Relay with
+        {
+            Request = MalformedEndpointRouteRequest(valid.Relay.Request, mutation),
+        };
+        var sequence = receiving.Session.LastSequence;
+        var carriers = receiving.Session.ActiveHostActionEntryCarrierCount;
+        SidecarCapabilityValidationResult? importResult = null;
+        var importException = Record.Exception(() =>
+            importResult = receiving.Session.ImportHostEndpointRouteRelay(
+                SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteRelay>(
+                    SidecarCapabilityTransportCodec.Serialize(malformedRelay)),
+                receiving.Now,
+                out _));
+        Assert.Null(importException);
+        Assert.NotNull(importResult);
+        Assert.False(importResult!.Accepted, importResult.Message);
+        Assert.Equal(sequence, receiving.Session.LastSequence);
+        Assert.Equal(carriers, receiving.Session.ActiveHostActionEntryCarrierCount);
+    }
+
+    [Theory]
+    [InlineData("handler")]
+    [InlineData("path")]
+    [InlineData("method")]
+    [InlineData("transport")]
+    [InlineData("headers")]
+    [InlineData("query")]
+    [InlineData("body")]
+    [InlineData("proof")]
+    [InlineData("call")]
+    [InlineData("session")]
+    [InlineData("generation")]
+    [InlineData("deadline")]
+    [InlineData("cancellation")]
+    public void Endpoint_route_relay_mutations_reject_before_receiving_reservation(string mutation)
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var context = IssueContext(
+            source,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(source, context, HostEndpointTransport.Http);
+        var sourceCall = ActionCall(source, 1, $"relay-mutation-source-{mutation}");
+        var receivingCall = ActionCall(receiving, 1, $"relay-mutation-receiving-{mutation}");
+        Assert.True(source.Session.IssueHostEndpointRouteRelay(
+            request,
+            sourceCall,
+            receivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (relay, hash) => KeyedEndpointProof("relay", hash),
+            out var relay).Accepted);
+        var original = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteRelay>(
+            SidecarCapabilityTransportCodec.Serialize(relay));
+        var mutated = original;
+        switch (mutation)
+        {
+            case "handler":
+                mutated = original with { Request = original.Request with { Route = original.Request.Route with { HandlerIdentity = "/other" } } };
+                break;
+            case "path":
+                mutated = original with { Request = original.Request with { Route = original.Request.Route with { Path = "/other" } } };
+                break;
+            case "method":
+                mutated = original with { Request = original.Request with { Route = original.Request.Route with { Method = "PATCH" } } };
+                break;
+            case "transport":
+                mutated = original with { Request = original.Request with { Route = original.Request.Route with { Transport = HostEndpointTransport.WebSocket } } };
+                break;
+            case "headers":
+                mutated = original with { Request = original.Request with { Headers = new Dictionary<string, string[]>(original.Request.Headers) { ["x-request"] = ["changed"] } } };
+                break;
+            case "query":
+                mutated = original with { Request = original.Request with { Query = new Dictionary<string, string[]>(original.Request.Query) { ["tag"] = ["changed"] } } };
+                break;
+            case "body":
+                mutated = original with { Request = original.Request with { Body = [9, 8, 7] } };
+                break;
+            case "proof":
+                mutated = original with { Proof = "forged" };
+                break;
+            case "call":
+                mutated = original with { Authority = original.Authority with { Call = original.Authority.Call with { CallId = Guid.NewGuid() } } };
+                break;
+            case "session":
+                mutated = original with { ReceivingParentCall = original.ReceivingParentCall with { SessionId = Guid.NewGuid() } };
+                break;
+            case "generation":
+                mutated = original with { ReceivingBindingGeneration = original.ReceivingBindingGeneration + 1 };
+                break;
+            case "deadline":
+                mutated = original with { ReceivingParentCall = original.ReceivingParentCall with { Deadline = original.ReceivingParentCall.Deadline.AddSeconds(-1) } };
+                break;
+            case "cancellation":
+                mutated = original with { ReceivingParentCall = original.ReceivingParentCall with { CancellationId = Guid.NewGuid() } };
+                break;
+        }
+
+        var rejected = receiving.Session.ImportHostEndpointRouteRelay(
+            mutated,
+            receiving.Now,
+            out _);
+        Assert.False(rejected.Accepted, rejected.Message);
+        Assert.Equal(
+            mutation == "proof"
+                ? SidecarCapabilityErrors.Unauthenticated
+                : SidecarCapabilityErrors.SpoofedIdentity,
+            rejected.Code);
+        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
+
+        var accepted = receiving.Session.ImportHostEndpointRouteRelay(
+            original,
+            receiving.Now,
+            out _);
+        Assert.True(accepted.Accepted, accepted.Message);
+    }
+
+    [Theory]
+    [InlineData("caller")]
+    [InlineData("roles")]
+    [InlineData("features")]
+    [InlineData("trace")]
+    [InlineData("idempotency")]
+    [InlineData("parent")]
+    [InlineData("depth")]
+    [InlineData("attempt")]
+    [InlineData("endpoint")]
+    [InlineData("action")]
+    [InlineData("version")]
+    [InlineData("descriptor")]
+    [InlineData("input-type")]
+    [InlineData("input-schema")]
+    public void Endpoint_route_relay_context_transformations_reject_before_reservation(string mutation)
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var original = CreateEndpointRelay(source, receiving, $"context-{mutation}").Relay;
+        var context = original.ReceivingContext;
+        var changed = context;
+        switch (mutation)
+        {
+            case "caller":
+                changed = context with { Caller = new RequestPrincipal("other-caller") };
+                break;
+            case "roles":
+                changed = context with
+                {
+                    Caller = context.Caller with { Roles = new HashSet<string>(["other-role"]) },
+                };
+                break;
+            case "features":
+                changed = context with
+                {
+                    Features = new ExtensionFeatureSet([
+                        new ExtensionFeature("other.feature", 1, "module-a", 1, JsonDocument.Parse("{}").RootElement.Clone()),
+                    ]),
+                };
+                break;
+            case "trace":
+                changed = context with { TraceId = Guid.NewGuid() };
+                break;
+            case "idempotency":
+                changed = context with { IdempotencyKey = Guid.NewGuid() };
+                break;
+            case "parent":
+                changed = context with { ParentInvocationId = Guid.NewGuid() };
+                break;
+            case "depth":
+                changed = context with { Depth = context.Depth + 1 };
+                break;
+            case "attempt":
+                changed = context with { Attempt = context.Attempt + 1 };
+                break;
+            case "endpoint":
+                changed = context with
+                {
+                    Contribution = context.Contribution! with
+                    {
+                        IngressBinding = context.Contribution.IngressBinding with { PrimaryIdentity = "/other" },
+                    },
+                };
+                break;
+            case "action":
+                changed = context with
+                {
+                    Contribution = context.Contribution! with
+                    {
+                        Lineage = context.Contribution.Lineage with { ActionKey = new SharpClawActionKey("other.action") },
+                    },
+                };
+                break;
+            case "version":
+                changed = context with
+                {
+                    Contribution = context.Contribution! with
+                    {
+                        Lineage = context.Contribution.Lineage with { ActionVersion = context.Contribution.Lineage.ActionVersion + 1 },
+                    },
+                };
+                break;
+            case "descriptor":
+                changed = context with
+                {
+                    Contribution = context.Contribution! with
+                    {
+                        Lineage = context.Contribution.Lineage with { DescriptorHash = "other-descriptor" },
+                    },
+                };
+                break;
+            case "input-type":
+                changed = context with
+                {
+                    Contribution = context.Contribution! with
+                    {
+                        Lineage = context.Contribution.Lineage with { InputTypeIdentity = "other.input" },
+                    },
+                };
+                break;
+            case "input-schema":
+                changed = context with
+                {
+                    Contribution = context.Contribution! with
+                    {
+                        Lineage = context.Contribution.Lineage with
+                        {
+                            InputSchemaVersion = context.Contribution.Lineage.InputSchemaVersion + 1,
+                            InputSchemaHash = "other-schema",
+                        },
+                    },
+                };
+                break;
+        }
+
+        var mutated = ResignEndpointRelay(original with { ReceivingContext = changed });
+        var rejected = receiving.Session.ImportHostEndpointRouteRelay(mutated, receiving.Now, out _);
+
+        Assert.False(rejected.Accepted, rejected.Message);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, rejected.Code);
+        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
+        Assert.True(receiving.Session.ImportHostEndpointRouteRelay(original, receiving.Now, out _).Accepted);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_rejects_public_route_hash_without_authenticated_proof()
+    {
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: (authority, hash) =>
+                authority.Proof == KeyedEndpointProof("route", hash),
+            authenticateEndpointRouteRelay: (relay, hash) =>
+                relay.Proof == KeyedEndpointProof("relay", hash));
+        var fixture = CreateEndpointRelay(source, receiving, "public-route-hash");
+        var unsignedAuthority = fixture.Relay.Authority with
+        {
+            Proof = fixture.Relay.Authority.CanonicalBindingHash,
+        };
+        var unsignedRelay = fixture.Relay with { Authority = unsignedAuthority };
+        var relayHash = SidecarCapabilityTransportValidation.ComputeEndpointRouteRelayBindingHash(unsignedRelay);
+        var forgedRelay = unsignedRelay with
+        {
+            CanonicalBindingHash = relayHash,
+            Proof = KeyedEndpointProof("relay", relayHash),
+        };
+
+        var result = receiving.Session.ImportHostEndpointRouteRelay(forgedRelay, receiving.Now, out _);
+
+        Assert.False(result.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Unauthenticated, result.Code);
+        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
+        Assert.True(receiving.Session.ImportHostEndpointRouteRelay(
+            fixture.Relay,
+            receiving.Now,
+            out _).Accepted);
+    }
+
+    [Theory]
+    [InlineData("grant")]
+    [InlineData("inflight")]
+    [InlineData("calls")]
+    [InlineData("payload")]
+    [InlineData("protocol")]
+    public void Endpoint_route_relay_applies_receiving_admission_before_state_change(string limit)
+    {
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var issuer = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: (authority, hash) =>
+                authority.Proof == KeyedEndpointProof("route", hash),
+            authenticateEndpointRouteRelay: (relay, hash) =>
+                relay.Proof == KeyedEndpointProof("relay", hash),
+            actionInputBytes: 4096,
+            protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            issuer,
+            authenticateEndpointRouteAuthority: (authority, hash) =>
+                authority.Proof == KeyedEndpointProof("route", hash),
+            authenticateEndpointRouteRelay: (relay, hash) =>
+                relay.Proof == KeyedEndpointProof("relay", hash),
+            capabilities: limit == "grant" ? [SidecarCapabilityKind.Storage] : null,
+            maxInFlight: limit == "inflight" ? 1 : null,
+            maxCalls: limit == "calls" ? 1 : null,
+            actionInputBytes: limit == "payload" ? 1 : null,
+            protocolMessageBytes: limit == "payload" ? 4096 : limit == "protocol" ? 1 : null);
+
+        if (limit is "inflight" or "calls")
+        {
+            var priorCall = receiving.Call with
+            {
+                Capability = SidecarCapabilityKind.Storage,
+                CallId = Guid.NewGuid(),
+                ReplayNonce = $"relay-admission-prior-{limit}",
+                Sequence = 1,
+            };
+            var priorPayload = Payload("storage.request", "prior");
+            Assert.True(receiving.Session.BeginCall(
+                priorCall,
+                SidecarCapabilityKind.Storage,
+                priorPayload,
+                priorPayload.ByteLength,
+                receiving.Now).Accepted);
+            if (limit == "calls")
+                Assert.True(receiving.Session.CompleteCall(priorCall.CallId, 0).Accepted);
+        }
+
+        var fixture = CreateEndpointRelay(source, issuer, $"limit-{limit}");
+        var lastSequence = receiving.Session.LastSequence;
+        var carriers = receiving.Session.ActiveHostActionEntryCarrierCount;
+        var result = receiving.Session.ImportHostEndpointRouteRelay(
+            fixture.Relay,
+            receiving.Now,
+            out _);
+
+        Assert.False(result.Accepted);
+        Assert.Equal(
+            limit == "grant"
+                ? SidecarCapabilityErrors.Unauthorized
+                : limit is "payload" or "protocol"
+                    ? SidecarCapabilityErrors.PayloadTooLarge
+                    : SidecarCapabilityErrors.ConcurrencyLimit,
+            result.Code);
+        Assert.Equal(lastSequence, receiving.Session.LastSequence);
+        Assert.Equal(carriers, receiving.Session.ActiveHostActionEntryCarrierCount);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_import_catches_verifier_failure_without_state_change()
+    {
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: (authority, hash) =>
+                authority.Proof == KeyedEndpointProof("route", hash),
+            authenticateEndpointRouteRelay: (_, _) => throw new InvalidOperationException("test verifier failure"));
+        var fixture = CreateEndpointRelay(source, receiving, "verifier-failure");
+
+        var result = receiving.Session.ImportHostEndpointRouteRelay(fixture.Relay, receiving.Now, out _);
+
+        Assert.False(result.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Unauthenticated, result.Code);
+        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_issue_cleans_source_authority_when_relay_signer_fails()
+    {
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(source);
+        var fixture = CreateEndpointRelayInputs(source, receiving, "signer-failure");
+
+        var failed = source.Session.IssueHostEndpointRouteRelay(
+            fixture.Request,
+            fixture.SourceCall,
+            fixture.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (_, _) => throw new InvalidOperationException("test signer failure"),
+            out _);
+
+        Assert.False(failed.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Unauthenticated, failed.Code);
+
+        var retry = source.Session.IssueHostEndpointRouteRelay(
+            fixture.Request,
+            fixture.SourceCall,
+            fixture.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (_, hash) => KeyedEndpointProof("relay", hash),
+            out var relay);
+
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.NotNull(relay);
+    }
+
+    [Fact]
+    public void Endpoint_route_authority_signer_disconnect_does_not_store_authority()
+    {
+        var fixture = CreateFixture(
+            authenticateEndpointRouteAuthority: (authority, hash) =>
+                authority.Proof == HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority));
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var call = ActionCall(fixture, 1, "route-signer-disconnect");
+
+        var result = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            call,
+            fixture.Now,
+            authority =>
+            {
+                fixture.Session.Disconnect();
+                return HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority);
+            },
+            out var authority);
+
+        Assert.False(result.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Disconnected, result.Code);
+        Assert.Null(authority);
+        Assert.Equal(0, fixture.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(0, fixture.Session.ActiveHostActionEntryCarrierCount);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_signer_disconnect_returns_null_and_cleans_source_authority()
+    {
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(source);
+        var inputs = CreateEndpointRelayInputs(source, receiving, "relay-signer-disconnect");
+
+        var result = source.Session.IssueHostEndpointRouteRelay(
+            inputs.Request,
+            inputs.SourceCall,
+            inputs.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority),
+            (candidate, hash) =>
+            {
+                source.Session.Disconnect();
+                return KeyedEndpointProof("relay", hash);
+            },
+            out var relay);
+
+        Assert.False(result.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Disconnected, result.Code);
+        Assert.Null(relay);
+        Assert.Equal(0, source.Session.ActiveHostActionEntryCarrierCount);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_verifier_disconnect_does_not_reserve_receiving_state()
+    {
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        Fixture? receiving = null;
+        receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: (authority, hash) =>
+                authority.Proof == KeyedEndpointProof("route", hash),
+            authenticateEndpointRouteRelay: (_, _) =>
+            {
+                receiving!.Session.Disconnect();
+                return true;
+            });
+        var fixture = CreateEndpointRelay(source, receiving, "relay-verifier-disconnect");
+
+        var result = receiving.Session.ImportHostEndpointRouteRelay(
+            fixture.Relay,
+            receiving.Now,
+            out var hostContext);
+
+        Assert.False(result.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Disconnected, result.Code);
+        Assert.Null(hostContext);
+        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_verifier_rotation_does_not_reserve_old_generation()
+    {
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        Fixture? receiving = null;
+        receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: (authority, hash) =>
+                authority.Proof == KeyedEndpointProof("route", hash),
+            authenticateEndpointRouteRelay: (_, _) =>
+            {
+                var rotated = CreateRotatedBinding(receiving!, "relay-verifier-rotation");
+                receiving!.BindingHashes.Add(rotated.Authentication.BindingHash);
+                return receiving.Session.RotateBinding(rotated, receiving.Now).Accepted;
+            });
+        var fixture = CreateEndpointRelay(source, receiving, "relay-verifier-rotation");
+
+        var result = receiving.Session.ImportHostEndpointRouteRelay(
+            fixture.Relay,
+            receiving.Now,
+            out var hostContext);
+
+        Assert.False(result.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Replay, result.Code);
+        Assert.Null(hostContext);
+        Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
+        Assert.Equal(0, receiving.Session.LastSequence);
+    }
+
+    [Fact]
+    public void Endpoint_route_authority_issue_cleans_state_when_route_signer_fails()
+    {
+        var fixture = CreateFixture(authenticateEndpointRouteAuthority: (authority, hash) =>
+            authority.Proof == hash);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var call = ActionCall(fixture, 1, "route-signer-failure");
+
+        var failed = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            call,
+            fixture.Now,
+            _ => throw new InvalidOperationException("test signer failure"),
+            out _);
+
+        Assert.False(failed.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Unauthenticated, failed.Code);
+        Assert.Equal(1, fixture.Session.IssuedHostActionEntryContextCount);
+
+        var retry = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            call,
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out var authority);
+
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.NotNull(authority);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_rejects_disconnected_target_before_source_authority_storage()
+    {
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: (authority, hash) =>
+                authority.Proof == KeyedEndpointProof("route", hash),
+            authenticateEndpointRouteRelay: (relay, hash) =>
+                relay.Proof == KeyedEndpointProof("relay", hash));
+        var inputs = CreateEndpointRelayInputs(source, receiving, "disconnected-target");
+        receiving.Session.Disconnect();
+
+        var result = source.Session.IssueHostEndpointRouteRelay(
+            inputs.Request,
+            inputs.SourceCall,
+            inputs.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (_, hash) => KeyedEndpointProof("relay", hash),
+            out _);
+
+        Assert.False(result.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Disconnected, result.Code);
+
+        var retry = source.Session.IssueHostEndpointRouteAuthority(
+            inputs.Request,
+            inputs.SourceCall,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            out var authority);
+
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.NotNull(authority);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_rejects_incompatible_receiving_lifetime_without_source_authority_storage()
+    {
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: (authority, hash) =>
+                authority.Proof == KeyedEndpointProof("route", hash),
+            authenticateEndpointRouteRelay: (relay, hash) =>
+                relay.Proof == KeyedEndpointProof("relay", hash));
+        var inputs = CreateEndpointRelayInputs(source, receiving, "incompatible-lifetime");
+        inputs = inputs with
+        {
+            ReceivingCall = inputs.ReceivingCall with
+            {
+                Deadline = receiving.Binding.ExpiresAt.AddSeconds(1),
+            },
+        };
+
+        var result = source.Session.IssueHostEndpointRouteRelay(
+            inputs.Request,
+            inputs.SourceCall,
+            inputs.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (_, hash) => KeyedEndpointProof("relay", hash),
+            out _);
+
+        Assert.False(result.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, result.Code);
+
+        var retry = source.Session.IssueHostEndpointRouteAuthority(
+            inputs.Request,
+            inputs.SourceCall,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            out var authority);
+
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.NotNull(authority);
+    }
+
+    [Fact]
+    public void Endpoint_route_relay_rejects_source_expiry_before_receiving_deadline_without_leak()
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var sourceExpiry = source.Now.AddSeconds(10);
+        var context = IssueContext(
+            source,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint,
+            actionDeadline: source.Now.AddSeconds(5),
+            contextExpiresAt: sourceExpiry);
+        var request = EndpointRouteRequest(source, context, HostEndpointTransport.Http);
+        var sourceCall = ActionCall(source, 1, "source-expiry-call") with
+        {
+            Deadline = source.Now.AddSeconds(5),
+        };
+        var receivingCall = ActionCall(receiving, 1, "receiving-longer-call") with
+        {
+            Deadline = source.Now.AddSeconds(30),
+        };
+
+        var result = source.Session.IssueHostEndpointRouteRelay(
+            request,
+            sourceCall,
+            receivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (_, hash) => KeyedEndpointProof("relay", hash),
+            out _);
+
+        Assert.False(result.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Expired, result.Code);
+        Assert.Equal(1, source.Session.IssuedHostActionEntryContextCount);
+        var retry = source.Session.IssueHostEndpointRouteAuthority(
+            request,
+            sourceCall,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            out var authority);
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.NotNull(authority);
+    }
+
+    [Theory]
+    [InlineData("domain")]
+    [InlineData("future-issued")]
+    [InlineData("early-issued")]
+    [InlineData("extended-expiry")]
+    [InlineData("shorter-source-lifetime")]
+    [InlineData("capability-collision")]
+    [InlineData("direct-admission-call-collision")]
+    [InlineData("reserved-call-collision")]
+    [InlineData("pending-authority-call-collision")]
+    [InlineData("pending-authority-nonce-collision")]
+    public void Endpoint_route_relay_re_signed_domain_mutations_reject_before_state_change(string mutation)
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay,
+            maxInFlight: 4,
+            maxCalls: 8);
+        SidecarCapabilityCallIdentity? collisionCall = null;
+        HostActionEntryRequestContext? collisionContext = null;
+
+        if (mutation == "capability-collision")
+        {
+            collisionContext = IssueContext(
+                receiving,
+                new RequestPrincipal("collision-user"),
+                HostActionEntryIngress.Tool);
+        }
+        else if (mutation == "direct-admission-call-collision")
+        {
+            var context = IssueContext(receiving, new RequestPrincipal("route-user"), HostActionEntryIngress.Endpoint);
+            var request = EndpointRouteRequest(receiving, context, HostEndpointTransport.Http);
+            collisionCall = ActionCall(receiving, 1, "existing-route-admission");
+            Assert.True(receiving.Session.IssueHostEndpointRouteAuthority(
+                request,
+                collisionCall,
+                receiving.Now,
+                authority => KeyedEndpointProof(
+                    "route",
+                    HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+                out var authority).Accepted);
+            Assert.True(receiving.Session.BeginHostEndpointRouteCarrier(
+                request,
+                authority!,
+                new HostActionEntryCarrierIdentity(
+                    HostActionEntryIngress.Endpoint,
+                    context.InvocationId,
+                    context.Contribution!.IngressBinding),
+                receiving.Now,
+                out _).Accepted);
+        }
+        else if (mutation == "reserved-call-collision")
+        {
+            var rootCall = ActionCall(receiving, 1, "existing-root-call");
+            var rootContext = IssueContext(receiving, new RequestPrincipal("root-user"), HostActionEntryIngress.Tool);
+            var rootAction = Payload(typeof(string).AssemblyQualifiedName!, "root");
+            Assert.NotNull(ActivateContext(receiving, rootContext));
+            Assert.True(receiving.Session.BeginCall(
+                rootCall,
+                SidecarCapabilityKind.Action,
+                rootAction,
+                rootAction.ByteLength,
+                receiving.Now,
+                rootContext).Accepted);
+            var childDescriptor = NestedDescriptor("existing-child", typeof(string).AssemblyQualifiedName!);
+            var childAction = Payload(childDescriptor.InputTypeIdentity, "child");
+            collisionCall = ActionCall(receiving, 2, "existing-reserved-child");
+            Assert.True(receiving.Session.IssueNestedHostActionEntryCarrier(
+                rootCall,
+                collisionCall,
+                childDescriptor,
+                childAction,
+                NestedContribution(childDescriptor),
+                receiving.Now,
+                out _).Accepted);
+        }
+        else if (mutation is "pending-authority-call-collision" or "pending-authority-nonce-collision")
+        {
+            var pendingContext = IssueContext(
+                receiving,
+                new RequestPrincipal("pending-route-user"),
+                HostActionEntryIngress.Endpoint);
+            var pendingRequest = EndpointRouteRequest(
+                receiving,
+                pendingContext,
+                HostEndpointTransport.Http);
+            collisionCall = ActionCall(
+                receiving,
+                1,
+                $"{mutation}-pending") with
+            {
+                CallId = Guid.NewGuid(),
+                ReplayNonce = mutation == "pending-authority-nonce-collision"
+                    ? "pending-authority-nonce"
+                    : "pending-authority-call-nonce",
+                Deadline = receiving.Now.AddSeconds(1),
+            };
+            Assert.True(receiving.Session.IssueHostEndpointRouteAuthority(
+                pendingRequest,
+                collisionCall,
+                receiving.Now,
+                authority => KeyedEndpointProof(
+                    "route",
+                    HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+                out _).Accepted);
+        }
+
+        var fixture = CreateEndpointRelay(source, receiving, $"domain-{mutation}");
+        var original = fixture.Relay;
+        var originalSequence = receiving.Session.LastSequence;
+        var originalContexts = receiving.Session.IssuedHostActionEntryContextCount;
+        var originalCarriers = receiving.Session.ActiveHostActionEntryCarrierCount;
+        var originalTombstones = receiving.Session.CompletedHostActionEntryTombstoneCount;
+        var mutated = original;
+
+        switch (mutation)
+        {
+            case "domain":
+                mutated = original with
+                {
+                    ReceivingParentCall = original.ReceivingParentCall with
+                    {
+                        Capability = SidecarCapabilityKind.Storage,
+                    },
+                };
+                break;
+            case "future-issued":
+                mutated = original with { IssuedAt = receiving.Now.AddSeconds(1) };
+                break;
+            case "early-issued":
+                mutated = original with { IssuedAt = original.Authority.IssuedAt.AddSeconds(-1) };
+                break;
+            case "extended-expiry":
+                mutated = original with
+                {
+                    ReceivingContext = original.ReceivingContext with
+                    {
+                        ExpiresAt = original.Authority.ExpiresAt.AddSeconds(1),
+                    },
+                    ExpiresAt = original.Authority.ExpiresAt.AddSeconds(1),
+                };
+                break;
+            case "shorter-source-lifetime":
+                var authority = original.Authority with
+                {
+                    ExpiresAt = original.ExpiresAt.AddSeconds(-1),
+                };
+                var authorityHash = HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority);
+                authority = authority with
+                {
+                    CanonicalBindingHash = authorityHash,
+                    Proof = KeyedEndpointProof("route", authorityHash),
+                };
+                mutated = original with { Authority = authority };
+                break;
+            case "capability-collision":
+                mutated = original with
+                {
+                    ReceivingContext = original.ReceivingContext with
+                    {
+                        CapabilityId = collisionContext!.CapabilityId,
+                    },
+                };
+                break;
+            case "direct-admission-call-collision":
+            case "reserved-call-collision":
+            case "pending-authority-call-collision":
+                mutated = original with
+                {
+                    ReceivingParentCall = original.ReceivingParentCall with
+                    {
+                        CallId = collisionCall!.CallId,
+                    },
+                };
+                break;
+            case "pending-authority-nonce-collision":
+                mutated = original with
+                {
+                    ReceivingParentCall = original.ReceivingParentCall with
+                    {
+                        ReplayNonce = collisionCall!.ReplayNonce,
+                    },
+                };
+                break;
+        }
+
+        mutated = ResignEndpointRelay(mutated);
+        var rejected = receiving.Session.ImportHostEndpointRouteRelay(mutated, receiving.Now, out _);
+        Assert.False(rejected.Accepted, rejected.Message);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, rejected.Code);
+        Assert.Equal(originalSequence, receiving.Session.LastSequence);
+        Assert.Equal(originalContexts, receiving.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(originalCarriers, receiving.Session.ActiveHostActionEntryCarrierCount);
+        Assert.Equal(originalTombstones, receiving.Session.CompletedHostActionEntryTombstoneCount);
+
+        if (mutation is "pending-authority-call-collision" or "pending-authority-nonce-collision")
+            receiving.Session.SweepExpiredHostActionEntryCarriers(receiving.Now.AddSeconds(2));
+
+        Assert.True(
+            receiving.Session.ImportHostEndpointRouteRelay(original, receiving.Now, out _).Accepted);
+    }
+
+    [Theory]
+    [InlineData("disconnect")]
+    [InlineData("rotate")]
+    [InlineData("consume")]
+    public void Endpoint_route_relay_rejects_after_target_lifecycle_change_and_cleans_source(string lifecycle)
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var fixture = CreateEndpointRelay(source, receiving, $"lifecycle-{lifecycle}");
+
+        if (lifecycle == "disconnect")
+        {
+            receiving.Session.Disconnect();
+        }
+        else if (lifecycle == "rotate")
+        {
+            var rotated = CreateRotatedBinding(receiving, "endpoint-relay-target-rotation");
+            receiving.BindingHashes.Add(rotated.Authentication.BindingHash);
+            Assert.True(receiving.Session.RotateBinding(rotated, receiving.Now).Accepted);
+        }
+        else
+        {
+            var unrelated = ActionCall(receiving, 1, "endpoint-relay-unrelated");
+            var payload = Payload("endpoint.unrelated", "unrelated");
+            Assert.True(receiving.Session.BeginCall(
+                unrelated,
+                SidecarCapabilityKind.Action,
+                payload,
+                payload.ByteLength,
+                receiving.Now).Accepted);
+        }
+
+        var import = receiving.Session.ImportHostEndpointRouteRelay(
+            SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteRelay>(
+                SidecarCapabilityTransportCodec.Serialize(fixture.Relay)),
+            receiving.Now,
+            out _);
+        Assert.False(import.Accepted, import.Message);
+        Assert.Equal(
+            lifecycle == "disconnect"
+                ? SidecarCapabilityErrors.Disconnected
+                : SidecarCapabilityErrors.SpoofedIdentity,
+            import.Code);
+
+        Assert.True(source.Session.CompleteHostEndpointRouteRelay(fixture.Relay, source.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            source.Session.CompleteHostEndpointRouteRelay(fixture.Relay, source.Now).Code);
+        var rotatedSource = CreateRotatedBinding(source, $"endpoint-relay-source-{lifecycle}");
+        source.BindingHashes.Add(rotatedSource.Authentication.BindingHash);
+        Assert.True(source.Session.RotateBinding(rotatedSource, source.Now).Accepted);
+    }
+
+    private static EndpointRelayInputs CreateEndpointRelayInputs(
+        Fixture source,
+        Fixture receiving,
+        string suffix,
+        RequestPrincipal? caller = null,
+        ExtensionFeatureSet? features = null)
+    {
+        var context = IssueContext(
+            source,
+            caller ?? new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint,
+            features: features);
+        var request = EndpointRouteRequest(source, context, HostEndpointTransport.Http);
+        var sourceCall = ActionCall(source, 1, $"endpoint-relay-source-{suffix}");
+        var receivingCall = ActionCall(
+            receiving,
+            receiving.Session.LastSequence + 1,
+            $"endpoint-relay-receiving-{suffix}");
+        return new EndpointRelayInputs(source, receiving, request, sourceCall, receivingCall);
+    }
+
+    private static EndpointRelayFixture CreateEndpointRelay(
+        Fixture source,
+        Fixture receiving,
+        string suffix)
+    {
+        var inputs = CreateEndpointRelayInputs(source, receiving, suffix);
+        var issue = source.Session.IssueHostEndpointRouteRelay(
+            inputs.Request,
+            inputs.SourceCall,
+            inputs.ReceivingCall,
+            receiving.Session,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (_, hash) => KeyedEndpointProof("relay", hash),
+            out var relay);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(relay);
+        return new EndpointRelayFixture(inputs, relay!);
     }
 
     [Theory]
@@ -7214,9 +8830,42 @@ public sealed class SidecarCapabilityTransportTests
     private static Fixture CreateMirroredFixture(
         Fixture template,
         Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null,
-        Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null)
+        Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null,
+        Func<HostEndpointRouteAuthority, string, bool>? authenticateEndpointRouteAuthority = null,
+        Func<SidecarHostEndpointRouteRelay, string, bool>? authenticateEndpointRouteRelay = null,
+        IReadOnlyList<SidecarCapabilityKind>? capabilities = null,
+        int? maxInFlight = null,
+        int? maxCalls = null,
+        int? actionInputBytes = null,
+        int? protocolMessageBytes = null)
     {
-        var binding = template.Binding;
+        var binding = template.Binding with
+        {
+            Grant = capabilities is null
+                ? template.Binding.Grant
+                : template.Binding.Grant with { Capabilities = capabilities },
+            ConcurrencyLimits = maxInFlight is null && maxCalls is null
+                ? template.Binding.ConcurrencyLimits
+                : template.Binding.ConcurrencyLimits with
+                {
+                    MaximumInFlightCalls = maxInFlight ?? template.Binding.ConcurrencyLimits.MaximumInFlightCalls,
+                    MaximumCallsPerRequest = maxCalls ?? template.Binding.ConcurrencyLimits.MaximumCallsPerRequest,
+                },
+            PayloadLimits = actionInputBytes is null && protocolMessageBytes is null
+                ? template.Binding.PayloadLimits
+                : template.Binding.PayloadLimits with
+                {
+                    ActionInputBytes = actionInputBytes ?? template.Binding.PayloadLimits.ActionInputBytes,
+                    ProtocolMessageBytes = protocolMessageBytes ?? template.Binding.PayloadLimits.ProtocolMessageBytes,
+                },
+        };
+        binding = binding with
+        {
+            Authentication = binding.Authentication with
+            {
+                BindingHash = SidecarCapabilitySessionValidator.ComputeBindingHash(binding),
+            },
+        };
         var nonces = new HashSet<string>(StringComparer.Ordinal);
         var bindingHashes = new HashSet<string>(StringComparer.Ordinal)
         {
@@ -7228,7 +8877,9 @@ public sealed class SidecarCapabilityTransportTests
             nonces.Add,
             template.Now,
             authenticateHostTerminalAuthority,
-            authenticateStorageContinuationAuthority);
+            authenticateStorageContinuationAuthority,
+            authenticateEndpointRouteAuthority,
+            authenticateEndpointRouteRelay);
         var call = new SidecarCapabilityCallIdentity(
             binding.SessionId,
             binding.RequestId,
@@ -7252,6 +8903,7 @@ public sealed class SidecarCapabilityTransportTests
         Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null,
         Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null,
         Func<HostEndpointRouteAuthority, string, bool>? authenticateEndpointRouteAuthority = null,
+        Func<SidecarHostEndpointRouteRelay, string, bool>? authenticateEndpointRouteRelay = null,
         int actionInputBytes = 1024,
         int protocolMessageBytes = 1024)
     {
@@ -7299,7 +8951,8 @@ public sealed class SidecarCapabilityTransportTests
             now,
             authenticateHostTerminalAuthority,
             authenticateStorageContinuationAuthority,
-            authenticateEndpointRouteAuthority);
+            authenticateEndpointRouteAuthority,
+            authenticateEndpointRouteRelay);
         var call = new SidecarCapabilityCallIdentity(
             binding.SessionId,
             binding.RequestId,
@@ -10089,7 +11742,8 @@ public sealed class SidecarCapabilityTransportTests
         DateTimeOffset? contextExpiresAt = null,
         HostActionEntryLineage? lineage = null,
         bool bindPayload = false,
-        Guid? conversationId = null)
+        Guid? conversationId = null,
+        ExtensionFeatureSet? features = null)
     {
         var request = new HostActionEntryContextRequest(
             ingress,
@@ -10097,7 +11751,7 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Binding.RequestId,
             fixture.Binding.CancellationId,
             caller,
-            ExtensionFeatureSet.Empty,
+            features ?? ExtensionFeatureSet.Empty,
             traceId ?? Guid.NewGuid(),
             idempotencyKey ?? Guid.NewGuid(),
             actionDeadline ?? fixture.Now.AddMinutes(1),
@@ -10200,11 +11854,57 @@ public sealed class SidecarCapabilityTransportTests
             },
             [0, 255, 1, 2]);
 
+    private static HostEndpointRouteRequest MalformedEndpointRouteRequest(
+        HostEndpointRouteRequest request,
+        string mutation) => mutation switch
+        {
+            "invocation" => request with
+            {
+                Invocation = request.Invocation with { Endpoint = null! },
+            },
+            "route" => request with { Route = null! },
+            "headers" => request with { Headers = null! },
+            "query" => request with { Query = null! },
+            "metadata-array" => request with
+            {
+                Headers = new Dictionary<string, string[]>(StringComparer.Ordinal)
+                {
+                    ["x-request"] = null!,
+                },
+            },
+            "metadata-value" => request with
+            {
+                Headers = new Dictionary<string, string[]>(StringComparer.Ordinal)
+                {
+                    ["x-request"] = [null!],
+                },
+            },
+            "body" => request with { Body = null! },
+            _ => throw new ArgumentOutOfRangeException(nameof(mutation)),
+        };
+
     private static HostEndpointRouteAuthority ResignEndpointAuthority(
         HostEndpointRouteAuthority authority)
     {
         var hash = HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority);
         return authority with { CanonicalBindingHash = hash, Proof = hash };
+    }
+
+    private static string KeyedEndpointProof(string domain, string hash)
+    {
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes("endpoint-route-relay-test-key"));
+        return Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes($"{domain}:{hash}")));
+    }
+
+    private static SidecarHostEndpointRouteRelay ResignEndpointRelay(
+        SidecarHostEndpointRouteRelay relay)
+    {
+        var hash = SidecarCapabilityTransportValidation.ComputeEndpointRouteRelayBindingHash(relay);
+        return relay with
+        {
+            CanonicalBindingHash = hash,
+            Proof = KeyedEndpointProof("relay", hash),
+        };
     }
 
     private static SidecarCapabilitySessionBinding CreateRotatedBinding(
@@ -10313,6 +12013,17 @@ public sealed class SidecarCapabilityTransportTests
         SidecarSafeFailureIdentity SafeFailure,
         HashSet<string> Nonces,
         HashSet<string> BindingHashes);
+
+    private sealed record EndpointRelayInputs(
+        Fixture Source,
+        Fixture Receiving,
+        HostEndpointRouteRequest Request,
+        SidecarCapabilityCallIdentity SourceCall,
+        SidecarCapabilityCallIdentity ReceivingCall);
+
+    private sealed record EndpointRelayFixture(
+        EndpointRelayInputs Inputs,
+        SidecarHostEndpointRouteRelay Relay);
 
     private sealed record ExternalSessionFixture(
         Fixture SessionFixture,

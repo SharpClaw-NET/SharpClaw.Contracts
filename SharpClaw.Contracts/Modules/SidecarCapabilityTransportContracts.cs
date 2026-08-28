@@ -185,6 +185,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private readonly Func<SidecarHostTerminalAuthority, string, bool>? _authenticateHostTerminalAuthority;
     private readonly Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? _authenticateStorageContinuationAuthority;
     private readonly Func<HostEndpointRouteAuthority, string, bool>? _authenticateEndpointRouteAuthority;
+    private readonly Func<SidecarHostEndpointRouteRelay, string, bool>? _authenticateEndpointRouteRelay;
     private readonly Func<string, bool> _registerAuthenticationNonce;
     private readonly Dictionary<Guid, SidecarCapabilityKind> _calls = [];
     private readonly Dictionary<Guid, SidecarCapabilityCallIdentity> _callIdentities = [];
@@ -192,6 +193,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _issuedEntryContexts = [];
     private readonly Dictionary<Guid, HostEndpointRouteAuthority> _issuedEndpointRouteAuthorities = [];
     private readonly Dictionary<Guid, EndpointRouteAdmissionState> _endpointRouteAdmissions = [];
+    private readonly Dictionary<Guid, EndpointRouteRelayAdmissionState> _endpointRouteRelayAdmissions = [];
+    private readonly Dictionary<Guid, SidecarHostEndpointRouteRelay> _issuedEndpointRouteRelays = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _activeEntryContexts = [];
     private readonly Dictionary<Guid, HostActionEntryCarrierAuthority> _activeEntryCarriers = [];
     private readonly Dictionary<Guid, Guid> _entryBudgetRoots = [];
@@ -259,6 +262,11 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         HostActionEntryRequestContext Context,
         HostActionEntryCarrierAuthority Carrier);
 
+    private sealed record EndpointRouteRelayAdmissionState(
+        SidecarHostEndpointRouteRelay Relay,
+        HostActionEntryRequestContext Context,
+        HostActionEntryCarrierAuthority Carrier);
+
     private sealed record NestedCarrierState(
         SidecarNestedHostActionEntryCarrier Carrier,
         SidecarCapabilityCallIdentity ParentCall,
@@ -287,7 +295,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         DateTimeOffset now,
         Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null,
         Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null,
-        Func<HostEndpointRouteAuthority, string, bool>? authenticateEndpointRouteAuthority = null)
+        Func<HostEndpointRouteAuthority, string, bool>? authenticateEndpointRouteAuthority = null,
+        Func<SidecarHostEndpointRouteRelay, string, bool>? authenticateEndpointRouteRelay = null)
     {
         ArgumentNullException.ThrowIfNull(binding);
         ArgumentNullException.ThrowIfNull(authenticate);
@@ -298,6 +307,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         _authenticateHostTerminalAuthority = authenticateHostTerminalAuthority;
         _authenticateStorageContinuationAuthority = authenticateStorageContinuationAuthority;
         _authenticateEndpointRouteAuthority = authenticateEndpointRouteAuthority;
+        _authenticateEndpointRouteRelay = authenticateEndpointRouteRelay;
 
         var result = SidecarCapabilitySessionValidator.Validate(
             binding,
@@ -1097,16 +1107,20 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         ArgumentNullException.ThrowIfNull(issueProof);
         authority = null;
 
-        if (!request.IsWellFormed(now) ||
+        var requestIsWellFormed = request.IsWellFormed(now);
+        if (!requestIsWellFormed ||
             !HostEndpointRouteAuthorityValidator.IsWithinLimits(request, Binding.PayloadLimits))
             return SidecarCapabilityValidationResult.Reject(
-                request.IsWellFormed(now)
+                requestIsWellFormed
                     ? SidecarCapabilityErrors.PayloadTooLarge
                     : SidecarCapabilityErrors.InvalidBinding,
-                request.IsWellFormed(now)
+                requestIsWellFormed
                     ? "The endpoint route request exceeds the session limits."
                     : "The endpoint route request is incomplete.");
 
+        HostEndpointRouteAuthority candidate;
+        long bindingGeneration;
+        string bindingHash;
         lock (_sync)
         {
             if (_disconnected)
@@ -1188,7 +1202,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     SidecarCapabilityErrors.Expired,
                     "The endpoint route authority has no valid lifetime.");
 
-            var candidate = new HostEndpointRouteAuthority(
+            candidate = new HostEndpointRouteAuthority(
                 Guid.NewGuid(),
                 call,
                 request.Invocation.InvocationId,
@@ -1207,19 +1221,128 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 InvocationContentHash = request.InvocationContentHash,
                 InvocationByteLength = request.InvocationByteLength,
             };
-            var canonicalHash = HostEndpointRouteAuthorityValidator.ComputeBindingHash(candidate);
-            var proof = issueProof(candidate with { CanonicalBindingHash = canonicalHash });
-            if (string.IsNullOrWhiteSpace(proof))
+            try
+            {
+                candidate = CloneTransport(candidate);
+            }
+            catch
+            {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Unauthenticated,
-                    "The host did not issue an endpoint route authority proof.");
+                    "The endpoint route authority snapshot could not be prepared.");
+            }
 
-            authority = candidate with
+            var canonicalHash = HostEndpointRouteAuthorityValidator.ComputeBindingHash(candidate);
+            candidate = candidate with { CanonicalBindingHash = canonicalHash };
+            bindingGeneration = _bindingGeneration;
+            bindingHash = Binding.Authentication.BindingHash;
+        }
+
+        HostEndpointRouteAuthority signerSnapshot;
+        byte[] signerSnapshotBytes;
+        try
+        {
+            signerSnapshot = CloneTransport(candidate);
+            signerSnapshotBytes = SidecarCapabilityTransportCodec.Serialize(signerSnapshot);
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint route authority snapshot could not be prepared.");
+        }
+
+        string? proof;
+        try
+        {
+            proof = issueProof(signerSnapshot);
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The host did not issue an endpoint route authority proof.");
+        }
+
+        try
+        {
+            if (!signerSnapshotBytes.SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(signerSnapshot)))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The endpoint route authority signer changed its input.");
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint route authority signer changed its input.");
+        }
+
+        if (string.IsNullOrWhiteSpace(proof))
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The host did not issue an endpoint route authority proof.");
+
+        var signedAuthority = candidate with { Proof = proof };
+        lock (_sync)
+        {
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            if (_bindingGeneration != bindingGeneration ||
+                !string.Equals(Binding.Authentication.BindingHash, bindingHash, StringComparison.Ordinal))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint route authority binding changed during issuance.");
+
+            if (!request.IsWellFormed(now) ||
+                !HostEndpointRouteAuthorityValidator.IsWithinLimits(request, Binding.PayloadLimits) ||
+                !TryGetStoredEndpointContextLocked(
+                    request.Invocation.HostActionContext,
+                    out var currentContext) ||
+                !SameEndpointContext(currentContext!, request.Invocation.HostActionContext) ||
+                call.Capability != SidecarCapabilityKind.Action ||
+                !Binding.Grant.Allows(SidecarCapabilityKind.Action) ||
+                call.SessionId != Binding.SessionId ||
+                call.RequestId != Binding.RequestId ||
+                call.CancellationId != Binding.CancellationId ||
+                !string.Equals(call.ModuleId, Binding.ModuleId, StringComparison.Ordinal) ||
+                !string.Equals(call.GraphId, Binding.GraphId, StringComparison.Ordinal) ||
+                call.Deadline <= now ||
+                call.Deadline > Binding.ExpiresAt ||
+                call.Sequence != _lastSequence + 1 ||
+                _calls.ContainsKey(call.CallId) ||
+                _completedCalls.Contains(call.CallId) ||
+                _nonces.Contains(call.ReplayNonce) ||
+                _endpointRouteAdmissions.ContainsKey(call.CallId) ||
+                _issuedEndpointRouteAuthorities.Values.Any(existing =>
+                    existing.Call.CallId == call.CallId ||
+                    string.Equals(existing.Call.ReplayNonce, call.ReplayNonce, StringComparison.Ordinal) ||
+                    existing.HostActionContext.CapabilityId ==
+                    request.Invocation.HostActionContext.CapabilityId))
             {
-                CanonicalBindingHash = canonicalHash,
-                Proof = proof,
-            };
-            _issuedEndpointRouteAuthorities.Add(authority.AuthorityId, authority);
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Duplicate,
+                    "The endpoint route authority is no longer available for issuance.");
+            }
+
+            HostEndpointRouteAuthority storedAuthority;
+            try
+            {
+                storedAuthority = CloneTransport(signedAuthority);
+            }
+            catch
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The endpoint route authority could not be stored.");
+            }
+
+            authority = signedAuthority;
+            _issuedEndpointRouteAuthorities.Add(storedAuthority.AuthorityId, storedAuthority);
             return SidecarCapabilityValidationResult.Accept();
         }
     }
@@ -1368,6 +1491,688 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _totalCalls++;
             _inFlight++;
             _nonces.Add(call.ReplayNonce);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult IssueHostEndpointRouteRelay(
+        HostEndpointRouteRequest request,
+        SidecarCapabilityCallIdentity sourceCall,
+        SidecarCapabilityCallIdentity receivingParentCall,
+        SidecarCapabilitySession receivingSession,
+        DateTimeOffset now,
+        Func<HostEndpointRouteAuthority, string> issueRouteAuthorityProof,
+        Func<SidecarHostEndpointRouteRelay, string, string> issueProof,
+        out SidecarHostEndpointRouteRelay? relay)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(sourceCall);
+        ArgumentNullException.ThrowIfNull(receivingParentCall);
+        ArgumentNullException.ThrowIfNull(receivingSession);
+        ArgumentNullException.ThrowIfNull(issueRouteAuthorityProof);
+        ArgumentNullException.ThrowIfNull(issueProof);
+        relay = null;
+
+        if (receivingSession == this)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidBinding,
+                "An endpoint route relay requires a separate receiving session.");
+
+        var receivingBinding = receivingSession.Binding;
+        var receivingGeneration = receivingSession.BindingGeneration;
+        lock (receivingSession._sync)
+        {
+            if (receivingSession._disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The receiving capability session is disconnected.");
+
+            if (!receivingSession.Binding.Grant.Allows(SidecarCapabilityKind.Action))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthorized,
+                    "The receiving session grant does not allow endpoint actions.");
+
+            if (receivingSession._inFlight >=
+                    receivingSession.Binding.ConcurrencyLimits.MaximumInFlightCalls ||
+                receivingSession._totalCalls >=
+                    receivingSession.Binding.ConcurrencyLimits.MaximumCallsPerRequest)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.ConcurrencyLimit,
+                    "The receiving session call limit was reached.");
+
+            if (!request.IsWellFormed(now))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The endpoint route relay request is incomplete.");
+
+            if (!HostEndpointRouteAuthorityValidator.IsWithinLimits(
+                    request,
+                    receivingSession.Binding.PayloadLimits))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.PayloadTooLarge,
+                    "The endpoint route relay request exceeds the receiving session limits.");
+        }
+
+        if (!receivingParentCall.IsValid ||
+            receivingParentCall.Capability != SidecarCapabilityKind.Action ||
+            receivingParentCall.SessionId != receivingBinding.SessionId ||
+            receivingParentCall.RequestId != receivingBinding.RequestId ||
+            receivingParentCall.CancellationId != receivingBinding.CancellationId ||
+            !string.Equals(receivingParentCall.ModuleId, receivingBinding.ModuleId, StringComparison.Ordinal) ||
+            !string.Equals(receivingParentCall.GraphId, receivingBinding.GraphId, StringComparison.Ordinal) ||
+            receivingParentCall.Sequence != receivingSession.LastSequence + 1 ||
+            receivingParentCall.Deadline <= now ||
+            receivingParentCall.Deadline > receivingBinding.ExpiresAt)
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The receiving endpoint route call does not match its session.");
+        }
+
+        var routeResult = IssueHostEndpointRouteAuthority(
+            request,
+            sourceCall,
+            now,
+            issueRouteAuthorityProof,
+            out var authority);
+        if (!routeResult.Accepted || authority is null)
+            return routeResult;
+
+        var expiresAt = new[]
+        {
+            authority.ExpiresAt,
+            receivingParentCall.Deadline,
+            receivingBinding.ExpiresAt,
+        }.Min();
+        if (expiresAt <= now)
+        {
+            lock (_sync)
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Expired,
+                "The endpoint route relay has no valid lifetime.");
+        }
+
+        if (expiresAt < receivingParentCall.Deadline)
+        {
+            lock (_sync)
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Expired,
+                "The endpoint route relay lifetime does not cover the receiving call.");
+        }
+
+        var sourceContext = request.Invocation.HostActionContext;
+        var receivingContext = sourceContext with
+        {
+            CapabilityId = Guid.NewGuid(),
+            CapabilityHandle = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)),
+            RequestId = receivingBinding.RequestId,
+            CancellationId = receivingBinding.CancellationId,
+            Deadline = receivingParentCall.Deadline,
+            ExpiresAt = expiresAt,
+            Contribution = sourceContext.Contribution! with
+            {
+                Lineage = sourceContext.Contribution!.Lineage with
+                {
+                    InputTypeIdentity = typeof(HostEndpointInvocation).AssemblyQualifiedName!,
+                    InputSchemaVersion = 1,
+                    InputSchemaHash = "host-endpoint-invocation",
+                },
+            },
+        };
+        var receivingCarrier = new HostActionEntryCarrierIdentity(
+            HostActionEntryIngress.Endpoint,
+            receivingContext.InvocationId,
+            receivingContext.Contribution!.IngressBinding);
+        var candidate = new SidecarHostEndpointRouteRelay(
+            request,
+            authority,
+            receivingParentCall,
+            receivingContext,
+            receivingCarrier,
+            receivingGeneration,
+            now,
+            expiresAt,
+            string.Empty,
+            string.Empty);
+
+        if (!MatchesEndpointRelayContextTransformation(sourceContext, receivingContext))
+        {
+            lock (_sync)
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint route relay context transformation is not authorized.");
+        }
+
+        try
+        {
+            candidate = CloneTransport(candidate);
+        }
+        catch
+        {
+            lock (_sync)
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint route relay snapshot could not be prepared.");
+        }
+
+        bool receivingUnavailable;
+        bool receivingDisconnected;
+        lock (receivingSession._sync)
+        {
+            receivingDisconnected = receivingSession._disconnected;
+            receivingUnavailable = receivingDisconnected ||
+                receivingSession._bindingGeneration != receivingGeneration ||
+                receivingParentCall.Sequence != receivingSession._lastSequence + 1 ||
+                receivingSession._calls.ContainsKey(receivingParentCall.CallId) ||
+                receivingSession._completedCalls.Contains(receivingParentCall.CallId) ||
+                receivingSession._nonces.Contains(receivingParentCall.ReplayNonce);
+        }
+
+        if (receivingUnavailable)
+        {
+            lock (_sync)
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+
+            return SidecarCapabilityValidationResult.Reject(
+                receivingDisconnected
+                    ? SidecarCapabilityErrors.Disconnected
+                    : SidecarCapabilityErrors.Replay,
+                "The receiving endpoint route call is no longer available.");
+        }
+
+        var hash = SidecarCapabilityTransportValidation.ComputeEndpointRouteRelayBindingHash(candidate);
+        SidecarHostEndpointRouteRelay signerSnapshot;
+        byte[] signerSnapshotBytes;
+        try
+        {
+            signerSnapshot = CloneTransport(candidate with { CanonicalBindingHash = hash });
+            signerSnapshotBytes = SidecarCapabilityTransportCodec.Serialize(signerSnapshot);
+        }
+        catch
+        {
+            lock (_sync)
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint route relay snapshot could not be prepared.");
+        }
+
+        string? proof;
+        try
+        {
+            proof = issueProof(signerSnapshot, hash);
+        }
+        catch
+        {
+            lock (_sync)
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The host did not issue an endpoint route relay proof.");
+        }
+
+        try
+        {
+            if (!signerSnapshotBytes.SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(signerSnapshot)))
+            {
+                lock (_sync)
+                    _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The endpoint route relay signer changed its input.");
+            }
+        }
+        catch
+        {
+            lock (_sync)
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint route relay signer changed its input.");
+        }
+
+        if (string.IsNullOrWhiteSpace(proof))
+        {
+            lock (_sync)
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The host did not issue an endpoint route relay proof.");
+        }
+
+        var signedRelay = candidate with { CanonicalBindingHash = hash, Proof = proof };
+        lock (_sync)
+        {
+            if (_disconnected ||
+                !_issuedEndpointRouteAuthorities.ContainsKey(authority.AuthorityId) ||
+                _issuedEndpointRouteRelays.ContainsKey(authority.AuthorityId))
+            {
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+                return SidecarCapabilityValidationResult.Reject(
+                    _disconnected
+                        ? SidecarCapabilityErrors.Disconnected
+                        : SidecarCapabilityErrors.Replay,
+                    "The endpoint route authority is no longer available for relay.");
+            }
+
+            SidecarHostEndpointRouteRelay storedRelay;
+            try
+            {
+                storedRelay = CloneTransport(signedRelay);
+            }
+            catch
+            {
+                _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The endpoint route relay could not be stored.");
+            }
+
+            _issuedEndpointRouteRelays.Add(authority.AuthorityId, storedRelay);
+            relay = signedRelay;
+        }
+
+        return SidecarCapabilityValidationResult.Accept();
+    }
+
+    public SidecarCapabilityValidationResult ImportHostEndpointRouteRelay(
+        SidecarHostEndpointRouteRelay relay,
+        DateTimeOffset now,
+        out HostActionEntryRequestContext? hostContext)
+    {
+        ArgumentNullException.ThrowIfNull(relay);
+        hostContext = null;
+
+        try
+        {
+            relay = CloneTransport(relay);
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint route relay could not be read.");
+        }
+
+        long bindingGeneration;
+        string bindingHash;
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The receiving capability session is disconnected.");
+            if (_authenticateEndpointRouteRelay is null ||
+                _authenticateEndpointRouteAuthority is null)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The receiving session has no endpoint route relay verifier.");
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            bindingGeneration = _bindingGeneration;
+            bindingHash = Binding.Authentication.BindingHash;
+            var stateResult = ValidateEndpointRouteRelayStateLocked(
+                relay,
+                now,
+                bindingGeneration,
+                bindingHash);
+            if (stateResult is not null)
+                return stateResult;
+        }
+
+        bool relayAuthenticated;
+        try
+        {
+            relayAuthenticated = _authenticateEndpointRouteRelay!(relay, relay.CanonicalBindingHash);
+        }
+        catch
+        {
+            relayAuthenticated = false;
+        }
+
+        if (!relayAuthenticated)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The host did not authenticate the endpoint route relay.");
+
+        SidecarCapabilityValidationResult authorityResult;
+        try
+        {
+            authorityResult = HostEndpointRouteAuthorityValidator.Validate(
+                relay.Request!,
+                relay.Authority,
+                now,
+                _authenticateEndpointRouteAuthority!);
+        }
+        catch
+        {
+            authorityResult = SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The host did not authenticate the endpoint route authority.");
+        }
+
+        if (!authorityResult.Accepted)
+            return authorityResult;
+
+        lock (_sync)
+        {
+            var stateResult = ValidateEndpointRouteRelayStateLocked(
+                relay,
+                now,
+                bindingGeneration,
+                bindingHash);
+            if (stateResult is not null)
+                return stateResult;
+
+            SidecarHostEndpointRouteRelay storedRelay;
+            HostActionEntryRequestContext returnedContext;
+            try
+            {
+                storedRelay = CloneTransport(relay);
+                returnedContext = CloneTransport(storedRelay.ReceivingContext!);
+            }
+            catch
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint route relay could not be stored.");
+            }
+
+            var storedContext = storedRelay.ReceivingContext!;
+
+            var carrierAuthority = new HostActionEntryCarrierAuthority(
+                Binding.ModuleId,
+                Binding.GraphId,
+                Binding.SessionId,
+                Binding.RequestId,
+                Binding.CancellationId,
+                storedContext.CapabilityId,
+                storedRelay.ReceivingCarrier,
+                _bindingGeneration,
+                now,
+                storedRelay.ExpiresAt,
+                HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(
+                    storedContext.CapabilityHandle));
+            _activeEntryCarriers.Add(storedContext.CapabilityId, carrierAuthority);
+            _activeEntryContexts.Add(storedContext.CapabilityId, storedContext);
+            _endpointRouteRelayAdmissions.Add(
+                storedRelay.ReceivingParentCall.CallId,
+                new EndpointRouteRelayAdmissionState(
+                    storedRelay,
+                    storedContext,
+                    carrierAuthority));
+            var budgetRootId = storedContext.CapabilityId;
+            _entryBudgetRoots[storedContext.CapabilityId] = budgetRootId;
+            _entryBudgetReservations[budgetRootId] = new EntryBudgetReservation(
+                storedContext,
+                _bindingGeneration,
+                storedRelay.ExpiresAt,
+                ExtensionAvailable: true);
+            _lastSequence = storedRelay.ReceivingParentCall.Sequence;
+            _totalCalls++;
+            _inFlight++;
+            _nonces.Add(storedRelay.ReceivingParentCall.ReplayNonce);
+            hostContext = returnedContext;
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    private SidecarCapabilityValidationResult? ValidateEndpointRouteRelayStateLocked(
+        SidecarHostEndpointRouteRelay relay,
+        DateTimeOffset now,
+        long expectedGeneration,
+        string expectedBindingHash)
+    {
+        if (_disconnected)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Disconnected,
+                "The receiving capability session is disconnected.");
+
+        if (_bindingGeneration != expectedGeneration ||
+            !string.Equals(Binding.Authentication.BindingHash, expectedBindingHash, StringComparison.Ordinal))
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Replay,
+                "The receiving endpoint route binding changed during admission.");
+
+        if (!Binding.Grant.Allows(SidecarCapabilityKind.Action))
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthorized,
+                "The receiving session grant does not allow endpoint actions.");
+
+        if (_inFlight >= Binding.ConcurrencyLimits.MaximumInFlightCalls ||
+            _totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.ConcurrencyLimit,
+                "The receiving session call limit was reached.");
+
+        if (relay.Request is null)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidBinding,
+                "The endpoint route relay request is incomplete.");
+
+        if (!HostEndpointRouteAuthorityValidator.IsWithinLimits(relay.Request, Binding.PayloadLimits))
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.PayloadTooLarge,
+                "The endpoint route relay request exceeds the receiving session limits.");
+
+        if (!IsEndpointRouteRelayWellFormed(relay) ||
+            relay.Authority is null ||
+            relay.ReceivingParentCall is null ||
+            relay.ReceivingContext is null ||
+            relay.ReceivingContext.Contribution is null)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint route relay is not authorized for this session.");
+
+        if (HasEndpointRouteRelayCallCollision(relay.ReceivingParentCall) ||
+            HasEndpointRouteRelayCapabilityCollision(relay.ReceivingContext.CapabilityId))
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint route relay conflicts with existing session authority.");
+
+        if (relay.ReceivingParentCall.Capability != SidecarCapabilityKind.Action ||
+            relay.IssuedAt > now ||
+            relay.IssuedAt < relay.Authority.IssuedAt ||
+            relay.ExpiresAt != relay.ReceivingParentCall.Deadline ||
+            relay.ExpiresAt > relay.Authority.ExpiresAt ||
+            relay.ReceivingBindingGeneration != _bindingGeneration ||
+            relay.ReceivingParentCall.SessionId != Binding.SessionId ||
+            relay.ReceivingParentCall.RequestId != Binding.RequestId ||
+            relay.ReceivingParentCall.CancellationId != Binding.CancellationId ||
+            !string.Equals(relay.ReceivingParentCall.ModuleId, Binding.ModuleId, StringComparison.Ordinal) ||
+            !string.Equals(relay.ReceivingParentCall.GraphId, Binding.GraphId, StringComparison.Ordinal) ||
+            relay.ReceivingParentCall.Sequence != _lastSequence + 1 ||
+            relay.ReceivingParentCall.Deadline <= now ||
+            relay.ExpiresAt > Binding.ExpiresAt ||
+            relay.ReceivingContext.RequestId != Binding.RequestId ||
+            relay.ReceivingContext.CancellationId != Binding.CancellationId ||
+            relay.ReceivingContext.Deadline != relay.ReceivingParentCall.Deadline ||
+            relay.ReceivingContext.ExpiresAt != relay.ExpiresAt ||
+            relay.ReceivingCarrier != new HostActionEntryCarrierIdentity(
+                HostActionEntryIngress.Endpoint,
+                relay.ReceivingContext.InvocationId,
+                relay.ReceivingContext.Contribution.IngressBinding) ||
+            _activeEntryCarriers.ContainsKey(relay.ReceivingContext.CapabilityId) ||
+            !MatchesEndpointRelayContextTransformation(
+                relay.Request.Invocation.HostActionContext,
+                relay.ReceivingContext) ||
+            !string.Equals(
+                relay.CanonicalBindingHash,
+                SidecarCapabilityTransportValidation.ComputeEndpointRouteRelayBindingHash(relay),
+                StringComparison.OrdinalIgnoreCase))
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint route relay is not authorized for this session.");
+
+        return null;
+    }
+
+    private static bool MatchesEndpointRelayContextTransformation(
+        HostActionEntryRequestContext source,
+        HostActionEntryRequestContext receiving)
+    {
+        if (!source.IsWellFormed(DateTimeOffset.MinValue) ||
+            !receiving.IsWellFormed(DateTimeOffset.MinValue) ||
+            source.Ingress != HostActionEntryIngress.Endpoint ||
+            receiving.Ingress != HostActionEntryIngress.Endpoint ||
+            source.InvocationId != receiving.InvocationId ||
+            source.TraceId != receiving.TraceId ||
+            source.IdempotencyKey != receiving.IdempotencyKey ||
+            source.ParentInvocationId != receiving.ParentInvocationId ||
+            source.Depth != receiving.Depth ||
+            source.Attempt != receiving.Attempt ||
+            source.CapabilityId == receiving.CapabilityId ||
+            string.Equals(source.CapabilityHandle, receiving.CapabilityHandle, StringComparison.Ordinal) ||
+            source.Contribution is null ||
+            receiving.Contribution is null)
+        {
+            return false;
+        }
+
+        var expectedLineage = source.Contribution.Lineage with
+        {
+            InputTypeIdentity = typeof(HostEndpointInvocation).AssemblyQualifiedName!,
+            InputSchemaVersion = 1,
+            InputSchemaHash = "host-endpoint-invocation",
+        };
+        var expectedContribution = source.Contribution with { Lineage = expectedLineage };
+        var expectedReceiving = source with
+        {
+            CapabilityId = receiving.CapabilityId,
+            CapabilityHandle = receiving.CapabilityHandle,
+            RequestId = receiving.RequestId,
+            CancellationId = receiving.CancellationId,
+            Deadline = receiving.Deadline,
+            ExpiresAt = receiving.ExpiresAt,
+            Contribution = expectedContribution,
+        };
+        return SameEndpointContext(expectedReceiving, receiving);
+    }
+
+    private static bool IsCurrentBindingCall(
+        SidecarCapabilityCallIdentity call,
+        SidecarCapabilitySessionBinding binding) =>
+        call.SessionId == binding.SessionId &&
+        call.RequestId == binding.RequestId &&
+        call.CancellationId == binding.CancellationId &&
+        string.Equals(call.ModuleId, binding.ModuleId, StringComparison.Ordinal) &&
+        string.Equals(call.GraphId, binding.GraphId, StringComparison.Ordinal);
+
+    private bool HasEndpointRouteRelayCallCollision(SidecarCapabilityCallIdentity call) =>
+        _calls.ContainsKey(call.CallId) ||
+        _callIdentities.ContainsKey(call.CallId) ||
+        _callPayloads.ContainsKey(call.CallId) ||
+        _endpointRouteAdmissions.ContainsKey(call.CallId) ||
+        _endpointRouteRelayAdmissions.ContainsKey(call.CallId) ||
+        _reservedNestedCalls.ContainsKey(call.CallId) ||
+        _callEntryContexts.ContainsKey(call.CallId) ||
+        _storageContinuationParents.ContainsKey(call.CallId) ||
+        _callBudgetRoots.ContainsKey(call.CallId) ||
+        _peerParentBudgetRoots.ContainsKey(call.CallId) ||
+        _completedCalls.Contains(call.CallId) ||
+        _nonces.Contains(call.ReplayNonce) ||
+        _issuedEndpointRouteAuthorities.Values.Any(authority =>
+            IsCurrentBindingCall(authority.Call, Binding) &&
+            (authority.Call.CallId == call.CallId ||
+             string.Equals(authority.Call.ReplayNonce, call.ReplayNonce, StringComparison.Ordinal))) ||
+        _issuedEndpointRouteRelays.Values.Any(relay =>
+            (IsCurrentBindingCall(relay.Authority.Call, Binding) &&
+             (relay.Authority.Call.CallId == call.CallId ||
+              string.Equals(relay.Authority.Call.ReplayNonce, call.ReplayNonce, StringComparison.Ordinal))) ||
+            (IsCurrentBindingCall(relay.ReceivingParentCall, Binding) &&
+             (relay.ReceivingParentCall.CallId == call.CallId ||
+              string.Equals(relay.ReceivingParentCall.ReplayNonce, call.ReplayNonce, StringComparison.Ordinal))));
+
+    private static T CloneTransport<T>(T value) =>
+        SidecarCapabilityTransportCodec.Deserialize<T>(
+            SidecarCapabilityTransportCodec.Serialize(value));
+
+    private static bool IsEndpointRouteRelayWellFormed(
+        SidecarHostEndpointRouteRelay relay)
+    {
+        try
+        {
+            return relay.IsWellFormed;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool HasEndpointRouteRelayCapabilityCollision(Guid capabilityId) =>
+        _issuedEntryContexts.ContainsKey(capabilityId) ||
+        _activeEntryContexts.ContainsKey(capabilityId) ||
+        _activeEntryCarriers.ContainsKey(capabilityId) ||
+        _entryBudgetRoots.ContainsKey(capabilityId) ||
+        _entryBudgetReservations.ContainsKey(capabilityId) ||
+        _budgetExtensionClaims.ContainsKey(capabilityId) ||
+        _nestedCarrierIds.Contains(capabilityId) ||
+        _nestedCarrierStates.ContainsKey(capabilityId) ||
+        _rootHostActionEntryStates.ContainsKey(capabilityId) ||
+        _crossSidecarStates.ContainsKey(capabilityId) ||
+        _completedEntryCarriers.ContainsKey(capabilityId) ||
+        _consumedEntryCarriers.Contains(capabilityId) ||
+        _endpointRouteAdmissions.Values.Any(state => state.Context.CapabilityId == capabilityId) ||
+        _endpointRouteRelayAdmissions.Values.Any(state => state.Context.CapabilityId == capabilityId) ||
+        _issuedEndpointRouteAuthorities.Values.Any(authority => authority.HostActionContext.CapabilityId == capabilityId) ||
+        _issuedEndpointRouteRelays.Values.Any(relay => relay.ReceivingContext.CapabilityId == capabilityId) ||
+        _storageContinuationStates.Values.Any(state => state.Authority.CarrierId == capabilityId) ||
+        _issuedStorageContinuationStates.Values.Any(state => state.Authority.CarrierId == capabilityId);
+
+    public SidecarCapabilityValidationResult CompleteHostEndpointRouteRelay(
+        SidecarHostEndpointRouteRelay relay,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(relay);
+
+        lock (_sync)
+        {
+            if (relay.Authority is null || relay.Authority.AuthorityId == Guid.Empty)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint route relay has no valid authority identity.");
+
+            SweepExpiredEntryContexts(now);
+            if (!_issuedEndpointRouteRelays.TryGetValue(relay.Authority.AuthorityId, out var issuedRelay) ||
+                !SidecarCapabilityTransportCodec.Serialize(issuedRelay).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(relay)))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint route relay was already completed or revoked.");
+            }
+
+            if (now >= issuedRelay.ExpiresAt)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Expired,
+                    "The endpoint route relay has expired.");
+
+            RemoveEntryCarrier(issuedRelay.Authority.HostActionContext.CapabilityId, now);
             return SidecarCapabilityValidationResult.Accept();
         }
     }
@@ -3664,7 +4469,9 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
             if (_issuedEntryContexts.Count != 0 ||
                 _issuedEndpointRouteAuthorities.Count != 0 ||
+                _issuedEndpointRouteRelays.Count != 0 ||
                 _endpointRouteAdmissions.Count != 0 ||
+                _endpointRouteRelayAdmissions.Count != 0 ||
                 _rootHostActionEntryStates.Count != 0 ||
                 _nestedCarrierStates.Count != 0 ||
                 _reservedNestedCalls.Count != 0 ||
@@ -3935,30 +4742,44 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
             var hasEndpointRouteAdmission =
                 _endpointRouteAdmissions.TryGetValue(identity.CallId, out var endpointAdmission);
+            var hasEndpointRouteRelayAdmission =
+                _endpointRouteRelayAdmissions.TryGetValue(identity.CallId, out var endpointRelayAdmission);
             var reservedEndpointRouteCall = hasEndpointRouteAdmission &&
                 hostContext is not null &&
                 endpointAdmission!.Authority.Call == identity &&
                 HostActionEntryAuthorityValidator.SameContext(
                     hostContext,
                     endpointAdmission.Context);
-            if (hasEndpointRouteAdmission && !reservedEndpointRouteCall)
+            var reservedEndpointRouteRelayCall = hasEndpointRouteRelayAdmission &&
+                hostContext is not null &&
+                endpointRelayAdmission!.Relay.ReceivingParentCall == identity &&
+                HostActionEntryAuthorityValidator.SameContext(
+                    hostContext,
+                    endpointRelayAdmission.Context);
+            if ((hasEndpointRouteAdmission && !reservedEndpointRouteCall) ||
+                (hasEndpointRouteRelayAdmission && !reservedEndpointRouteRelayCall))
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
                     "The endpoint route admission does not match the active call.");
 
             if (hostContext?.Ingress == HostActionEntryIngress.Endpoint &&
-                !reservedEndpointRouteCall)
+                !reservedEndpointRouteCall &&
+                !reservedEndpointRouteRelayCall)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
                     "An endpoint action requires its reserved route admission.");
 
-            if (reservedEndpointRouteCall &&
+            if ((reservedEndpointRouteCall || reservedEndpointRouteRelayCall) &&
                 (payload is null ||
                  !string.Equals(
-                     payload.ContentHash,
-                     endpointAdmission!.Authority.InvocationContentHash,
-                     StringComparison.OrdinalIgnoreCase) ||
-                 payload.ByteLength != endpointAdmission.Authority.InvocationByteLength))
+                      payload.ContentHash,
+                      reservedEndpointRouteCall
+                          ? endpointAdmission!.Authority.InvocationContentHash
+                          : endpointRelayAdmission!.Relay.Authority.InvocationContentHash,
+                      StringComparison.OrdinalIgnoreCase) ||
+                  payload.ByteLength != (reservedEndpointRouteCall
+                      ? endpointAdmission!.Authority.InvocationByteLength
+                      : endpointRelayAdmission!.Relay.Authority.InvocationByteLength)))
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
                     "The endpoint action payload does not match its admitted invocation.");
@@ -4030,6 +4851,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             var usesBudgetExtension =
                 !reservedNestedCall &&
                 !reservedEndpointRouteCall &&
+                !reservedEndpointRouteRelayCall &&
                 hostContext is not null &&
                 _totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest;
             if (usesBudgetExtension && !HasAvailableBudgetExtension(budgetRootId, now))
@@ -4041,6 +4863,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
             if (!reservedNestedCall &&
                 !reservedEndpointRouteCall &&
+                !reservedEndpointRouteRelayCall &&
                 identity.Sequence != _lastSequence + 1)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Replay,
@@ -4062,13 +4885,17 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             if (!payloadResult.Accepted)
                 return payloadResult;
 
-            if (reservedEndpointRouteCall &&
+            if ((reservedEndpointRouteCall || reservedEndpointRouteRelayCall) &&
                 (payload is null ||
                  !string.Equals(
-                     payload.ContentHash,
-                     endpointAdmission!.Authority.InvocationContentHash,
-                     StringComparison.OrdinalIgnoreCase) ||
-                 payload.ByteLength != endpointAdmission.Authority.InvocationByteLength))
+                      payload.ContentHash,
+                      reservedEndpointRouteCall
+                          ? endpointAdmission!.Authority.InvocationContentHash
+                          : endpointRelayAdmission!.Relay.Authority.InvocationContentHash,
+                      StringComparison.OrdinalIgnoreCase) ||
+                  payload.ByteLength != (reservedEndpointRouteCall
+                      ? endpointAdmission!.Authority.InvocationByteLength
+                      : endpointRelayAdmission!.Relay.Authority.InvocationByteLength)))
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
                     "The endpoint action payload does not match its admitted invocation.");
@@ -4096,6 +4923,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 _completedCalls.Contains(identity.CallId) ||
                 (!reservedNestedCall &&
                  !reservedEndpointRouteCall &&
+                 !reservedEndpointRouteRelayCall &&
                  !usesStorageContinuation &&
                  !_nonces.Add(identity.ReplayNonce)))
             {
@@ -4106,6 +4934,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
             if (!reservedNestedCall &&
                 !reservedEndpointRouteCall &&
+                !reservedEndpointRouteRelayCall &&
                 _inFlight >= Binding.ConcurrencyLimits.MaximumInFlightCalls)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.ConcurrencyLimit,
@@ -4113,6 +4942,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
             if (!reservedNestedCall &&
                 !reservedEndpointRouteCall &&
+                !reservedEndpointRouteRelayCall &&
                 !usesBudgetExtension &&
                 !usesStorageContinuation &&
                 _totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest)
@@ -4150,9 +4980,11 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             }
             if (reservedEndpointRouteCall)
                 _endpointRouteAdmissions.Remove(identity.CallId);
+            if (reservedEndpointRouteRelayCall)
+                _endpointRouteRelayAdmissions.Remove(identity.CallId);
             if (reservedNestedCall)
                 _reservedNestedCalls.Remove(identity.CallId);
-            else if (!reservedEndpointRouteCall)
+            else if (!reservedEndpointRouteCall && !reservedEndpointRouteRelayCall)
             {
                 _lastSequence = identity.Sequence;
                 if (!usesBudgetExtension && !usesStorageContinuation)
@@ -4349,9 +5181,25 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         {
             _issuedEndpointRouteAuthorities.Remove(authorityId);
         }
+        foreach (var authorityId in _issuedEndpointRouteRelays
+            .Where(pair => pair.Value.ExpiresAt <= now)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _issuedEndpointRouteRelays.Remove(authorityId);
+        }
 
         foreach (var admission in _endpointRouteAdmissions.Values
             .Where(state => state.Authority.ExpiresAt <= now)
+            .Select(state => state.Context.CapabilityId)
+            .ToArray())
+        {
+            RemoveEntryCarrier(admission, now);
+            removed++;
+        }
+
+        foreach (var admission in _endpointRouteRelayAdmissions.Values
+            .Where(state => state.Relay.ExpiresAt <= now)
             .Select(state => state.Context.CapabilityId)
             .ToArray())
         {
@@ -4642,6 +5490,14 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             .ToArray())
         {
             _endpointRouteAdmissions.Remove(admission);
+                _inFlight = Math.Max(0, _inFlight - 1);
+        }
+        foreach (var admission in _endpointRouteRelayAdmissions
+            .Where(pair => pair.Value.Context.CapabilityId == capabilityId)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _endpointRouteRelayAdmissions.Remove(admission);
             _inFlight = Math.Max(0, _inFlight - 1);
         }
         foreach (var authorityId in _issuedEndpointRouteAuthorities
@@ -4650,6 +5506,15 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             .ToArray())
         {
             _issuedEndpointRouteAuthorities.Remove(authorityId);
+        }
+        foreach (var authorityId in _issuedEndpointRouteRelays
+            .Where(pair =>
+                pair.Value.ReceivingContext.CapabilityId == capabilityId ||
+                pair.Value.Authority.HostActionContext.CapabilityId == capabilityId)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _issuedEndpointRouteRelays.Remove(authorityId);
         }
         _issuedEntryContexts.Remove(capabilityId);
         _activeEntryContexts.Remove(capabilityId);
@@ -5046,7 +5911,9 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _callEntryContexts.Clear();
             _issuedEntryContexts.Clear();
             _issuedEndpointRouteAuthorities.Clear();
+            _issuedEndpointRouteRelays.Clear();
             _endpointRouteAdmissions.Clear();
+            _endpointRouteRelayAdmissions.Clear();
             _activeEntryCarriers.Clear();
             _activeEntryContexts.Clear();
             _entryBudgetRoots.Clear();
@@ -5497,6 +6364,43 @@ public sealed record SidecarNestedHostActionEntryRelay(
               PeerCall.CallId == Carrier.CallId &&
               PeerCall.Deadline == Call.Deadline &&
                PeerCall.Sequence == Call.Sequence);
+}
+
+/// <summary>Host-issued endpoint route authority for one receiving session.</summary>
+public sealed record SidecarHostEndpointRouteRelay(
+    HostEndpointRouteRequest Request,
+    HostEndpointRouteAuthority Authority,
+    SidecarCapabilityCallIdentity ReceivingParentCall,
+    HostActionEntryRequestContext ReceivingContext,
+    HostActionEntryCarrierIdentity ReceivingCarrier,
+    long ReceivingBindingGeneration,
+    DateTimeOffset IssuedAt,
+    DateTimeOffset ExpiresAt,
+    string CanonicalBindingHash,
+    string Proof)
+{
+    public bool IsWellFormed =>
+        Request is not null &&
+        Request.Invocation is not null &&
+        Request.IsWellFormed(DateTimeOffset.MinValue) &&
+        Authority is not null &&
+        Authority.IsWellFormed &&
+        ReceivingParentCall is not null &&
+        ReceivingParentCall.IsValid &&
+        ReceivingContext is not null &&
+        ReceivingContext.Contribution is not null &&
+        ReceivingCarrier is not null &&
+        ReceivingCarrier.IsWellFormed &&
+        ReceivingContext.IsWellFormed(DateTimeOffset.MinValue) &&
+        ReceivingContext.Ingress == HostActionEntryIngress.Endpoint &&
+        ReceivingContext.InvocationId == Request.Invocation.InvocationId &&
+        ReceivingCarrier.InvocationId == ReceivingContext.InvocationId &&
+        ReceivingCarrier.Ingress == HostActionEntryIngress.Endpoint &&
+        ReceivingCarrier.Contribution == ReceivingContext.Contribution!.IngressBinding &&
+        ReceivingBindingGeneration > 0 &&
+        IssuedAt <= ExpiresAt &&
+        !string.IsNullOrWhiteSpace(CanonicalBindingHash) &&
+        !string.IsNullOrWhiteSpace(Proof);
 }
 
 public sealed record SidecarHostActionEntryRootRelay(
@@ -7481,6 +8385,30 @@ public static class SidecarCapabilityTransportValidation
     public static string ComputeSnapshotHash(ActionPipelineSnapshot snapshot) =>
         SidecarCapabilityTransportCodec.ComputeSha256(
             SidecarCapabilityTransportCodec.Serialize(snapshot));
+
+    public static string ComputeEndpointRouteRelayBindingHash(
+        SidecarHostEndpointRouteRelay relay)
+    {
+        ArgumentNullException.ThrowIfNull(relay);
+        var canonical = new
+        {
+            Request = Convert.ToBase64String(
+                SidecarCapabilityTransportCodec.Serialize(relay.Request)),
+            Authority = Convert.ToBase64String(
+                SidecarCapabilityTransportCodec.Serialize(relay.Authority)),
+            ReceivingParentCall = Convert.ToBase64String(
+                SidecarCapabilityTransportCodec.Serialize(relay.ReceivingParentCall)),
+            ReceivingContext = Convert.ToBase64String(
+                SidecarCapabilityTransportCodec.Serialize(relay.ReceivingContext)),
+            ReceivingCarrier = Convert.ToBase64String(
+                SidecarCapabilityTransportCodec.Serialize(relay.ReceivingCarrier)),
+            relay.ReceivingBindingGeneration,
+            relay.IssuedAt,
+            relay.ExpiresAt,
+        };
+        return SidecarCapabilityTransportCodec.ComputeSha256(
+            SidecarCapabilityTransportCodec.Serialize(canonical));
+    }
 
     public static string ComputeHostActionEntryContextBindingHash(
         HostActionEntryRequestContext context)
