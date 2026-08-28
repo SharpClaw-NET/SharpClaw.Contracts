@@ -635,6 +635,115 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Theory]
+    [InlineData("authority", "call-id")]
+    [InlineData("authority", "replay-nonce")]
+    [InlineData("reservation", "call-id")]
+    [InlineData("reservation", "replay-nonce")]
+    public void Endpoint_route_rejects_invalid_call_identity_without_state(
+        string path,
+        string mutation)
+    {
+        static bool Authenticate(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var fixture = CreateFixture(
+            authenticateEndpointRouteAuthority: Authenticate,
+            actionInputBytes: 4096,
+            protocolMessageBytes: 4096);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint,
+            actionDeadline: fixture.Now.AddMinutes(1),
+            contextExpiresAt: fixture.Now.AddMinutes(1));
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var validCall = ActionCall(fixture, 1, $"invalid-call-{path}-{mutation}");
+        var invalidCall = mutation == "call-id"
+            ? validCall with { CallId = Guid.Empty }
+            : validCall with { ReplayNonce = string.Empty };
+
+        if (path == "authority")
+        {
+            var rejected = fixture.Session.IssueHostEndpointRouteAuthority(
+                request,
+                invalidCall,
+                fixture.Now,
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+                out var rejectedAuthority);
+            Assert.False(rejected.Accepted);
+            Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, rejected.Code);
+            Assert.Null(rejectedAuthority);
+        }
+        else
+        {
+            var rejected = fixture.Session.IssueHostEndpointRouteReservation(
+                request,
+                invalidCall,
+                fixture.Now,
+                reservation => SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                    reservation),
+                out var rejectedReservation);
+            Assert.False(rejected.Accepted);
+            Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, rejected.Code);
+            Assert.Null(rejectedReservation);
+        }
+
+        Assert.Equal(0, fixture.Session.LastSequence);
+        Assert.Equal(1, fixture.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(0, fixture.Session.ActiveHostActionEntryCarrierCount);
+
+        if (path == "authority")
+        {
+            var issued = fixture.Session.IssueHostEndpointRouteAuthority(
+                request,
+                validCall,
+                fixture.Now,
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+                out var authority);
+            Assert.True(issued.Accepted, issued.Message);
+            Assert.NotNull(authority);
+            var carrier = new HostActionEntryCarrierIdentity(
+                HostActionEntryIngress.Endpoint,
+                context.InvocationId,
+                context.Contribution!.IngressBinding);
+            var admitted = fixture.Session.BeginHostEndpointRouteCarrier(
+                request,
+                authority!,
+                carrier,
+                fixture.Now,
+                out var carrierAuthority);
+            Assert.True(admitted.Accepted, admitted.Message);
+            Assert.True(
+                fixture.Session.CompleteHostActionEntryCarrier(
+                    carrierAuthority!,
+                    HostActionEntryCarrierCompletionKind.Failed,
+                    fixture.Now).Accepted);
+        }
+        else
+        {
+            var issued = fixture.Session.IssueHostEndpointRouteReservation(
+                request,
+                validCall,
+                fixture.Now,
+                reservation => SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                    reservation),
+                out var reservation);
+            Assert.True(issued.Accepted, issued.Message);
+            Assert.NotNull(reservation);
+            Assert.True(
+                fixture.Session.ReleaseHostEndpointRouteReservation(
+                    reservation!,
+                    fixture.Now).Accepted);
+        }
+
+        var rotated = CreateRotatedBinding(fixture, $"invalid-call-{path}-{mutation}-rotation");
+        fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+        var cleanupTime = fixture.Now.AddMinutes(1).AddSeconds(1);
+        fixture.Session.SweepExpiredHostActionEntryCarriers(cleanupTime);
+        Assert.True(fixture.Session.RotateBinding(rotated, cleanupTime).Accepted);
+    }
+
+    [Theory]
     [InlineData("/demo", "get")]
     [InlineData("/demo", "\u00C9")]
     [InlineData("/demo", "GET ")]
@@ -989,6 +1098,370 @@ public sealed class SidecarCapabilityTransportTests
         fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
         var rotation = fixture.Session.RotateBinding(rotated, fixture.Now);
         Assert.True(rotation.Accepted, rotation.Message);
+    }
+
+    [Theory]
+    [InlineData(1, 4)]
+    [InlineData(4, 1)]
+    public void Endpoint_route_reservation_exact_retry_precedes_capacity_limits(
+        int maxInFlight,
+        int maxCalls)
+    {
+        var fixture = CreateFixture(
+            maxInFlight: maxInFlight,
+            maxCalls: maxCalls);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("reservation-retry"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var call = ActionCall(fixture, 1, "reservation-retry");
+        var issue = fixture.Session.IssueHostEndpointRouteReservation(
+            request,
+            call,
+            fixture.Now,
+            reservation => SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                reservation),
+            out var first);
+
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(first);
+        var firstBytes = SidecarCapabilityTransportCodec.Serialize(first);
+        var sequence = fixture.Session.LastSequence;
+
+        var retry = fixture.Session.IssueHostEndpointRouteReservation(
+            request,
+            call,
+            fixture.Now,
+            reservation => SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                reservation),
+            out var second);
+
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.NotNull(second);
+        Assert.Equal(firstBytes, SidecarCapabilityTransportCodec.Serialize(second));
+        Assert.Equal(sequence, fixture.Session.LastSequence);
+        Assert.Equal(0, fixture.Session.ActiveHostActionEntryCarrierCount);
+
+        Assert.True(fixture.Session.ReleaseHostEndpointRouteReservation(second!, fixture.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            fixture.Session.ReleaseHostEndpointRouteReservation(second!, fixture.Now).Code);
+        Assert.Equal(0, fixture.Session.LastSequence);
+    }
+
+    [Theory]
+    [InlineData("signer-failure")]
+    [InlineData("signer-mutation")]
+    [InlineData("disconnect")]
+    [InlineData("rotation")]
+    [InlineData("expiry")]
+    [InlineData("release")]
+    [InlineData("abandoned")]
+    public void Endpoint_route_reservation_direct_lifecycle_preserves_state(string lifecycle)
+    {
+        var fixture = CreateFixture(maxInFlight: 4, maxCalls: 4);
+        var contextDeadline = fixture.Now.AddMinutes(1);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("reservation-lifecycle"),
+            HostActionEntryIngress.Endpoint,
+            actionDeadline: contextDeadline,
+            contextExpiresAt: contextDeadline);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var call = ActionCall(fixture, 1, "reservation-lifecycle");
+        static string Proof(SidecarHostEndpointRouteReservation reservation) =>
+            SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                reservation);
+
+        if (lifecycle is "signer-failure" or "signer-mutation" or "disconnect")
+        {
+            var failed = fixture.Session.IssueHostEndpointRouteReservation(
+                request,
+                call,
+                fixture.Now,
+                lifecycle == "signer-failure"
+                    ? _ => throw new InvalidOperationException("test signer failure")
+                    : lifecycle == "signer-mutation"
+                        ? reservation =>
+                        {
+                            reservation.Request.Body[0] = 99;
+                            return Proof(reservation);
+                        }
+                        : reservation =>
+                        {
+                            fixture.Session.Disconnect();
+                            return Proof(reservation);
+                        },
+                out var rejectedReservation);
+
+            Assert.False(failed.Accepted);
+            Assert.Equal(
+                lifecycle == "disconnect"
+                    ? SidecarCapabilityErrors.Disconnected
+                    : SidecarCapabilityErrors.Unauthenticated,
+                failed.Code);
+            Assert.Null(rejectedReservation);
+            Assert.Equal(0, fixture.Session.LastSequence);
+            Assert.Equal(0, fixture.Session.ActiveHostActionEntryCarrierCount);
+            if (lifecycle == "disconnect")
+                return;
+
+            var retry = fixture.Session.IssueHostEndpointRouteReservation(
+                request,
+                call,
+                fixture.Now,
+                Proof,
+                out var reservation);
+            Assert.True(retry.Accepted, retry.Message);
+            Assert.True(fixture.Session.ReleaseHostEndpointRouteReservation(reservation!, fixture.Now).Accepted);
+            return;
+        }
+
+        var issued = fixture.Session.IssueHostEndpointRouteReservation(
+            request,
+            call,
+            fixture.Now,
+            Proof,
+            out var reservationResult);
+        Assert.True(issued.Accepted, issued.Message);
+        Assert.NotNull(reservationResult);
+
+        if (lifecycle == "rotation")
+        {
+            var rotated = CreateRotatedBinding(fixture, "reservation-lifecycle-rotation");
+            fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+            Assert.False(fixture.Session.RotateBinding(rotated, fixture.Now).Accepted);
+            Assert.True(fixture.Session.ReleaseHostEndpointRouteReservation(reservationResult!, fixture.Now).Accepted);
+            Assert.True(
+                fixture.Session.SweepExpiredHostActionEntryCarriers(contextDeadline.AddSeconds(1)) > 0);
+            Assert.True(fixture.Session.RotateBinding(rotated, contextDeadline.AddSeconds(1)).Accepted);
+            return;
+        }
+
+        if (lifecycle is "expiry" or "abandoned")
+        {
+            Assert.True(
+                fixture.Session.SweepExpiredHostActionEntryCarriers(
+                    fixture.Now.AddMinutes(2)) > 0);
+            var rotated = CreateRotatedBinding(fixture, "reservation-lifecycle-expiry");
+            fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+            Assert.True(fixture.Session.RotateBinding(rotated, contextDeadline.AddSeconds(1)).Accepted);
+            return;
+        }
+
+        Assert.True(fixture.Session.ReleaseHostEndpointRouteReservation(reservationResult!, fixture.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            fixture.Session.ReleaseHostEndpointRouteReservation(reservationResult!, fixture.Now).Code);
+        var retryAfterRelease = fixture.Session.IssueHostEndpointRouteReservation(
+            request,
+            call,
+            fixture.Now,
+            Proof,
+            out var retriedReservation);
+        Assert.True(retryAfterRelease.Accepted, retryAfterRelease.Message);
+        Assert.True(fixture.Session.ReleaseHostEndpointRouteReservation(retriedReservation!, fixture.Now).Accepted);
+        var rotatedAfterRelease = CreateRotatedBinding(fixture, "reservation-lifecycle-release");
+        fixture.BindingHashes.Add(rotatedAfterRelease.Authentication.BindingHash);
+        Assert.True(
+            fixture.Session.SweepExpiredHostActionEntryCarriers(contextDeadline.AddSeconds(1)) > 0);
+        Assert.True(
+            fixture.Session.RotateBinding(rotatedAfterRelease, contextDeadline.AddSeconds(1)).Accepted);
+    }
+
+    [Theory]
+    [InlineData("session")]
+    [InlineData("request")]
+    [InlineData("cancellation")]
+    [InlineData("module")]
+    [InlineData("graph")]
+    [InlineData("capability")]
+    [InlineData("call")]
+    [InlineData("nonce")]
+    [InlineData("sequence")]
+    [InlineData("deadline")]
+    [InlineData("request-header")]
+    [InlineData("request-query")]
+    [InlineData("request-body")]
+    public void Endpoint_route_reservation_changed_call_or_request_does_not_retrieve_existing(
+        string mutation)
+    {
+        var fixture = CreateFixture(maxInFlight: 4, maxCalls: 4);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("reservation-identity"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var call = ActionCall(fixture, 1, "reservation-identity");
+        var issue = fixture.Session.IssueHostEndpointRouteReservation(
+            request,
+            call,
+            fixture.Now,
+            reservation => SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                reservation),
+            out var original);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(original);
+        var sequence = fixture.Session.LastSequence;
+
+        var changedCall = call;
+        var changedRequest = request;
+        switch (mutation)
+        {
+            case "session":
+                changedCall = call with { SessionId = Guid.NewGuid() };
+                break;
+            case "request":
+                changedCall = call with { RequestId = Guid.NewGuid() };
+                break;
+            case "cancellation":
+                changedCall = call with { CancellationId = Guid.NewGuid() };
+                break;
+            case "module":
+                changedCall = call with { ModuleId = "other-module" };
+                break;
+            case "graph":
+                changedCall = call with { GraphId = "other-graph" };
+                break;
+            case "capability":
+                changedCall = call with { Capability = SidecarCapabilityKind.Storage };
+                break;
+            case "call":
+                changedCall = call with { CallId = Guid.NewGuid() };
+                break;
+            case "nonce":
+                changedCall = call with { ReplayNonce = "changed-reservation-nonce" };
+                break;
+            case "sequence":
+                changedCall = call with { Sequence = call.Sequence + 1 };
+                break;
+            case "deadline":
+                changedCall = call with { Deadline = call.Deadline.AddSeconds(1) };
+                break;
+            case "request-header":
+                changedRequest = request with
+                {
+                    Headers = new Dictionary<string, string[]>(request.Headers)
+                    {
+                        ["x-request"] = ["changed"],
+                    },
+                };
+                break;
+            case "request-query":
+                changedRequest = request with
+                {
+                    Query = new Dictionary<string, string[]>(request.Query)
+                    {
+                        ["tag"] = ["changed"],
+                    },
+                };
+                break;
+            case "request-body":
+                changedRequest = request with { Body = [9, 8, 7] };
+                break;
+        }
+
+        var rejected = fixture.Session.IssueHostEndpointRouteReservation(
+            changedRequest,
+            changedCall,
+            fixture.Now,
+            reservation => SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                reservation),
+            out var changedReservation);
+
+        Assert.False(rejected.Accepted, rejected.Message);
+        Assert.Null(changedReservation);
+        Assert.Equal(sequence, fixture.Session.LastSequence);
+        var retry = fixture.Session.IssueHostEndpointRouteReservation(
+            request,
+            call,
+            fixture.Now,
+            reservation => SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                reservation),
+            out var exactRetry);
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.Equal(
+            SidecarCapabilityTransportCodec.Serialize(original),
+            SidecarCapabilityTransportCodec.Serialize(exactRetry));
+        Assert.True(fixture.Session.ReleaseHostEndpointRouteReservation(exactRetry!, fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public void Endpoint_route_reservation_callbacks_use_detached_input_snapshots()
+    {
+        var features = new ExtensionFeatureSet(new List<ExtensionFeature>
+        {
+            new ExtensionFeature(
+                "reservation.feature",
+                1,
+                "module-a",
+                128,
+                JsonDocument.Parse("{\"mode\":\"snapshot\"}").RootElement.Clone()),
+        });
+        var fixture = CreateFixture(maxInFlight: 4, maxCalls: 4);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal(
+                "reservation-snapshot",
+                Roles: new HashSet<string>(["reader"], StringComparer.Ordinal)),
+            HostActionEntryIngress.Endpoint,
+            features: features);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var call = ActionCall(fixture, 1, "reservation-snapshot");
+        var pristineRequestBytes = SidecarCapabilityTransportCodec.Serialize(request);
+        Exception? mutationError = null;
+
+        var issue = fixture.Session.IssueHostEndpointRouteReservation(
+            request,
+            call,
+            fixture.Now,
+            reservation =>
+            {
+                try
+                {
+                    ((ISet<string>)request.Invocation.HostActionContext.Caller.Roles!).Add("mutated-role");
+                    ((IList<ExtensionFeature>)request.Invocation.HostActionContext.Features.Items)[0] =
+                        new ExtensionFeature(
+                            "mutated.feature",
+                            1,
+                            "module-a",
+                            1,
+                            JsonDocument.Parse("{}").RootElement.Clone());
+                    request.Headers["x-request"][0] = "mutated-header";
+                    request.Query["tag"][0] = "mutated-query";
+                    request.Body[0] = 99;
+                }
+                catch (Exception ex)
+                {
+                    mutationError = ex;
+                }
+                return SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                    reservation);
+            },
+            out var reservation);
+
+        Assert.Null(mutationError);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(reservation);
+        Assert.Equal(
+            pristineRequestBytes,
+            SidecarCapabilityTransportCodec.Serialize(reservation!.Request));
+
+        var pristineRequest = SidecarCapabilityTransportCodec.Deserialize<HostEndpointRouteRequest>(
+            pristineRequestBytes);
+        var retry = fixture.Session.IssueHostEndpointRouteReservation(
+            pristineRequest,
+            call,
+            fixture.Now,
+            candidate => SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                candidate),
+            out var exactRetry);
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.Equal(
+            SidecarCapabilityTransportCodec.Serialize(reservation),
+            SidecarCapabilityTransportCodec.Serialize(exactRetry));
+        Assert.True(fixture.Session.ReleaseHostEndpointRouteReservation(exactRetry!, fixture.Now).Accepted);
     }
 
     [Theory]
@@ -1527,6 +2000,135 @@ public sealed class SidecarCapabilityTransportTests
         Assert.NotNull(relay);
     }
 
+    [Fact]
+    public void Endpoint_route_relay_callbacks_use_detached_input_snapshots()
+    {
+        static bool AuthenticateAuthority(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(actionInputBytes: 4096, protocolMessageBytes: 4096);
+        var receiving = CreateMirroredFixture(
+            source,
+            authenticateEndpointRouteAuthority: AuthenticateAuthority,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var features = new ExtensionFeatureSet(new List<ExtensionFeature>
+        {
+            new ExtensionFeature(
+                "relay.snapshot.feature",
+                1,
+                "module-a",
+                128,
+                JsonDocument.Parse("{\"mode\":\"relay-snapshot\"}").RootElement.Clone()),
+        });
+        var inputs = CreateEndpointRelayInputs(
+            source,
+            receiving,
+            "relay-input-snapshot",
+            new RequestPrincipal(
+                "relay-snapshot",
+                Roles: new HashSet<string>(["reader"], StringComparer.Ordinal)),
+            features);
+        var reservationIssue = receiving.Session.IssueHostEndpointRouteReservation(
+            inputs.Request,
+            inputs.ReceivingCall,
+            source.Now,
+            reservation => KeyedEndpointProof(
+                "reservation",
+                SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                    reservation)),
+            out var reservation);
+        Assert.True(reservationIssue.Accepted, reservationIssue.Message);
+        Assert.NotNull(reservation);
+
+        var pristineRequestBytes = SidecarCapabilityTransportCodec.Serialize(inputs.Request);
+        var pristineReservationBytes = SidecarCapabilityTransportCodec.Serialize(reservation);
+        Exception? reservationMutationError = null;
+        Exception? requestMutationError = null;
+        var issue = source.Session.IssueHostEndpointRouteRelay(
+            inputs.Request,
+            inputs.SourceCall,
+            reservation!,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (candidate, hash) =>
+            {
+                try
+                {
+                    ((ISet<string>)reservation!.ReceivingContext.Caller.Roles!).Add("mutated-reservation-role");
+                }
+                catch (Exception ex)
+                {
+                    reservationMutationError = ex;
+                }
+                try
+                {
+                    ((IList<ExtensionFeature>)reservation.ReceivingContext.Features.Items)[0] =
+                        new ExtensionFeature(
+                            "mutated.reservation.feature",
+                            1,
+                            "module-a",
+                            1,
+                            JsonDocument.Parse("{}").RootElement.Clone());
+                    reservation.Request.Headers["x-request"][0] = "mutated-reservation-header";
+                    reservation.Request.Query["tag"][0] = "mutated-reservation-query";
+                    reservation.Request.Body[0] = 99;
+                }
+                catch (Exception ex)
+                {
+                    reservationMutationError = ex;
+                }
+                return candidate.Proof == KeyedEndpointProof("reservation", hash);
+            },
+            (candidate, hash) =>
+            {
+                try
+                {
+                    ((ISet<string>)inputs.Request.Invocation.HostActionContext.Caller.Roles!).Add(
+                        "mutated-request-role");
+                    ((IList<ExtensionFeature>)inputs.Request.Invocation.HostActionContext.Features.Items)[0] =
+                        new ExtensionFeature(
+                            "mutated.request.feature",
+                            1,
+                            "module-a",
+                            1,
+                            JsonDocument.Parse("{}").RootElement.Clone());
+                    inputs.Request.Headers["x-request"][0] = "mutated-request-header";
+                    inputs.Request.Query["tag"][0] = "mutated-request-query";
+                    inputs.Request.Body[0] = 98;
+                }
+                catch (Exception ex)
+                {
+                    requestMutationError = ex;
+                }
+                return KeyedEndpointProof("relay", hash);
+            },
+            out var relay);
+
+        Assert.Null(reservationMutationError);
+        Assert.Null(requestMutationError);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(relay);
+        Assert.Equal(
+            pristineRequestBytes,
+            SidecarCapabilityTransportCodec.Serialize(relay!.Request));
+        Assert.Equal(
+            pristineReservationBytes,
+            SidecarCapabilityTransportCodec.Serialize(relay.ReceivingReservation));
+
+        var pristineReservation = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteReservation>(
+            pristineReservationBytes);
+        Assert.True(source.Session.CompleteHostEndpointRouteRelay(relay, source.Now).Accepted);
+        Assert.True(
+            receiving.Session.ReleaseHostEndpointRouteReservation(
+                pristineReservation,
+                receiving.Now).Accepted);
+    }
+
     [Theory]
     [InlineData("invocation")]
     [InlineData("route")]
@@ -1638,6 +2240,7 @@ public sealed class SidecarCapabilityTransportTests
                 HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
             (relay, hash) => KeyedEndpointProof("relay", hash),
             out var relay).Accepted);
+        var reservedSequence = receiving.Session.LastSequence;
         var original = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteRelay>(
             SidecarCapabilityTransportCodec.Serialize(relay));
         var mutated = original;
@@ -1694,7 +2297,7 @@ public sealed class SidecarCapabilityTransportTests
                 ? SidecarCapabilityErrors.Unauthenticated
                 : SidecarCapabilityErrors.SpoofedIdentity,
             rejected.Code);
-        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(reservedSequence, receiving.Session.LastSequence);
         Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
 
         var accepted = receiving.Session.ImportHostEndpointRouteRelay(
@@ -1732,6 +2335,7 @@ public sealed class SidecarCapabilityTransportTests
             authenticateEndpointRouteAuthority: AuthenticateAuthority,
             authenticateEndpointRouteRelay: AuthenticateRelay);
         var original = CreateEndpointRelay(source, receiving, $"context-{mutation}").Relay;
+        var reservedSequence = receiving.Session.LastSequence;
         var context = original.ReceivingContext;
         var changed = context;
         switch (mutation)
@@ -1833,7 +2437,7 @@ public sealed class SidecarCapabilityTransportTests
 
         Assert.False(rejected.Accepted, rejected.Message);
         Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, rejected.Code);
-        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(reservedSequence, receiving.Session.LastSequence);
         Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
         Assert.True(receiving.Session.ImportHostEndpointRouteRelay(original, receiving.Now, out _).Accepted);
     }
@@ -1849,6 +2453,7 @@ public sealed class SidecarCapabilityTransportTests
             authenticateEndpointRouteRelay: (relay, hash) =>
                 relay.Proof == KeyedEndpointProof("relay", hash));
         var fixture = CreateEndpointRelay(source, receiving, "public-route-hash");
+        var reservedSequence = receiving.Session.LastSequence;
         var unsignedAuthority = fixture.Relay.Authority with
         {
             Proof = fixture.Relay.Authority.CanonicalBindingHash,
@@ -1865,7 +2470,7 @@ public sealed class SidecarCapabilityTransportTests
 
         Assert.False(result.Accepted);
         Assert.Equal(SidecarCapabilityErrors.Unauthenticated, result.Code);
-        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(reservedSequence, receiving.Session.LastSequence);
         Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
         Assert.True(receiving.Session.ImportHostEndpointRouteRelay(
             fixture.Relay,
@@ -1922,12 +2527,19 @@ public sealed class SidecarCapabilityTransportTests
                 Assert.True(receiving.Session.CompleteCall(priorCall.CallId, 0).Accepted);
         }
 
-        var fixture = CreateEndpointRelay(source, issuer, $"limit-{limit}");
+        var inputs = CreateEndpointRelayInputs(source, receiving, $"limit-{limit}");
         var lastSequence = receiving.Session.LastSequence;
-        var carriers = receiving.Session.ActiveHostActionEntryCarrierCount;
-        var result = receiving.Session.ImportHostEndpointRouteRelay(
-            fixture.Relay,
+        var result = EndpointRouteRelayTestExtensions.IssueHostEndpointRouteRelay(
+            source.Session,
+            inputs.Request,
+            inputs.SourceCall,
+            inputs.ReceivingCall,
+            receiving.Session,
             receiving.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (_, hash) => KeyedEndpointProof("relay", hash),
             out _);
 
         Assert.False(result.Accepted);
@@ -1939,7 +2551,7 @@ public sealed class SidecarCapabilityTransportTests
                     : SidecarCapabilityErrors.ConcurrencyLimit,
             result.Code);
         Assert.Equal(lastSequence, receiving.Session.LastSequence);
-        Assert.Equal(carriers, receiving.Session.ActiveHostActionEntryCarrierCount);
+        Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
     }
 
     [Fact]
@@ -1952,12 +2564,13 @@ public sealed class SidecarCapabilityTransportTests
                 authority.Proof == KeyedEndpointProof("route", hash),
             authenticateEndpointRouteRelay: (_, _) => throw new InvalidOperationException("test verifier failure"));
         var fixture = CreateEndpointRelay(source, receiving, "verifier-failure");
+        var reservedSequence = receiving.Session.LastSequence;
 
         var result = receiving.Session.ImportHostEndpointRouteRelay(fixture.Relay, receiving.Now, out _);
 
         Assert.False(result.Accepted);
         Assert.Equal(SidecarCapabilityErrors.Unauthenticated, result.Code);
-        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(reservedSequence, receiving.Session.LastSequence);
         Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
     }
 
@@ -2072,6 +2685,7 @@ public sealed class SidecarCapabilityTransportTests
                 return true;
             });
         var fixture = CreateEndpointRelay(source, receiving, "relay-verifier-disconnect");
+        var reservedSequence = receiving.Session.LastSequence;
 
         var result = receiving.Session.ImportHostEndpointRouteRelay(
             fixture.Relay,
@@ -2081,7 +2695,7 @@ public sealed class SidecarCapabilityTransportTests
         Assert.False(result.Accepted);
         Assert.Equal(SidecarCapabilityErrors.Disconnected, result.Code);
         Assert.Null(hostContext);
-        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(reservedSequence, receiving.Session.LastSequence);
         Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
     }
 
@@ -2101,6 +2715,7 @@ public sealed class SidecarCapabilityTransportTests
                 return receiving.Session.RotateBinding(rotated, receiving.Now).Accepted;
             });
         var fixture = CreateEndpointRelay(source, receiving, "relay-verifier-rotation");
+        var reservedSequence = receiving.Session.LastSequence;
 
         var result = receiving.Session.ImportHostEndpointRouteRelay(
             fixture.Relay,
@@ -2108,10 +2723,10 @@ public sealed class SidecarCapabilityTransportTests
             out var hostContext);
 
         Assert.False(result.Accepted);
-        Assert.Equal(SidecarCapabilityErrors.Replay, result.Code);
+        Assert.Equal(SidecarCapabilityErrors.Unauthenticated, result.Code);
         Assert.Null(hostContext);
         Assert.Equal(0, receiving.Session.ActiveHostActionEntryCarrierCount);
-        Assert.Equal(0, receiving.Session.LastSequence);
+        Assert.Equal(reservedSequence, receiving.Session.LastSequence);
     }
 
     [Fact]
@@ -2528,17 +3143,16 @@ public sealed class SidecarCapabilityTransportTests
         {
             var rotated = CreateRotatedBinding(receiving, "endpoint-relay-target-rotation");
             receiving.BindingHashes.Add(rotated.Authentication.BindingHash);
+            Assert.False(receiving.Session.RotateBinding(rotated, receiving.Now).Accepted);
+            Assert.True(receiving.Session.ReleaseHostEndpointRouteReservation(
+                fixture.Relay.ReceivingReservation!,
+                receiving.Now).Accepted);
             Assert.True(receiving.Session.RotateBinding(rotated, receiving.Now).Accepted);
         }
         else
         {
-            var unrelated = ActionCall(receiving, 1, "endpoint-relay-unrelated");
-            var payload = Payload("endpoint.unrelated", "unrelated");
-            Assert.True(receiving.Session.BeginCall(
-                unrelated,
-                SidecarCapabilityKind.Action,
-                payload,
-                payload.ByteLength,
+            Assert.True(receiving.Session.ReleaseHostEndpointRouteReservation(
+                fixture.Relay.ReceivingReservation!,
                 receiving.Now).Accepted);
         }
 
@@ -2551,7 +3165,9 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Equal(
             lifecycle == "disconnect"
                 ? SidecarCapabilityErrors.Disconnected
-                : SidecarCapabilityErrors.SpoofedIdentity,
+                : lifecycle == "rotate"
+                    ? SidecarCapabilityErrors.SpoofedIdentity
+                    : SidecarCapabilityErrors.Replay,
             import.Code);
 
         Assert.True(source.Session.CompleteHostEndpointRouteRelay(fixture.Relay, source.Now).Accepted);
@@ -12445,5 +13061,55 @@ public sealed class SidecarCapabilityTransportTests
         public ContinuationToken? Continuation => null;
         public ExecutionError? Error => null;
         public ActionUncertainty? Uncertainty => null;
+    }
+}
+
+internal static class EndpointRouteRelayTestExtensions
+{
+    public static SidecarCapabilityValidationResult IssueHostEndpointRouteRelay(
+        this SidecarCapabilitySession source,
+        HostEndpointRouteRequest request,
+        SidecarCapabilityCallIdentity sourceCall,
+        SidecarCapabilityCallIdentity receivingParentCall,
+        SidecarCapabilitySession receivingSession,
+        DateTimeOffset now,
+        Func<HostEndpointRouteAuthority, string> issueRouteAuthorityProof,
+        Func<SidecarHostEndpointRouteRelay, string, string> issueProof,
+        out SidecarHostEndpointRouteRelay? relay)
+    {
+        var reservationResult = receivingSession.IssueHostEndpointRouteReservation(
+            request,
+            receivingParentCall,
+            now,
+            reservation => KeyedEndpointProof(
+                "reservation",
+                SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(reservation)),
+            out var reservation);
+        if (!reservationResult.Accepted || reservation is null)
+        {
+            relay = null;
+            return reservationResult;
+        }
+
+        var wireReservation = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEndpointRouteReservation>(
+            SidecarCapabilityTransportCodec.Serialize(reservation));
+        var result = source.IssueHostEndpointRouteRelay(
+            request,
+            sourceCall,
+            wireReservation,
+            now,
+            issueRouteAuthorityProof,
+            (candidate, hash) => candidate.Proof == KeyedEndpointProof("reservation", hash),
+            issueProof,
+            out relay);
+        if (!result.Accepted)
+            receivingSession.ReleaseHostEndpointRouteReservation(wireReservation, now);
+        return result;
+    }
+
+    private static string KeyedEndpointProof(string domain, string hash)
+    {
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes("endpoint-route-relay-test-key"));
+        return Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes($"{domain}:{hash}")));
     }
 }
