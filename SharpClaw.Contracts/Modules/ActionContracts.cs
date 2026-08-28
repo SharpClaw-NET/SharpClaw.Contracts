@@ -258,8 +258,15 @@ public sealed record HostActionEntryIngressBinding(
             HostActionEntryIngress.CrossModule =>
                 !string.IsNullOrWhiteSpace(SecondaryIdentity) &&
                 !string.Equals(PrimaryIdentity, SecondaryIdentity, StringComparison.Ordinal),
+            HostActionEntryIngress.Tool =>
+                SecondaryIdentity is null || IsCanonicalConversationIdentity(SecondaryIdentity),
             _ => SecondaryIdentity is null,
         };
+
+    private static bool IsCanonicalConversationIdentity(string value) =>
+        Guid.TryParseExact(value, "D", out var conversationId) &&
+        conversationId != Guid.Empty &&
+        string.Equals(value, conversationId.ToString("D"), StringComparison.Ordinal);
 }
 
 public sealed record HostActionEntryContribution(
@@ -325,6 +332,363 @@ public sealed record HostEndpointInvocation(
         HostActionContext.Contribution?.IngressBinding.Ingress == HostActionEntryIngress.Endpoint &&
         string.Equals(HostActionContext.Contribution.IngressBinding.PrimaryIdentity, Endpoint, StringComparison.Ordinal) &&
         HostActionContext.IsWellFormed(now);
+}
+
+public enum HostEndpointTransport
+{
+    Http,
+    WebSocket,
+}
+
+public sealed record HostEndpointRouteIdentity(
+    string HandlerIdentity,
+    string Path,
+    string Method,
+    HostEndpointTransport Transport)
+{
+    public bool IsWellFormed =>
+        !string.IsNullOrWhiteSpace(HandlerIdentity) &&
+        HandlerIdentity == HandlerIdentity.Trim() &&
+        HandlerIdentity.Length <= 512 &&
+        IsCanonicalPath(Path) &&
+        Path.Length <= 512 &&
+        IsCanonicalMethod(Method) &&
+        Method.Length <= 16 &&
+        Enum.IsDefined(Transport);
+
+    private static bool IsCanonicalPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) ||
+            path != path.Trim() ||
+            !path.StartsWith("/", StringComparison.Ordinal) ||
+            path.Contains("//", StringComparison.Ordinal) ||
+            path.Contains('?', StringComparison.Ordinal) ||
+            path.Contains('#', StringComparison.Ordinal) ||
+            path.Contains('\\', StringComparison.Ordinal) ||
+            path.Contains('%', StringComparison.Ordinal) ||
+            path.Any(character => char.IsControl(character) || char.IsWhiteSpace(character)) ||
+            path.Split('/').Any(segment => segment is "." or ".."))
+        {
+            return false;
+        }
+
+        try
+        {
+            return string.Equals(
+                path,
+                Uri.UnescapeDataString(path),
+                StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsCanonicalMethod(string? method) =>
+        !string.IsNullOrWhiteSpace(method) &&
+        method == method.Trim() &&
+        method.All(character => character is >= 'A' and <= 'Z');
+}
+
+public sealed record HostEndpointRouteRequest(
+    HostEndpointInvocation Invocation,
+    HostEndpointRouteIdentity Route,
+    IReadOnlyDictionary<string, string[]> Headers,
+    IReadOnlyDictionary<string, string[]> Query,
+    byte[] Body)
+{
+    public string ContentHash =>
+        Body is null ? string.Empty : Convert.ToHexString(SHA256.HashData(Body));
+
+    public int ContentByteLength => Body?.Length ?? -1;
+
+    public string InvocationContentHash =>
+        Invocation is null
+            ? string.Empty
+            : SidecarCapabilityTransportCodec.ComputeSha256(
+                CanonicalInvocationBytes(Invocation));
+
+    public int InvocationByteLength =>
+        Invocation is null
+            ? -1
+            : CanonicalInvocationBytes(Invocation).Length;
+
+    public bool IsWellFormed(DateTimeOffset now) =>
+        Invocation is not null &&
+        Invocation.IsWellFormed(now) &&
+        Route is not null &&
+        Route.IsWellFormed &&
+        string.Equals(Route.HandlerIdentity, Invocation.Endpoint, StringComparison.Ordinal) &&
+        HostEndpointRouteAuthorityValidator.IsHeaderMetadataWellFormed(Headers) &&
+        HostEndpointRouteAuthorityValidator.IsQueryMetadataWellFormed(Query) &&
+        Body is not null;
+
+    private static byte[] CanonicalInvocationBytes(HostEndpointInvocation invocation)
+    {
+        var encoded = SidecarCapabilityTransportCodec.Serialize(invocation);
+        using var document = JsonDocument.Parse(encoded);
+        return SidecarCapabilityTransportCodec.Serialize(document.RootElement);
+    }
+}
+
+public sealed record HostEndpointRouteAuthority(
+    Guid AuthorityId,
+    SidecarCapabilityCallIdentity Call,
+    Guid InvocationId,
+    HostEndpointRouteIdentity Route,
+    IReadOnlyDictionary<string, string[]> Headers,
+    IReadOnlyDictionary<string, string[]> Query,
+    string RequestContentHash,
+    int RequestContentByteLength,
+    HostActionEntryRequestContext HostActionContext,
+    DateTimeOffset IssuedAt,
+    DateTimeOffset ExpiresAt,
+    string CanonicalBindingHash,
+    string Proof)
+{
+    public string InvocationContentHash { get; init; } = string.Empty;
+
+    public int InvocationByteLength { get; init; } = -1;
+
+    public bool IsWellFormed =>
+        AuthorityId != Guid.Empty &&
+        Call is not null &&
+        Call.IsValid &&
+        InvocationId != Guid.Empty &&
+        Route is not null &&
+        Route.IsWellFormed &&
+        HostEndpointRouteAuthorityValidator.IsHeaderMetadataWellFormed(Headers) &&
+        HostEndpointRouteAuthorityValidator.IsQueryMetadataWellFormed(Query) &&
+        !string.IsNullOrWhiteSpace(RequestContentHash) &&
+        RequestContentByteLength >= 0 &&
+        !string.IsNullOrWhiteSpace(InvocationContentHash) &&
+        InvocationByteLength >= 0 &&
+        HostActionContext is not null &&
+        IssuedAt <= ExpiresAt &&
+        !string.IsNullOrWhiteSpace(CanonicalBindingHash) &&
+        !string.IsNullOrWhiteSpace(Proof);
+}
+
+public static class HostEndpointRouteAuthorityValidator
+{
+    public static string ComputeBindingHash(HostEndpointRouteAuthority authority)
+    {
+        ArgumentNullException.ThrowIfNull(authority);
+        var canonical = new
+        {
+            Call = Convert.ToBase64String(SidecarCapabilityTransportCodec.Serialize(authority.Call)),
+            authority.InvocationId,
+            Route = Convert.ToBase64String(SidecarCapabilityTransportCodec.Serialize(authority.Route)),
+            Headers = Convert.ToBase64String(SerializeMetadata(authority.Headers, caseInsensitiveKeys: true)),
+            Query = Convert.ToBase64String(SerializeMetadata(authority.Query, caseInsensitiveKeys: false)),
+            authority.RequestContentHash,
+            authority.RequestContentByteLength,
+            authority.AuthorityId,
+            authority.InvocationContentHash,
+            authority.InvocationByteLength,
+            HostActionContextBindingHash =
+                SidecarCapabilityTransportValidation.ComputeHostActionEntryContextBindingHash(
+                    authority.HostActionContext),
+            authority.IssuedAt,
+            authority.ExpiresAt,
+        };
+        return SidecarCapabilityTransportCodec.ComputeSha256(
+            SidecarCapabilityTransportCodec.Serialize(canonical));
+    }
+
+    public static SidecarCapabilityValidationResult Validate(
+        HostEndpointRouteRequest request,
+        HostEndpointRouteAuthority authority,
+        DateTimeOffset now,
+        Func<HostEndpointRouteAuthority, string, bool> authenticateAuthority)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(authority);
+        ArgumentNullException.ThrowIfNull(authenticateAuthority);
+
+        if (!request.IsWellFormed(now) ||
+            !authority.IsWellFormed ||
+            !authority.HostActionContext.IsWellFormed(now))
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidBinding,
+                "The endpoint route authority is incomplete.");
+
+        if (authority.IssuedAt > now ||
+            authority.ExpiresAt <= now ||
+            authority.ExpiresAt > authority.Call.Deadline ||
+            authority.ExpiresAt > authority.HostActionContext.Deadline ||
+            authority.ExpiresAt > authority.HostActionContext.ExpiresAt)
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Expired,
+                "The endpoint route authority is outside its signed lifetime.");
+        }
+
+        if (!string.Equals(
+                authority.CanonicalBindingHash,
+                ComputeBindingHash(authority),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint route authority binding is invalid.");
+        }
+
+        if (authority.InvocationId != request.Invocation.InvocationId ||
+            !SameRoute(authority.Route, request.Route) ||
+            !SameMetadata(authority.Headers, request.Headers, caseInsensitiveKeys: true) ||
+            !SameMetadata(authority.Query, request.Query, caseInsensitiveKeys: false) ||
+            !string.Equals(
+                authority.RequestContentHash,
+                request.ContentHash,
+                StringComparison.OrdinalIgnoreCase) ||
+            authority.RequestContentByteLength != request.ContentByteLength ||
+            !string.Equals(
+                authority.InvocationContentHash,
+                request.InvocationContentHash,
+                StringComparison.OrdinalIgnoreCase) ||
+            authority.InvocationByteLength != request.InvocationByteLength ||
+            !string.Equals(
+                SidecarCapabilityTransportValidation.ComputeHostActionEntryContextBindingHash(
+                    authority.HostActionContext),
+                SidecarCapabilityTransportValidation.ComputeHostActionEntryContextBindingHash(
+                    request.Invocation.HostActionContext),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint route request does not match its authority.");
+        }
+
+        bool authenticated;
+        try
+        {
+            authenticated = authenticateAuthority(authority, authority.CanonicalBindingHash);
+        }
+        catch
+        {
+            authenticated = false;
+        }
+
+        return authenticated
+            ? SidecarCapabilityValidationResult.Accept()
+            : SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The host did not authenticate the endpoint route authority.");
+    }
+
+    internal static bool IsHeaderMetadataWellFormed(
+        IReadOnlyDictionary<string, string[]>? metadata) =>
+        IsMetadataWellFormed(
+            metadata,
+            StringComparer.OrdinalIgnoreCase,
+            validateHeaderNames: true,
+            validateHeaderValues: true);
+
+    internal static bool IsQueryMetadataWellFormed(
+        IReadOnlyDictionary<string, string[]>? metadata) =>
+        IsMetadataWellFormed(
+            metadata,
+            StringComparer.Ordinal,
+            validateHeaderNames: false,
+            validateHeaderValues: false);
+
+    private static bool IsMetadataWellFormed(
+        IReadOnlyDictionary<string, string[]>? metadata,
+        StringComparer keyComparer,
+        bool validateHeaderNames,
+        bool validateHeaderValues)
+    {
+        if (metadata is null)
+            return false;
+
+        var keys = new HashSet<string>(keyComparer);
+        foreach (var pair in metadata)
+        {
+            if (string.IsNullOrWhiteSpace(pair.Key) ||
+                (validateHeaderNames && !IsHttpToken(pair.Key)) ||
+                pair.Value is null ||
+                !keys.Add(pair.Key) ||
+                pair.Value.Any(value =>
+                    value is null ||
+                    (validateHeaderValues &&
+                     value.Any(character =>
+                         char.IsControl(character) ||
+                         character is '\r' or '\n' or '\0'))))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsHttpToken(string value) =>
+        value.All(character =>
+            character is >= 'A' and <= 'Z' ||
+            character is >= 'a' and <= 'z' ||
+            character is >= '0' and <= '9' ||
+            "!#$%&'*+-.^_`|~".IndexOf(character) >= 0);
+
+    internal static bool IsWithinLimits(
+        HostEndpointRouteRequest request,
+        SidecarPayloadLimits limits)
+    {
+        if (request is null || limits is null || !limits.IsValid ||
+            request.Body is null ||
+            request.Body.Length > limits.ActionInputBytes ||
+            !IsMetadataWithinLimits(request.Headers) ||
+            !IsMetadataWithinLimits(request.Query))
+            return false;
+
+        try
+        {
+            return SidecarCapabilityTransportCodec.Serialize(request).Length <=
+                limits.ProtocolMessageBytes;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsMetadataWithinLimits(
+        IReadOnlyDictionary<string, string[]> metadata) =>
+        metadata.Count <= 128 &&
+        metadata.All(pair =>
+            pair.Key.Length <= 256 &&
+            pair.Value.Length <= 64 &&
+            pair.Value.All(value => value.Length <= 8192));
+
+    private static bool SameRoute(
+        HostEndpointRouteIdentity left,
+        HostEndpointRouteIdentity right) =>
+        left == right;
+
+    private static bool SameMetadata(
+        IReadOnlyDictionary<string, string[]> left,
+        IReadOnlyDictionary<string, string[]> right,
+        bool caseInsensitiveKeys) =>
+        string.Equals(
+            Convert.ToBase64String(SerializeMetadata(left, caseInsensitiveKeys)),
+            Convert.ToBase64String(SerializeMetadata(right, caseInsensitiveKeys)),
+            StringComparison.Ordinal);
+
+    private static byte[] SerializeMetadata(
+        IReadOnlyDictionary<string, string[]> metadata,
+        bool caseInsensitiveKeys)
+    {
+        var ordered = metadata
+            .Select(pair => new
+            {
+                Key = caseInsensitiveKeys ? pair.Key.ToUpperInvariant() : pair.Key,
+                Values = pair.Value,
+            })
+            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .ToArray();
+        return SidecarCapabilityTransportCodec.Serialize(ordered);
+    }
 }
 
 public sealed record CrossModuleActionInvocation(

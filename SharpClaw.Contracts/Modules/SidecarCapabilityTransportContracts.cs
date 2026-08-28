@@ -184,11 +184,14 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private readonly Func<SidecarCapabilityAuthenticationAuthority, bool> _authenticate;
     private readonly Func<SidecarHostTerminalAuthority, string, bool>? _authenticateHostTerminalAuthority;
     private readonly Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? _authenticateStorageContinuationAuthority;
+    private readonly Func<HostEndpointRouteAuthority, string, bool>? _authenticateEndpointRouteAuthority;
     private readonly Func<string, bool> _registerAuthenticationNonce;
     private readonly Dictionary<Guid, SidecarCapabilityKind> _calls = [];
     private readonly Dictionary<Guid, SidecarCapabilityCallIdentity> _callIdentities = [];
     private readonly Dictionary<Guid, SidecarSerializedPayload?> _callPayloads = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _issuedEntryContexts = [];
+    private readonly Dictionary<Guid, HostEndpointRouteAuthority> _issuedEndpointRouteAuthorities = [];
+    private readonly Dictionary<Guid, EndpointRouteAdmissionState> _endpointRouteAdmissions = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _activeEntryContexts = [];
     private readonly Dictionary<Guid, HostActionEntryCarrierAuthority> _activeEntryCarriers = [];
     private readonly Dictionary<Guid, Guid> _entryBudgetRoots = [];
@@ -251,6 +254,11 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private sealed record IssuedStorageContinuationState(
         SidecarHostEntryStorageContinuationAuthority Authority);
 
+    private sealed record EndpointRouteAdmissionState(
+        HostEndpointRouteAuthority Authority,
+        HostActionEntryRequestContext Context,
+        HostActionEntryCarrierAuthority Carrier);
+
     private sealed record NestedCarrierState(
         SidecarNestedHostActionEntryCarrier Carrier,
         SidecarCapabilityCallIdentity ParentCall,
@@ -278,7 +286,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         Func<string, bool> registerAuthenticationNonce,
         DateTimeOffset now,
         Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null,
-        Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null)
+        Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null,
+        Func<HostEndpointRouteAuthority, string, bool>? authenticateEndpointRouteAuthority = null)
     {
         ArgumentNullException.ThrowIfNull(binding);
         ArgumentNullException.ThrowIfNull(authenticate);
@@ -288,6 +297,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         _registerAuthenticationNonce = registerAuthenticationNonce;
         _authenticateHostTerminalAuthority = authenticateHostTerminalAuthority;
         _authenticateStorageContinuationAuthority = authenticateStorageContinuationAuthority;
+        _authenticateEndpointRouteAuthority = authenticateEndpointRouteAuthority;
 
         var result = SidecarCapabilitySessionValidator.Validate(
             binding,
@@ -1075,10 +1085,310 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         }
     }
 
+    public SidecarCapabilityValidationResult IssueHostEndpointRouteAuthority(
+        HostEndpointRouteRequest request,
+        SidecarCapabilityCallIdentity call,
+        DateTimeOffset now,
+        Func<HostEndpointRouteAuthority, string> issueProof,
+        out HostEndpointRouteAuthority? authority)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(call);
+        ArgumentNullException.ThrowIfNull(issueProof);
+        authority = null;
+
+        if (!request.IsWellFormed(now) ||
+            !HostEndpointRouteAuthorityValidator.IsWithinLimits(request, Binding.PayloadLimits))
+            return SidecarCapabilityValidationResult.Reject(
+                request.IsWellFormed(now)
+                    ? SidecarCapabilityErrors.PayloadTooLarge
+                    : SidecarCapabilityErrors.InvalidBinding,
+                request.IsWellFormed(now)
+                    ? "The endpoint route request exceeds the session limits."
+                    : "The endpoint route request is incomplete.");
+
+        lock (_sync)
+        {
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            if (call.Capability != SidecarCapabilityKind.Action ||
+                !Binding.Grant.Allows(SidecarCapabilityKind.Action) ||
+                call.SessionId != Binding.SessionId ||
+                call.RequestId != Binding.RequestId ||
+                call.CancellationId != Binding.CancellationId ||
+                !string.Equals(call.ModuleId, Binding.ModuleId, StringComparison.Ordinal) ||
+                !string.Equals(call.GraphId, Binding.GraphId, StringComparison.Ordinal) ||
+                call.Deadline <= now ||
+                call.Deadline > Binding.ExpiresAt ||
+                call.Sequence != _lastSequence + 1 ||
+                _calls.ContainsKey(call.CallId) ||
+                _completedCalls.Contains(call.CallId) ||
+                _nonces.Contains(call.ReplayNonce))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint route call does not match the active session.");
+            }
+
+            if (_issuedEndpointRouteAuthorities.Values.Any(existing =>
+                    existing.Call.CallId == call.CallId ||
+                    string.Equals(existing.Call.ReplayNonce, call.ReplayNonce, StringComparison.Ordinal)))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Duplicate,
+                    "The endpoint route authority was already issued for this call or replay nonce.");
+            }
+
+            if (_endpointRouteAdmissions.ContainsKey(call.CallId))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Duplicate,
+                    "The endpoint route admission already exists for this call.");
+            }
+
+            if (_issuedEndpointRouteAuthorities.Values.Any(existing =>
+                    existing.HostActionContext.CapabilityId ==
+                    request.Invocation.HostActionContext.CapabilityId))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Duplicate,
+                    "The endpoint route authority was already issued for this context.");
+            }
+
+            if (!TryGetStoredEndpointContextLocked(
+                    request.Invocation.HostActionContext,
+                    out var storedContext) ||
+                !SameEndpointContext(storedContext!, request.Invocation.HostActionContext))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint route context is not issued by this session.");
+            }
+
+            var expiresAt = new[]
+            {
+                request.Invocation.HostActionContext.ExpiresAt,
+                call.Deadline,
+                Binding.ExpiresAt,
+            }.Min();
+            if (expiresAt <= now)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Expired,
+                    "The endpoint route authority has no valid lifetime.");
+
+            var candidate = new HostEndpointRouteAuthority(
+                Guid.NewGuid(),
+                call,
+                request.Invocation.InvocationId,
+                request.Route,
+                request.Headers,
+                request.Query,
+                request.ContentHash,
+                request.ContentByteLength,
+                request.Invocation.HostActionContext,
+                now,
+                expiresAt,
+                string.Empty,
+                string.Empty);
+            candidate = candidate with
+            {
+                InvocationContentHash = request.InvocationContentHash,
+                InvocationByteLength = request.InvocationByteLength,
+            };
+            var canonicalHash = HostEndpointRouteAuthorityValidator.ComputeBindingHash(candidate);
+            var proof = issueProof(candidate with { CanonicalBindingHash = canonicalHash });
+            if (string.IsNullOrWhiteSpace(proof))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The host did not issue an endpoint route authority proof.");
+
+            authority = candidate with
+            {
+                CanonicalBindingHash = canonicalHash,
+                Proof = proof,
+            };
+            _issuedEndpointRouteAuthorities.Add(authority.AuthorityId, authority);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult BeginHostEndpointRouteCarrier(
+        HostEndpointRouteRequest request,
+        HostEndpointRouteAuthority authority,
+        HostActionEntryCarrierIdentity carrier,
+        DateTimeOffset now,
+        out HostActionEntryCarrierAuthority? carrierAuthority)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(authority);
+        ArgumentNullException.ThrowIfNull(carrier);
+        carrierAuthority = null;
+
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The sidecar capability session is disconnected.");
+
+            if (_authenticateEndpointRouteAuthority is null)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The session has no trusted endpoint route authority verifier.");
+
+            if (!request.IsWellFormed(now))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.InvalidBinding,
+                    "The endpoint route request is incomplete.");
+
+            if (!HostEndpointRouteAuthorityValidator.IsWithinLimits(
+                    request,
+                    Binding.PayloadLimits))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.PayloadTooLarge,
+                    "The endpoint route request exceeds the session limits.");
+
+            var requestResult = HostEndpointRouteAuthorityValidator.Validate(
+                request,
+                authority,
+                now,
+                _authenticateEndpointRouteAuthority);
+            if (!requestResult.Accepted)
+                return requestResult;
+
+            var bindingResult = SidecarCapabilitySessionValidator.Validate(
+                Binding,
+                _authenticate,
+                _registerAuthenticationNonce,
+                now,
+                RegisterAuthenticationNonce: false);
+            if (!bindingResult.Accepted)
+                return bindingResult;
+
+            var call = authority.Call;
+            if (call.Capability != SidecarCapabilityKind.Action ||
+                !Binding.Grant.Allows(SidecarCapabilityKind.Action) ||
+                call.SessionId != Binding.SessionId ||
+                call.RequestId != Binding.RequestId ||
+                call.CancellationId != Binding.CancellationId ||
+                !string.Equals(call.ModuleId, Binding.ModuleId, StringComparison.Ordinal) ||
+                !string.Equals(call.GraphId, Binding.GraphId, StringComparison.Ordinal) ||
+                call.Deadline <= now ||
+                call.Deadline > Binding.ExpiresAt)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint route call does not match the active session.");
+            }
+
+            if (!_issuedEndpointRouteAuthorities.TryGetValue(
+                    authority.AuthorityId,
+                    out var issuedAuthority) ||
+                !string.Equals(
+                    issuedAuthority.CanonicalBindingHash,
+                    authority.CanonicalBindingHash,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(issuedAuthority.Proof, authority.Proof, StringComparison.Ordinal))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint route authority was not issued by this session.");
+            }
+
+            if (call.Sequence != _lastSequence + 1 ||
+                _calls.ContainsKey(call.CallId) ||
+                _completedCalls.Contains(call.CallId) ||
+                _nonces.Contains(call.ReplayNonce))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint route authority was already used or is outside the next session sequence.");
+            }
+
+            if (_endpointRouteAdmissions.ContainsKey(call.CallId))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Duplicate,
+                    "The endpoint route admission already exists for this call.");
+            }
+
+            if (_inFlight >= Binding.ConcurrencyLimits.MaximumInFlightCalls)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.ConcurrencyLimit,
+                    "The session concurrency limit was reached.");
+
+            if (_totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.ConcurrencyLimit,
+                    "The session request call limit was reached.");
+
+            if (!_issuedEntryContexts.TryGetValue(
+                    authority.HostActionContext.CapabilityId,
+                    out var issuedContext) ||
+                !HostActionEntryAuthorityValidator.SameContext(
+                    authority.HostActionContext,
+                    issuedContext))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint route context is not issued by this session.");
+            }
+
+            var carrierResult = BeginHostActionEntryCarrierCore(
+                authority.HostActionContext,
+                carrier,
+                now,
+                allowEndpoint: true,
+                out carrierAuthority);
+            if (!carrierResult.Accepted)
+                return carrierResult;
+
+            _issuedEndpointRouteAuthorities.Remove(authority.AuthorityId);
+            _endpointRouteAdmissions.Add(
+                call.CallId,
+                new EndpointRouteAdmissionState(
+                    authority,
+                    authority.HostActionContext,
+                    carrierAuthority!));
+            _lastSequence = call.Sequence;
+            _totalCalls++;
+            _inFlight++;
+            _nonces.Add(call.ReplayNonce);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
     public SidecarCapabilityValidationResult BeginHostActionEntryCarrier(
         HostActionEntryRequestContext context,
         HostActionEntryCarrierIdentity carrier,
         DateTimeOffset now,
+        out HostActionEntryCarrierAuthority? authority)
+        => BeginHostActionEntryCarrierCore(
+            context,
+            carrier,
+            now,
+            allowEndpoint: false,
+            out authority);
+
+    private SidecarCapabilityValidationResult BeginHostActionEntryCarrierCore(
+        HostActionEntryRequestContext context,
+        HostActionEntryCarrierIdentity carrier,
+        DateTimeOffset now,
+        bool allowEndpoint,
         out HostActionEntryCarrierAuthority? authority)
     {
         ArgumentNullException.ThrowIfNull(context);
@@ -1104,6 +1414,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 return bindingResult;
 
             if (!context.IsWellFormed(now) ||
+                !allowEndpoint && context.Ingress == HostActionEntryIngress.Endpoint ||
                 !carrier.IsWellFormed ||
                 context.RequestId != Binding.RequestId ||
                 context.CancellationId != Binding.CancellationId ||
@@ -1113,7 +1424,9 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
-                    "The host action entry carrier does not match the issued context.");
+                    context.Ingress == HostActionEntryIngress.Endpoint && !allowEndpoint
+                        ? "Endpoint carriers require an authenticated route authority."
+                        : "The host action entry carrier does not match the issued context.");
             }
 
             authority = new HostActionEntryCarrierAuthority(
@@ -3350,6 +3663,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     "The capability session cannot rotate while a capability call is active.");
 
             if (_issuedEntryContexts.Count != 0 ||
+                _issuedEndpointRouteAuthorities.Count != 0 ||
+                _endpointRouteAdmissions.Count != 0 ||
                 _rootHostActionEntryStates.Count != 0 ||
                 _nestedCarrierStates.Count != 0 ||
                 _reservedNestedCalls.Count != 0 ||
@@ -3618,6 +3933,36 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     "The storage continuation authority is not active for this call.");
             }
 
+            var hasEndpointRouteAdmission =
+                _endpointRouteAdmissions.TryGetValue(identity.CallId, out var endpointAdmission);
+            var reservedEndpointRouteCall = hasEndpointRouteAdmission &&
+                hostContext is not null &&
+                endpointAdmission!.Authority.Call == identity &&
+                HostActionEntryAuthorityValidator.SameContext(
+                    hostContext,
+                    endpointAdmission.Context);
+            if (hasEndpointRouteAdmission && !reservedEndpointRouteCall)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint route admission does not match the active call.");
+
+            if (hostContext?.Ingress == HostActionEntryIngress.Endpoint &&
+                !reservedEndpointRouteCall)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "An endpoint action requires its reserved route admission.");
+
+            if (reservedEndpointRouteCall &&
+                (payload is null ||
+                 !string.Equals(
+                     payload.ContentHash,
+                     endpointAdmission!.Authority.InvocationContentHash,
+                     StringComparison.OrdinalIgnoreCase) ||
+                 payload.ByteLength != endpointAdmission.Authority.InvocationByteLength))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint action payload does not match its admitted invocation.");
+
             if (capability != SidecarCapabilityKind.Action && hostContext is not null)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.InvalidBinding,
@@ -3684,6 +4029,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 : ResolveEntryBudgetRoot(identity.CallId, hostContext.CapabilityId);
             var usesBudgetExtension =
                 !reservedNestedCall &&
+                !reservedEndpointRouteCall &&
                 hostContext is not null &&
                 _totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest;
             if (usesBudgetExtension && !HasAvailableBudgetExtension(budgetRootId, now))
@@ -3693,7 +4039,9 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     "The host action entry has no reserved continuation credit.");
             }
 
-            if (!reservedNestedCall && identity.Sequence != _lastSequence + 1)
+            if (!reservedNestedCall &&
+                !reservedEndpointRouteCall &&
+                identity.Sequence != _lastSequence + 1)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Replay,
                     "The call sequence is not the next session sequence.");
@@ -3713,6 +4061,17 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 payloadLimit);
             if (!payloadResult.Accepted)
                 return payloadResult;
+
+            if (reservedEndpointRouteCall &&
+                (payload is null ||
+                 !string.Equals(
+                     payload.ContentHash,
+                     endpointAdmission!.Authority.InvocationContentHash,
+                     StringComparison.OrdinalIgnoreCase) ||
+                 payload.ByteLength != endpointAdmission.Authority.InvocationByteLength))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint action payload does not match its admitted invocation.");
 
             if (hostContext is not null &&
                 (hostContext.Contribution?.Lineage is null ||
@@ -3735,19 +4094,25 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
             if (_calls.ContainsKey(identity.CallId) ||
                 _completedCalls.Contains(identity.CallId) ||
-                (!reservedNestedCall && !usesStorageContinuation && !_nonces.Add(identity.ReplayNonce)))
+                (!reservedNestedCall &&
+                 !reservedEndpointRouteCall &&
+                 !usesStorageContinuation &&
+                 !_nonces.Add(identity.ReplayNonce)))
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Replay,
                     "The call identity or replay nonce was already used.");
             }
 
-            if (!reservedNestedCall && _inFlight >= Binding.ConcurrencyLimits.MaximumInFlightCalls)
+            if (!reservedNestedCall &&
+                !reservedEndpointRouteCall &&
+                _inFlight >= Binding.ConcurrencyLimits.MaximumInFlightCalls)
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.ConcurrencyLimit,
                     "The session concurrency limit was reached.");
 
             if (!reservedNestedCall &&
+                !reservedEndpointRouteCall &&
                 !usesBudgetExtension &&
                 !usesStorageContinuation &&
                 _totalCalls >= Binding.ConcurrencyLimits.MaximumCallsPerRequest)
@@ -3783,9 +4148,11 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 _callBudgetRoots[identity.CallId] = budgetRootId;
                 _consumedEntryCarriers.Add(hostContext.CapabilityId);
             }
+            if (reservedEndpointRouteCall)
+                _endpointRouteAdmissions.Remove(identity.CallId);
             if (reservedNestedCall)
                 _reservedNestedCalls.Remove(identity.CallId);
-            else
+            else if (!reservedEndpointRouteCall)
             {
                 _lastSequence = identity.Sequence;
                 if (!usesBudgetExtension && !usesStorageContinuation)
@@ -3973,6 +4340,22 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             .ToArray())
         {
             RemoveEntryCarrier(capabilityId, now);
+            removed++;
+        }
+        foreach (var authorityId in _issuedEndpointRouteAuthorities
+            .Where(pair => pair.Value.ExpiresAt <= now)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _issuedEndpointRouteAuthorities.Remove(authorityId);
+        }
+
+        foreach (var admission in _endpointRouteAdmissions.Values
+            .Where(state => state.Authority.ExpiresAt <= now)
+            .Select(state => state.Context.CapabilityId)
+            .ToArray())
+        {
+            RemoveEntryCarrier(admission, now);
             removed++;
         }
 
@@ -4253,6 +4636,21 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     {
         RevokeStorageContinuationsForCarrier(capabilityId, now);
         RevokeIssuedStorageContinuationsForCarrier(capabilityId);
+        foreach (var admission in _endpointRouteAdmissions
+            .Where(pair => pair.Value.Context.CapabilityId == capabilityId)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _endpointRouteAdmissions.Remove(admission);
+            _inFlight = Math.Max(0, _inFlight - 1);
+        }
+        foreach (var authorityId in _issuedEndpointRouteAuthorities
+            .Where(pair => pair.Value.HostActionContext.CapabilityId == capabilityId)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _issuedEndpointRouteAuthorities.Remove(authorityId);
+        }
         _issuedEntryContexts.Remove(capabilityId);
         _activeEntryContexts.Remove(capabilityId);
         if (_rootHostActionEntryStates.Remove(capabilityId, out var rootState))
@@ -4562,6 +4960,19 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(context.CapabilityHandle),
             StringComparison.OrdinalIgnoreCase);
 
+    private bool TryGetStoredEndpointContextLocked(
+        HostActionEntryRequestContext context,
+        out HostActionEntryRequestContext? storedContext) =>
+        _issuedEntryContexts.TryGetValue(context.CapabilityId, out storedContext);
+
+    private static bool SameEndpointContext(
+        HostActionEntryRequestContext left,
+        HostActionEntryRequestContext right) =>
+        string.Equals(
+            SidecarCapabilityTransportValidation.ComputeHostActionEntryContextBindingHash(left),
+            SidecarCapabilityTransportValidation.ComputeHostActionEntryContextBindingHash(right),
+            StringComparison.OrdinalIgnoreCase);
+
     private static bool MatchesCarrierAuthority(
         HostActionEntryCarrierAuthority candidate,
         HostActionEntryCarrierAuthority active) =>
@@ -4634,6 +5045,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _callPayloads.Clear();
             _callEntryContexts.Clear();
             _issuedEntryContexts.Clear();
+            _issuedEndpointRouteAuthorities.Clear();
+            _endpointRouteAdmissions.Clear();
             _activeEntryCarriers.Clear();
             _activeEntryContexts.Clear();
             _entryBudgetRoots.Clear();

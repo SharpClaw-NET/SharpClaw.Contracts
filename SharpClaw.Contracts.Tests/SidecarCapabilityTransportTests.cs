@@ -189,10 +189,12 @@ public sealed class SidecarCapabilityTransportTests
     public void Tool_handler_start_round_trips_and_binds_the_host_entry_context()
     {
         var fixture = CreateFixture();
+        var conversationId = Guid.NewGuid();
         var context = IssueContext(
             fixture,
             new RequestPrincipal("tool-user", Roles: new HashSet<string>(["reader"], StringComparer.Ordinal)),
             HostActionEntryIngress.Tool,
+            conversationId: conversationId,
             lineage: new HostActionEntryLineage(
                 new SharpClawActionKey("tool.entry"),
                 1,
@@ -216,7 +218,8 @@ public sealed class SidecarCapabilityTransportTests
             JsonSerializer.SerializeToElement(new { value = 1 }),
             new JsonSchemaReference("clock.input", 1, "tool-input-schema"),
             context.Caller,
-            context);
+            context,
+            conversationId);
 
         var encoded = SidecarCapabilityTransportCodec.Serialize(start);
         var roundTrip = SidecarCapabilityTransportCodec.Deserialize<SidecarToolHandlerInvokeStart>(encoded);
@@ -225,6 +228,35 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(roundTrip.IsWellFormed(fixture.Now));
         Assert.Equal(context.CapabilityId, roundTrip.HostActionContext.CapabilityId);
         Assert.Equal(context.CancellationId, roundTrip.HostActionContext.CancellationId);
+        Assert.Equal(conversationId, roundTrip.ConversationId);
+
+        var nullConversationContext = roundTrip.HostActionContext with
+        {
+            Contribution = roundTrip.HostActionContext.Contribution! with
+            {
+                IngressBinding = roundTrip.HostActionContext.Contribution.IngressBinding with
+                {
+                    SecondaryIdentity = null,
+                },
+            },
+        };
+        Assert.True(
+            (roundTrip with
+            {
+                ConversationId = null,
+                HostActionContext = nullConversationContext,
+            }).IsWellFormed(fixture.Now));
+
+        var toolInvocation = new ToolInvocation(
+            roundTrip.InvocationId,
+            roundTrip.ConversationId,
+            "tool-call",
+            roundTrip.ToolName,
+            roundTrip.Input,
+            roundTrip.HostActionContext);
+        var toolInvocationRoundTrip = SidecarCapabilityTransportCodec.Deserialize<ToolInvocation>(
+            SidecarCapabilityTransportCodec.Serialize(toolInvocation));
+        Assert.True(toolInvocationRoundTrip.IsWellFormed(fixture.Now));
 
         var state = new SidecarProtocolState(
             SidecarExchangeKind.ToolHandler,
@@ -262,6 +294,40 @@ public sealed class SidecarCapabilityTransportTests
             Caller = new RequestPrincipal("other-user"),
         };
         Assert.False(wrongCaller.IsWellFormed(fixture.Now));
+        Assert.False((roundTrip with { ConversationId = null }).IsWellFormed(fixture.Now));
+        Assert.False((roundTrip with { ConversationId = Guid.Empty }).IsWellFormed(fixture.Now));
+        Assert.False((roundTrip with { ConversationId = Guid.NewGuid() }).IsWellFormed(fixture.Now));
+        var nonCanonicalConversationContext = roundTrip.HostActionContext with
+        {
+            Contribution = roundTrip.HostActionContext.Contribution! with
+            {
+                IngressBinding = roundTrip.HostActionContext.Contribution.IngressBinding with
+                {
+                    SecondaryIdentity = conversationId.ToString("D").ToUpperInvariant(),
+                },
+            },
+        };
+        Assert.False(
+            (roundTrip with { HostActionContext = nonCanonicalConversationContext })
+                .IsWellFormed(fixture.Now));
+        Assert.False(
+            (toolInvocationRoundTrip with { ConversationId = null })
+                .IsWellFormed(fixture.Now));
+        Assert.False(
+            (toolInvocationRoundTrip with { ConversationId = Guid.Empty })
+                .IsWellFormed(fixture.Now));
+        Assert.False(
+            (toolInvocationRoundTrip with { ConversationId = Guid.NewGuid() })
+                .IsWellFormed(fixture.Now));
+        Assert.False(
+            (toolInvocationRoundTrip with { HostActionContext = nonCanonicalConversationContext })
+                .IsWellFormed(fixture.Now));
+        Assert.True(
+            (toolInvocationRoundTrip with
+            {
+                ConversationId = null,
+                HostActionContext = nullConversationContext,
+            }).IsWellFormed(fixture.Now));
         var wrongIngress = roundTrip with
         {
             HostActionContext = roundTrip.HostActionContext with
@@ -489,6 +555,943 @@ public sealed class SidecarCapabilityTransportTests
         Assert.False(cliContext.Contribution!.Lineage.IsPayloadBound);
         Assert.False(toolContext.Contribution!.Lineage.IsPayloadBound);
         Assert.False(crossModuleContext.Contribution!.Lineage.IsPayloadBound);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_route_authority_round_trips_and_validates_before_carrier_admission(
+        HostEndpointTransport transport)
+    {
+        static bool Authenticate(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var fixture = CreateFixture(
+            authenticateEndpointRouteAuthority: Authenticate,
+            actionInputBytes: 4096,
+            protocolMessageBytes: 4096);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(fixture, context, transport);
+        var call = ActionCall(fixture, 1, $"endpoint-route-{transport}");
+
+        var issued = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            call,
+            fixture.Now,
+            authority => HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority),
+            out var authority);
+
+        Assert.True(issued.Accepted, issued.Message);
+        Assert.NotNull(authority);
+        var encodedRequest = SidecarCapabilityTransportCodec.Serialize(request);
+        var encodedAuthority = SidecarCapabilityTransportCodec.Serialize(authority!);
+        var requestRoundTrip =
+            SidecarCapabilityTransportCodec.Deserialize<HostEndpointRouteRequest>(encodedRequest);
+        var authorityRoundTrip =
+            SidecarCapabilityTransportCodec.Deserialize<HostEndpointRouteAuthority>(encodedAuthority);
+
+        Assert.Equal(encodedRequest, SidecarCapabilityTransportCodec.Serialize(requestRoundTrip));
+        Assert.Equal(encodedAuthority, SidecarCapabilityTransportCodec.Serialize(authorityRoundTrip));
+        Assert.True(
+            HostEndpointRouteAuthorityValidator.Validate(
+                requestRoundTrip,
+                authorityRoundTrip,
+                fixture.Now,
+                Authenticate).Accepted);
+        var carrier = new HostActionEntryCarrierIdentity(
+            HostActionEntryIngress.Endpoint,
+            context.InvocationId,
+            context.Contribution!.IngressBinding);
+        Assert.False(
+            fixture.Session.BeginHostActionEntryCarrier(
+                context,
+                carrier,
+                fixture.Now,
+                out _).Accepted);
+        Assert.False(
+            fixture.Session.TryGetActiveHostActionEntryCarrier(
+                context.CapabilityId,
+                out _));
+
+        var carrierResult = fixture.Session.BeginHostEndpointRouteCarrier(
+            requestRoundTrip,
+            authorityRoundTrip,
+            carrier,
+            fixture.Now,
+            out _);
+        Assert.True(carrierResult.Accepted, carrierResult.Message);
+
+        Assert.False(
+            fixture.Session.BeginHostEndpointRouteCarrier(
+                requestRoundTrip,
+                authorityRoundTrip,
+                carrier,
+                fixture.Now,
+                out _).Accepted);
+    }
+
+    [Theory]
+    [InlineData("/demo", "get")]
+    [InlineData("/demo", "\u00C9")]
+    [InlineData("/demo", "GET ")]
+    [InlineData(" /demo", "GET")]
+    [InlineData("/demo?value", "GET")]
+    [InlineData("/demo#fragment", "GET")]
+    [InlineData("/demo\\item", "GET")]
+    [InlineData("//demo", "GET")]
+    [InlineData("/./demo", "GET")]
+    [InlineData("/../demo", "GET")]
+    [InlineData("/demo//item", "GET")]
+    [InlineData("/demo%2Fitem", "GET")]
+    [InlineData("/demo%2", "GET")]
+    [InlineData("/demo%ZZ", "GET")]
+    [InlineData("/demo\u0001", "GET")]
+    [InlineData("/demo\u0020item", "GET")]
+    public void Endpoint_route_identity_rejects_noncanonical_forms_without_throwing(
+        string path,
+        string method)
+    {
+        var identity = new HostEndpointRouteIdentity(
+            "/demo",
+            path,
+            method,
+            HostEndpointTransport.Http);
+
+        Assert.False(identity.IsWellFormed);
+    }
+
+    [Fact]
+    public void Endpoint_route_metadata_uses_case_insensitive_headers_and_case_sensitive_queries()
+    {
+        static bool Authenticate(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var fixture = CreateFixture(authenticateEndpointRouteAuthority: Authenticate);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var call = ActionCall(fixture, 1, "endpoint-metadata");
+        var issue = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            call,
+            fixture.Now,
+            authority => HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority),
+            out var authority);
+
+        Assert.True(issue.Accepted, issue.Message);
+        var caseChangedHeaders = request with
+        {
+            Headers = new Dictionary<string, string[]>(StringComparer.Ordinal)
+            {
+                ["X-REQUEST"] = ["one", "two"],
+                ["x-empty"] = [],
+            },
+        };
+        Assert.True(
+            HostEndpointRouteAuthorityValidator.Validate(
+                caseChangedHeaders,
+                authority!,
+                fixture.Now,
+                Authenticate).Accepted);
+
+        var duplicateHeaders = request with
+        {
+            Headers = new Dictionary<string, string[]>(StringComparer.Ordinal)
+            {
+                ["x-request"] = ["one", "two"],
+                ["X-REQUEST"] = ["one", "two"],
+            },
+        };
+        Assert.False(duplicateHeaders.IsWellFormed(fixture.Now));
+
+        var changedQueryKey = request with
+        {
+            Query = new Dictionary<string, string[]>(StringComparer.Ordinal)
+            {
+                ["Tag"] = ["one", "two"],
+            },
+        };
+        Assert.False(
+            HostEndpointRouteAuthorityValidator.Validate(
+                changedQueryKey,
+                authority!,
+                fixture.Now,
+                Authenticate).Accepted);
+    }
+
+    [Theory]
+    [InlineData("header name", "value")]
+    [InlineData("header:name", "value")]
+    [InlineData("h\u00E9ader", "value")]
+    [InlineData("header", "bad\rvalue")]
+    [InlineData("header", "bad\nvalue")]
+    [InlineData("header", "bad\u0000value")]
+    public void Endpoint_route_rejects_invalid_header_metadata_before_authority_storage(
+        string name,
+        string value)
+    {
+        static bool Authenticate(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var fixture = CreateFixture(authenticateEndpointRouteAuthority: Authenticate);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http) with
+        {
+            Headers = new Dictionary<string, string[]>(StringComparer.Ordinal)
+            {
+                [name] = [value],
+            },
+        };
+
+        var rejected = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            ActionCall(fixture, 1, "invalid-header"),
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out _);
+
+        Assert.False(rejected.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, rejected.Code);
+        Assert.Equal(1, fixture.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(0, fixture.Session.ActiveHostActionEntryCarrierCount);
+
+        var validRequest = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        Assert.True(
+            fixture.Session.IssueHostEndpointRouteAuthority(
+                validRequest,
+                ActionCall(fixture, 1, "valid-header"),
+                fixture.Now,
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+                out _).Accepted);
+    }
+
+    [Fact]
+    public void Endpoint_route_authority_uses_only_one_unconsumed_issued_context()
+    {
+        static bool Authenticate(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var fixture = CreateFixture(authenticateEndpointRouteAuthority: Authenticate);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var firstCall = ActionCall(fixture, 1, "first-route");
+        var firstIssue = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            firstCall,
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out var firstAuthority);
+        Assert.True(firstIssue.Accepted, firstIssue.Message);
+
+        var firstCarrier = new HostActionEntryCarrierIdentity(
+            HostActionEntryIngress.Endpoint,
+            context.InvocationId,
+            context.Contribution!.IngressBinding);
+        var firstAdmission = fixture.Session.BeginHostEndpointRouteCarrier(
+            request,
+            firstAuthority!,
+            firstCarrier,
+            fixture.Now,
+            out var firstCarrierAuthority);
+        Assert.True(firstAdmission.Accepted, firstAdmission.Message);
+
+        var secondIssue = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            firstCall with
+            {
+                CallId = Guid.NewGuid(),
+                ReplayNonce = "second-route",
+                Sequence = 2,
+            },
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out _);
+        Assert.False(secondIssue.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, secondIssue.Code);
+
+        var completed = fixture.Session.CompleteHostActionEntryCarrier(
+            firstCarrierAuthority!,
+            HostActionEntryCarrierCompletionKind.Failed,
+            fixture.Now);
+        Assert.True(completed.Accepted, completed.Message);
+
+        var rotatedExpiry = fixture.Binding.ExpiresAt.AddMinutes(1);
+        var rotated = fixture.Binding with
+        {
+            SessionId = Guid.NewGuid(),
+            RequestId = Guid.NewGuid(),
+            CancellationId = Guid.NewGuid(),
+            ExpiresAt = rotatedExpiry,
+            Grant = fixture.Binding.Grant with { ExpiresAt = rotatedExpiry },
+            Authentication = fixture.Binding.Authentication with
+            {
+                Nonce = "endpoint-rotation",
+                ExpiresAt = rotatedExpiry,
+                BindingHash = string.Empty,
+            },
+        };
+        rotated = rotated with
+        {
+            Authentication = rotated.Authentication with
+            {
+                BindingHash = SidecarCapabilitySessionValidator.ComputeBindingHash(rotated),
+            },
+        };
+        fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+
+        var rotation = fixture.Session.RotateBinding(rotated, fixture.Now);
+        Assert.True(rotation.Accepted, rotation.Message);
+    }
+
+    [Fact]
+    public void Endpoint_route_authority_rejects_second_pending_authority_for_context()
+    {
+        static bool Authenticate(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var fixture = CreateFixture(
+            authenticateEndpointRouteAuthority: Authenticate,
+            actionInputBytes: 4096,
+            protocolMessageBytes: 4096);
+        var invocationType = typeof(HostEndpointInvocation).AssemblyQualifiedName!;
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint,
+            lineage: new HostActionEntryLineage(
+                new SharpClawActionKey("endpoint.action"),
+                1,
+                "endpoint-descriptor",
+                invocationType,
+                1,
+                "endpoint-input-schema",
+                null,
+                null),
+            bindPayload: true);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var firstCall = ActionCall(fixture, 1, "pending-context-first");
+        var firstIssue = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            firstCall,
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out var firstAuthority);
+        Assert.True(firstIssue.Accepted, firstIssue.Message);
+        Assert.NotNull(firstAuthority);
+
+        var secondCall = firstCall with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "pending-context-second",
+            Sequence = 1,
+        };
+        var secondIssue = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            secondCall,
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out var secondAuthority);
+        Assert.False(secondIssue.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Duplicate, secondIssue.Code);
+        Assert.Null(secondAuthority);
+        Assert.Equal(1, fixture.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(0, fixture.Session.ActiveHostActionEntryCarrierCount);
+
+        var carrier = new HostActionEntryCarrierIdentity(
+            HostActionEntryIngress.Endpoint,
+            context.InvocationId,
+            context.Contribution!.IngressBinding);
+        var admission = fixture.Session.BeginHostEndpointRouteCarrier(
+            request,
+            firstAuthority!,
+            carrier,
+            fixture.Now,
+            out var carrierAuthority);
+        Assert.True(admission.Accepted, admission.Message);
+
+        var payload = EndpointInvocationPayload(invocationType, request.Invocation);
+        Assert.True(
+            fixture.Session.BeginCall(
+                firstCall,
+                SidecarCapabilityKind.Action,
+                payload,
+                payload.ByteLength,
+                fixture.Now,
+                context).Accepted);
+        Assert.True(
+            fixture.Session.RecordTerminal(
+                firstCall.CallId,
+                Guid.NewGuid(),
+                new SidecarTerminalReceipt(
+                    "pending-context-receipt",
+                    new SharpClawActionKey("endpoint.action"),
+                    1,
+                    firstCall.CallId,
+                    1,
+                    payload.ContentHash,
+                    "endpoint-scope")).Accepted);
+        Assert.True(fixture.Session.CompleteCall(firstCall.CallId, 1).Accepted);
+        Assert.True(
+            fixture.Session.CompleteHostActionEntryCarrier(
+                carrierAuthority!,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                fixture.Now).Accepted);
+
+        var rotated = CreateRotatedBinding(fixture, "pending-context-rotation");
+        fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+        var rotation = fixture.Session.RotateBinding(rotated, fixture.Now);
+        Assert.True(rotation.Accepted, rotation.Message);
+    }
+
+    [Fact]
+    public void Endpoint_route_pending_authority_is_removed_when_context_expires()
+    {
+        static bool Authenticate(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var fixture = CreateFixture(authenticateEndpointRouteAuthority: Authenticate);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint,
+            actionDeadline: fixture.Now.AddMilliseconds(500),
+            contextExpiresAt: fixture.Now.AddSeconds(1));
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var issue = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            ActionCall(fixture, 1, "pending-expiry"),
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out var authority);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(authority);
+        Assert.Equal(1, fixture.Session.IssuedHostActionEntryContextCount);
+
+        var removed = fixture.Session.SweepExpiredHostActionEntryCarriers(
+            fixture.Now.AddSeconds(2));
+        Assert.Equal(1, removed);
+        Assert.Equal(0, fixture.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(0, fixture.Session.ActiveHostActionEntryCarrierCount);
+
+        var rotated = CreateRotatedBinding(fixture, "pending-expiry-rotation");
+        fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+        var rotation = fixture.Session.RotateBinding(rotated, fixture.Now);
+        Assert.True(rotation.Accepted, rotation.Message);
+    }
+
+    [Theory]
+    [InlineData("handler")]
+    [InlineData("path")]
+    [InlineData("method")]
+    [InlineData("transport")]
+    [InlineData("headers")]
+    [InlineData("query")]
+    [InlineData("body")]
+    [InlineData("content-hash")]
+    [InlineData("content-length")]
+    [InlineData("request-deadline")]
+    [InlineData("context")]
+    [InlineData("session")]
+    [InlineData("request")]
+    [InlineData("cancellation")]
+    [InlineData("call")]
+    [InlineData("replay-nonce")]
+    [InlineData("sequence")]
+    [InlineData("deadline")]
+    [InlineData("expiry")]
+    [InlineData("proof")]
+    [InlineData("invocation-id")]
+    [InlineData("invocation-handler")]
+    [InlineData("invocation-context")]
+    [InlineData("invocation-hash")]
+    [InlineData("invocation-length")]
+    public void Endpoint_route_mutations_reject_before_reservation_and_preserve_original(
+        string mutation)
+    {
+        static bool Authenticate(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var fixture = CreateFixture(authenticateEndpointRouteAuthority: Authenticate);
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint);
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var call = ActionCall(fixture, 1, "endpoint-route-mutation");
+        var issue = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            call,
+            fixture.Now,
+            authority => HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority),
+            out var authority);
+        Assert.True(issue.Accepted, issue.Message);
+        var original = authority!;
+        var mutatedRequest = request;
+        var mutatedAuthority = original;
+
+        switch (mutation)
+        {
+            case "handler":
+                mutatedRequest = request with
+                {
+                    Route = request.Route with { HandlerIdentity = "/other" },
+                };
+                break;
+            case "path":
+                mutatedRequest = request with
+                {
+                    Route = request.Route with { Path = "/other" },
+                };
+                break;
+            case "method":
+                mutatedRequest = request with
+                {
+                    Route = request.Route with { Method = "PATCH" },
+                };
+                break;
+            case "transport":
+                mutatedRequest = request with
+                {
+                    Route = request.Route with { Transport = HostEndpointTransport.WebSocket },
+                };
+                break;
+            case "headers":
+                mutatedRequest = request with
+                {
+                    Headers = new Dictionary<string, string[]>(request.Headers)
+                    {
+                        ["x-request"] = ["changed"],
+                    },
+                };
+                break;
+            case "query":
+                mutatedRequest = request with
+                {
+                    Query = new Dictionary<string, string[]>(request.Query)
+                    {
+                        ["tag"] = ["changed", "value"],
+                    },
+                };
+                break;
+            case "body":
+                mutatedRequest = request with { Body = [0, 255, 2] };
+                break;
+            case "content-hash":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { RequestContentHash = new string('0', 64) });
+                break;
+            case "content-length":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { RequestContentByteLength = original.RequestContentByteLength + 1 });
+                break;
+            case "request-deadline":
+                mutatedRequest = request with
+                {
+                    Invocation = request.Invocation with
+                    {
+                        HostActionContext = request.Invocation.HostActionContext with
+                        {
+                            Deadline = request.Invocation.HostActionContext.Deadline.AddSeconds(-1),
+                        },
+                    },
+                };
+                break;
+            case "context":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with
+                    {
+                        HostActionContext = original.HostActionContext with { TraceId = Guid.NewGuid() },
+                    });
+                break;
+            case "session":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { Call = original.Call with { SessionId = Guid.NewGuid() } });
+                break;
+            case "request":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { Call = original.Call with { RequestId = Guid.NewGuid() } });
+                break;
+            case "cancellation":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { Call = original.Call with { CancellationId = Guid.NewGuid() } });
+                break;
+            case "call":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { Call = original.Call with { CallId = Guid.NewGuid() } });
+                break;
+            case "replay-nonce":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { Call = original.Call with { ReplayNonce = "changed-replay" } });
+                break;
+            case "sequence":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { Call = original.Call with { Sequence = original.Call.Sequence + 1 } });
+                break;
+            case "deadline":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with
+                    {
+                        Call = original.Call with { Deadline = fixture.Now.AddSeconds(10) },
+                    });
+                break;
+            case "expiry":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { ExpiresAt = original.ExpiresAt.AddSeconds(1) });
+                break;
+            case "proof":
+                mutatedAuthority = original with { Proof = "forged" };
+                break;
+            case "invocation-id":
+                mutatedRequest = request with
+                {
+                    Invocation = request.Invocation with { InvocationId = Guid.NewGuid() },
+                };
+                break;
+            case "invocation-handler":
+                mutatedRequest = request with
+                {
+                    Invocation = request.Invocation with { Endpoint = "/other" },
+                };
+                break;
+            case "invocation-context":
+                mutatedRequest = request with
+                {
+                    Invocation = request.Invocation with
+                    {
+                        HostActionContext = request.Invocation.HostActionContext with
+                        {
+                            TraceId = Guid.NewGuid(),
+                        },
+                    },
+                };
+                break;
+            case "invocation-hash":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { InvocationContentHash = new string('0', 64) });
+                break;
+            case "invocation-length":
+                mutatedAuthority = ResignEndpointAuthority(
+                    original with { InvocationByteLength = original.InvocationByteLength + 1 });
+                break;
+        }
+
+        var carrier = new HostActionEntryCarrierIdentity(
+            HostActionEntryIngress.Endpoint,
+            context.InvocationId,
+            context.Contribution!.IngressBinding);
+        var bypass = fixture.Session.BeginHostActionEntryCarrier(
+            context,
+            carrier,
+            fixture.Now,
+            out _);
+        Assert.False(bypass.Accepted);
+
+        var rejected = fixture.Session.BeginHostEndpointRouteCarrier(
+            mutatedRequest,
+            mutatedAuthority,
+            carrier,
+            fixture.Now,
+            out _);
+        Assert.False(rejected.Accepted, rejected.Message);
+        Assert.False(
+            fixture.Session.TryGetActiveHostActionEntryCarrier(
+                context.CapabilityId,
+                out _));
+
+        var originalResult = fixture.Session.BeginHostEndpointRouteCarrier(
+            request,
+            original,
+            carrier,
+            fixture.Now,
+            out _);
+        Assert.True(originalResult.Accepted, originalResult.Message);
+    }
+
+    [Fact]
+    public void Endpoint_route_admission_binds_one_call_and_serialized_invocation()
+    {
+        static bool Authenticate(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var fixture = CreateFixture(
+            authenticateEndpointRouteAuthority: Authenticate,
+            actionInputBytes: 4096,
+            protocolMessageBytes: 4096);
+        var invocationType = typeof(HostEndpointInvocation).AssemblyQualifiedName!;
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-user"),
+            HostActionEntryIngress.Endpoint,
+            lineage: new HostActionEntryLineage(
+                new SharpClawActionKey("endpoint.action"),
+                1,
+                "endpoint-descriptor",
+                invocationType,
+                1,
+                "endpoint-input-schema",
+                null,
+                null));
+        var request = EndpointRouteRequest(fixture, context, HostEndpointTransport.Http);
+        var call = ActionCall(fixture, 1, "endpoint-bound-call");
+        var authorityResult = fixture.Session.IssueHostEndpointRouteAuthority(
+            request,
+            call,
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out var authority);
+        Assert.True(authorityResult.Accepted, authorityResult.Message);
+
+        var carrier = new HostActionEntryCarrierIdentity(
+            HostActionEntryIngress.Endpoint,
+            context.InvocationId,
+            context.Contribution!.IngressBinding);
+        Assert.True(
+            fixture.Session.BeginHostEndpointRouteCarrier(
+                request,
+                authority!,
+                carrier,
+                fixture.Now,
+                out var carrierAuthority).Accepted);
+
+        var invocationPayload = EndpointInvocationPayload(invocationType, request.Invocation);
+        var otherCall = call with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "endpoint-other-call",
+            Sequence = 2,
+        };
+        var otherResult = fixture.Session.BeginCall(
+            otherCall,
+            SidecarCapabilityKind.Action,
+            invocationPayload,
+            invocationPayload.ByteLength,
+            fixture.Now,
+            context);
+        Assert.False(otherResult.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, otherResult.Code);
+
+        var changedPayload = EndpointInvocationPayload(
+            invocationType,
+            request.Invocation with { Endpoint = "/changed" });
+        var changedResult = fixture.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            changedPayload,
+            changedPayload.ByteLength,
+            fixture.Now,
+            context);
+        Assert.False(changedResult.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, changedResult.Code);
+
+        Assert.Equal(authority!.InvocationContentHash, invocationPayload.ContentHash);
+        Assert.Equal(authority.InvocationByteLength, invocationPayload.ByteLength);
+        var canonicalInvocationBytes =
+            SidecarCapabilityTransportCodec.Serialize(invocationPayload.Value);
+        Assert.Equal(invocationPayload.ByteLength, canonicalInvocationBytes.Length);
+        Assert.Equal(
+            invocationPayload.ContentHash,
+            SidecarCapabilityTransportCodec.ComputeSha256(canonicalInvocationBytes));
+        var invocationPayloadValidation =
+            SidecarCapabilityTransportValidation.ValidateSerializedPayload(
+                invocationPayload,
+                required: true,
+                fixture.Binding.PayloadLimits.ActionInputBytes);
+        Assert.True(invocationPayloadValidation.Accepted, invocationPayloadValidation.Message);
+        var originalResult = fixture.Session.BeginCall(
+            call,
+            SidecarCapabilityKind.Action,
+            invocationPayload,
+            invocationPayload.ByteLength,
+            fixture.Now,
+            context);
+        Assert.True(originalResult.Accepted, originalResult.Message);
+        Assert.True(
+            fixture.Session.RecordTerminal(
+                call.CallId,
+                Guid.NewGuid(),
+                new SidecarTerminalReceipt(
+                    "endpoint-receipt",
+                    new SharpClawActionKey("endpoint.action"),
+                    1,
+                    call.CallId,
+                    1,
+                    invocationPayload.ContentHash,
+                    "endpoint-scope")).Accepted);
+        Assert.True(fixture.Session.CompleteCall(call.CallId, 1).Accepted);
+        Assert.True(
+            fixture.Session.CompleteHostActionEntryCarrier(
+                carrierAuthority!,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                fixture.Now).Accepted);
+    }
+
+    [Fact]
+    public void Endpoint_route_authority_rejects_duplicate_admission_call_without_consuming_context()
+    {
+        static bool Authenticate(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == hash;
+
+        var fixture = CreateFixture(
+            authenticateEndpointRouteAuthority: Authenticate,
+            actionInputBytes: 4096,
+            protocolMessageBytes: 4096);
+        var invocationType = typeof(HostEndpointInvocation).AssemblyQualifiedName!;
+        var lineage = new HostActionEntryLineage(
+            new SharpClawActionKey("endpoint.action"),
+            1,
+            "endpoint-descriptor",
+            invocationType,
+            1,
+            "endpoint-input-schema",
+            null,
+            null);
+        var firstContext = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-one"),
+            HostActionEntryIngress.Endpoint,
+            lineage: lineage,
+            bindPayload: true);
+        var secondContext = IssueContext(
+            fixture,
+            new RequestPrincipal("endpoint-two"),
+            HostActionEntryIngress.Endpoint,
+            lineage: lineage,
+            bindPayload: true);
+        var firstRequest = EndpointRouteRequest(fixture, firstContext, HostEndpointTransport.Http);
+        var secondRequest = EndpointRouteRequest(fixture, secondContext, HostEndpointTransport.Http);
+        var firstCall = ActionCall(fixture, 1, "duplicate-admission-first");
+        var firstIssue = fixture.Session.IssueHostEndpointRouteAuthority(
+            firstRequest,
+            firstCall,
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out var firstAuthority);
+        Assert.True(firstIssue.Accepted, firstIssue.Message);
+
+        var firstCarrier = new HostActionEntryCarrierIdentity(
+            HostActionEntryIngress.Endpoint,
+            firstContext.InvocationId,
+            firstContext.Contribution!.IngressBinding);
+        var firstAdmission = fixture.Session.BeginHostEndpointRouteCarrier(
+            firstRequest,
+            firstAuthority!,
+            firstCarrier,
+            fixture.Now,
+            out var firstCarrierAuthority);
+        Assert.True(firstAdmission.Accepted, firstAdmission.Message);
+        Assert.Equal(1, fixture.Session.ActiveHostActionEntryCarrierCount);
+
+        var duplicateCall = firstCall with
+        {
+            ReplayNonce = "duplicate-admission-second",
+            Sequence = 2,
+        };
+        var duplicateIssue = fixture.Session.IssueHostEndpointRouteAuthority(
+            secondRequest,
+            duplicateCall,
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out _);
+        Assert.False(duplicateIssue.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Duplicate, duplicateIssue.Code);
+        Assert.Equal(1, fixture.Session.ActiveHostActionEntryCarrierCount);
+
+        var firstPayload = EndpointInvocationPayload(invocationType, firstRequest.Invocation);
+        Assert.True(
+            fixture.Session.BeginCall(
+                firstCall,
+                SidecarCapabilityKind.Action,
+                firstPayload,
+                firstPayload.ByteLength,
+                fixture.Now,
+                firstContext).Accepted);
+        Assert.True(
+            fixture.Session.RecordTerminal(
+                firstCall.CallId,
+                Guid.NewGuid(),
+                new SidecarTerminalReceipt(
+                    "duplicate-admission-first-receipt",
+                    new SharpClawActionKey("endpoint.action"),
+                    1,
+                    firstCall.CallId,
+                    1,
+                    firstPayload.ContentHash,
+                    "endpoint-scope")).Accepted);
+        Assert.True(fixture.Session.CompleteCall(firstCall.CallId, 1).Accepted);
+        Assert.True(
+            fixture.Session.CompleteHostActionEntryCarrier(
+                firstCarrierAuthority!,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                fixture.Now).Accepted);
+
+        var secondCall = duplicateCall with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "duplicate-admission-fresh",
+        };
+        var secondIssue = fixture.Session.IssueHostEndpointRouteAuthority(
+            secondRequest,
+            secondCall,
+            fixture.Now,
+            HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+            out var secondAuthority);
+        Assert.True(secondIssue.Accepted, secondIssue.Message);
+
+        var secondCarrier = new HostActionEntryCarrierIdentity(
+            HostActionEntryIngress.Endpoint,
+            secondContext.InvocationId,
+            secondContext.Contribution!.IngressBinding);
+        var secondAdmission = fixture.Session.BeginHostEndpointRouteCarrier(
+            secondRequest,
+            secondAuthority!,
+            secondCarrier,
+            fixture.Now,
+            out var secondCarrierAuthority);
+        Assert.True(secondAdmission.Accepted, secondAdmission.Message);
+
+        var secondPayload = EndpointInvocationPayload(invocationType, secondRequest.Invocation);
+        Assert.True(
+            fixture.Session.BeginCall(
+                secondCall,
+                SidecarCapabilityKind.Action,
+                secondPayload,
+                secondPayload.ByteLength,
+                fixture.Now,
+                secondContext).Accepted);
+        Assert.True(
+            fixture.Session.RecordTerminal(
+                secondCall.CallId,
+                Guid.NewGuid(),
+                new SidecarTerminalReceipt(
+                    "duplicate-admission-second-receipt",
+                    new SharpClawActionKey("endpoint.action"),
+                    1,
+                    secondCall.CallId,
+                    1,
+                    secondPayload.ContentHash,
+                    "endpoint-scope")).Accepted);
+        Assert.True(fixture.Session.CompleteCall(secondCall.CallId, 1).Accepted);
+        Assert.True(
+            fixture.Session.CompleteHostActionEntryCarrier(
+                secondCarrierAuthority!,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                fixture.Now).Accepted);
+
+        var rotated = CreateRotatedBinding(fixture, "duplicate-admission-rotation");
+        fixture.BindingHashes.Add(rotated.Authentication.BindingHash);
+        var rotation = fixture.Session.RotateBinding(rotated, fixture.Now);
+        Assert.True(rotation.Accepted, rotation.Message);
     }
 
     [Fact]
@@ -1211,14 +2214,15 @@ public sealed class SidecarCapabilityTransportTests
             Sequence = 1,
         };
         var firstPayload = Payload(typeof(string).AssemblyQualifiedName!, "first");
-        ActivateContext(fixture, contexts[0]);
+        var activeContext = contexts[1];
+        ActivateContext(fixture, activeContext);
         Assert.True(fixture.Session.BeginCall(
             firstCall,
             SidecarCapabilityKind.Action,
             firstPayload,
             firstPayload.ByteLength,
             fixture.Now,
-            contexts[0]).Accepted);
+            activeContext).Accepted);
 
         var wrongOwner = fixture.Session.BeginCall(
             firstCall with
@@ -1232,7 +2236,7 @@ public sealed class SidecarCapabilityTransportTests
             firstPayload,
             firstPayload.ByteLength,
             fixture.Now,
-            contexts[1]);
+            contexts[0]);
         Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, wrongOwner.Code);
 
         var wrongGraph = fixture.Session.BeginCall(
@@ -1247,7 +2251,7 @@ public sealed class SidecarCapabilityTransportTests
             firstPayload,
             firstPayload.ByteLength,
             fixture.Now,
-            contexts[1]);
+            contexts[0]);
         Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, wrongGraph.Code);
 
         var replay = fixture.Session.BeginCall(
@@ -1256,7 +2260,7 @@ public sealed class SidecarCapabilityTransportTests
             firstPayload,
             firstPayload.ByteLength,
             fixture.Now,
-            contexts[0]);
+            activeContext);
         Assert.Equal(SidecarCapabilityErrors.Replay, replay.Code);
 
         var wrongIngress = contexts[1] with { Ingress = HostActionEntryIngress.Tool };
@@ -1600,7 +2604,7 @@ public sealed class SidecarCapabilityTransportTests
         var context = IssueContext(
             fixture,
             caller,
-            HostActionEntryIngress.Endpoint,
+            HostActionEntryIngress.Cli,
             traceId,
             idempotencyKey,
             actionDeadline: fixture.Call.Deadline,
@@ -1754,7 +2758,7 @@ public sealed class SidecarCapabilityTransportTests
         var context = IssueContext(
             fixture,
             caller,
-            HostActionEntryIngress.Endpoint,
+            HostActionEntryIngress.Cli,
             lineage: Lineage(descriptor, "input"));
         var call = fixture.Call with
         {
@@ -2597,7 +3601,7 @@ public sealed class SidecarCapabilityTransportTests
         var hostContext = IssueContext(
             fixture,
             new RequestPrincipal("effective-caller", Roles: new HashSet<string>(["reader"])),
-            HostActionEntryIngress.Endpoint,
+            HostActionEntryIngress.Cli,
             actionDeadline: call.Deadline,
             lineage: new HostActionEntryLineage(
                 descriptor.Key,
@@ -2812,7 +3816,11 @@ public sealed class SidecarCapabilityTransportTests
     [Fact]
     public void Host_entry_accepts_each_ingress_with_one_descriptor_bound_terminal()
     {
-        var fixture = CreateFixture(maxCalls: 8);
+        var fixture = CreateFixture(
+            maxCalls: 8,
+            authenticateEndpointRouteAuthority: static (authority, hash) => authority.Proof == hash,
+            actionInputBytes: 4096,
+            protocolMessageBytes: 4096);
         var ingresses = Enum.GetValues<HostActionEntryIngress>();
 
         for (var index = 0; index < ingresses.Length; index++)
@@ -2826,11 +3834,14 @@ public sealed class SidecarCapabilityTransportTests
                 Sequence = index + 1,
             };
             var key = new SharpClawActionKey($"module.{ingress.ToString().ToLowerInvariant()}");
+            var inputType = ingress == HostActionEntryIngress.Endpoint
+                ? typeof(HostEndpointInvocation).AssemblyQualifiedName!
+                : typeof(string).AssemblyQualifiedName!;
             var descriptor = new SidecarActionDescriptorIdentity(
                 key,
                 1,
                 "module",
-                typeof(string).AssemblyQualifiedName!,
+                inputType,
                 $"{key.Value}.input",
                 1,
                 typeof(string).AssemblyQualifiedName!,
@@ -2852,6 +3863,11 @@ public sealed class SidecarCapabilityTransportTests
                     descriptor.InputSchemaHash,
                     null,
                     null));
+            var endpointRequest = ingress == HostActionEntryIngress.Endpoint
+                ? EndpointRouteRequest(fixture, context, HostEndpointTransport.Http)
+                : null;
+            if (endpointRequest is not null)
+                action = EndpointInvocationPayload(descriptor.InputTypeIdentity, endpointRequest.Invocation);
             var request = SidecarActionCapabilityRequest.HostEntry(
                 call,
                 descriptor,
@@ -2871,7 +3887,9 @@ public sealed class SidecarCapabilityTransportTests
                 request,
                 fixture.Binding,
                 fixture.Now).Accepted);
-            var authority = ActivateContext(fixture, context);
+            var authority = ingress == HostActionEntryIngress.Endpoint
+                ? ActivateContext(fixture, context, call)
+                : ActivateContext(fixture, context);
             Assert.True(fixture.Session.BeginCall(
                 call,
                 SidecarCapabilityKind.Action,
@@ -4702,7 +5720,7 @@ public sealed class SidecarCapabilityTransportTests
         var parentContext = IssueContext(
             fixture,
             new RequestPrincipal("resolution-caller"),
-            HostActionEntryIngress.Endpoint,
+            HostActionEntryIngress.Cli,
             lineage: new HostActionEntryLineage(
                 parentDescriptor.Key,
                 parentDescriptor.Version,
@@ -4850,7 +5868,7 @@ public sealed class SidecarCapabilityTransportTests
         var context = IssueContext(
             fixture,
             new RequestPrincipal("revoke-caller"),
-            HostActionEntryIngress.Endpoint,
+            HostActionEntryIngress.Cli,
             lineage: new HostActionEntryLineage(
                 descriptor.Key,
                 descriptor.Version,
@@ -5223,7 +6241,7 @@ public sealed class SidecarCapabilityTransportTests
         var context = IssueContext(
             fixture,
             new RequestPrincipal("external-user"),
-            HostActionEntryIngress.Endpoint,
+            HostActionEntryIngress.Cli,
             lineage: new HostActionEntryLineage(
                 descriptor.Key,
                 descriptor.Version,
@@ -6232,7 +7250,10 @@ public sealed class SidecarCapabilityTransportTests
         string moduleId = "module-a",
         string graphId = "graph-a",
         Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null,
-        Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null)
+        Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null,
+        Func<HostEndpointRouteAuthority, string, bool>? authenticateEndpointRouteAuthority = null,
+        int actionInputBytes = 1024,
+        int protocolMessageBytes = 1024)
     {
         var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var expires = now.AddMinutes(5);
@@ -6254,7 +7275,7 @@ public sealed class SidecarCapabilityTransportTests
             Guid.NewGuid(),
             Guid.NewGuid(),
             expires,
-            new SidecarPayloadLimits(1024, 1024, 1024, 2048, 512),
+            new SidecarPayloadLimits(actionInputBytes, 1024, protocolMessageBytes, 2048, 512),
             new SidecarConcurrencyLimits(maxInFlight, maxCalls),
             safeFailure,
             "host-a",
@@ -6277,7 +7298,8 @@ public sealed class SidecarCapabilityTransportTests
             nonces.Add,
             now,
             authenticateHostTerminalAuthority,
-            authenticateStorageContinuationAuthority);
+            authenticateStorageContinuationAuthority,
+            authenticateEndpointRouteAuthority);
         var call = new SidecarCapabilityCallIdentity(
             binding.SessionId,
             binding.RequestId,
@@ -9066,7 +10088,8 @@ public sealed class SidecarCapabilityTransportTests
         DateTimeOffset? actionDeadline = null,
         DateTimeOffset? contextExpiresAt = null,
         HostActionEntryLineage? lineage = null,
-        bool bindPayload = false)
+        bool bindPayload = false,
+        Guid? conversationId = null)
     {
         var request = new HostActionEntryContextRequest(
             ingress,
@@ -9085,7 +10108,10 @@ public sealed class SidecarCapabilityTransportTests
                 {
                     HostActionEntryIngress.Endpoint => new HostActionEntryIngressBinding(ingress, "/demo"),
                     HostActionEntryIngress.Cli => new HostActionEntryIngressBinding(ingress, "demo"),
-                    HostActionEntryIngress.Tool => new HostActionEntryIngressBinding(ingress, "clock_now"),
+                    HostActionEntryIngress.Tool => new HostActionEntryIngressBinding(
+                        ingress,
+                        "clock_now",
+                        conversationId?.ToString("D")),
                     _ => new HostActionEntryIngressBinding(ingress, "source.module", "target.module"),
                 },
                 bindPayload
@@ -9102,8 +10128,42 @@ public sealed class SidecarCapabilityTransportTests
 
     private static HostActionEntryCarrierAuthority ActivateContext(
         Fixture fixture,
-        HostActionEntryRequestContext context)
+        HostActionEntryRequestContext context,
+        SidecarCapabilityCallIdentity? endpointCall = null)
     {
+        if (context.Ingress == HostActionEntryIngress.Endpoint)
+        {
+            if (endpointCall is null)
+                throw new ArgumentException("Endpoint activation requires its route call.", nameof(endpointCall));
+
+            var routeRequest = EndpointRouteRequest(
+                fixture,
+                context,
+                HostEndpointTransport.Http);
+            var routeIssue = fixture.Session.IssueHostEndpointRouteAuthority(
+                routeRequest,
+                endpointCall,
+                fixture.Now,
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash,
+                out var routeAuthority);
+            Assert.True(routeIssue.Accepted, routeIssue.Message);
+            Assert.NotNull(routeAuthority);
+
+            var routeCarrier = new HostActionEntryCarrierIdentity(
+                HostActionEntryIngress.Endpoint,
+                context.InvocationId,
+                context.Contribution!.IngressBinding);
+            var routeAdmission = fixture.Session.BeginHostEndpointRouteCarrier(
+                routeRequest,
+                routeAuthority!,
+                routeCarrier,
+                fixture.Now,
+                out var routeCarrierAuthority);
+            Assert.True(routeAdmission.Accepted, routeAdmission.Message);
+            Assert.NotNull(routeCarrierAuthority);
+            return routeCarrierAuthority!;
+        }
+
         var carrier = new HostActionEntryCarrierIdentity(
             context.Ingress,
             context.InvocationId,
@@ -9116,6 +10176,35 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(result.Accepted, result.Message);
         Assert.NotNull(authority);
         return authority!;
+    }
+
+    private static HostEndpointRouteRequest EndpointRouteRequest(
+        Fixture fixture,
+        HostActionEntryRequestContext context,
+        HostEndpointTransport transport) =>
+        new(
+            new HostEndpointInvocation(context.InvocationId, "/demo", context),
+            new HostEndpointRouteIdentity(
+                "/demo",
+                transport == HostEndpointTransport.Http ? "/api/items" : "/socket",
+                transport == HostEndpointTransport.Http ? "POST" : "GET",
+                transport),
+            new Dictionary<string, string[]>(StringComparer.Ordinal)
+            {
+                ["x-request"] = ["one", "two"],
+                ["x-empty"] = [],
+            },
+            new Dictionary<string, string[]>(StringComparer.Ordinal)
+            {
+                ["tag"] = ["one", "two"],
+            },
+            [0, 255, 1, 2]);
+
+    private static HostEndpointRouteAuthority ResignEndpointAuthority(
+        HostEndpointRouteAuthority authority)
+    {
+        var hash = HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority);
+        return authority with { CanonicalBindingHash = hash, Proof = hash };
     }
 
     private static SidecarCapabilitySessionBinding CreateRotatedBinding(
@@ -9160,6 +10249,21 @@ public sealed class SidecarCapabilityTransportTests
             SidecarCapabilityTransportCodec.ComputeSha256(bytes),
             document.RootElement.Clone(),
             bytes.Length);
+    }
+
+    private static SidecarSerializedPayload EndpointInvocationPayload(
+        string typeIdentity,
+        HostEndpointInvocation invocation)
+    {
+        var encoded = SidecarCapabilityTransportCodec.Serialize(invocation);
+        using var document = JsonDocument.Parse(encoded);
+        var canonicalBytes = SidecarCapabilityTransportCodec.Serialize(document.RootElement);
+        return new SidecarSerializedPayload(
+            typeIdentity,
+            1,
+            SidecarCapabilityTransportCodec.ComputeSha256(canonicalBytes),
+            document.RootElement.Clone(),
+            canonicalBytes.Length);
     }
 
     private static HostActionEntryLineage LineageForContext(HostActionEntryLineage? lineage)

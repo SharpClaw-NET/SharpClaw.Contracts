@@ -240,7 +240,8 @@ public sealed record SidecarToolHandlerInvokeStart(
     JsonElement Input,
     JsonSchemaReference InputSchema,
     RequestPrincipal Caller,
-    HostActionEntryRequestContext HostActionContext) : ISidecarProtocolMessage
+    HostActionEntryRequestContext HostActionContext,
+    Guid? ConversationId = null) : ISidecarProtocolMessage
 {
     public SidecarProtocolMessageKind MessageKind => SidecarProtocolMessageKind.ToolHandlerInvokeStart;
 
@@ -265,6 +266,13 @@ public sealed record SidecarToolHandlerInvokeStart(
             HostActionContext.Contribution.IngressBinding.PrimaryIdentity,
             ToolName,
             StringComparison.Ordinal) &&
+        (ConversationId is null
+            ? HostActionContext.Contribution.IngressBinding.SecondaryIdentity is null
+            : ConversationId != Guid.Empty &&
+              string.Equals(
+                  HostActionContext.Contribution.IngressBinding.SecondaryIdentity,
+                  ConversationId.Value.ToString("D"),
+                  StringComparison.Ordinal)) &&
         !HostActionContext.Contribution.Lineage.IsPayloadBound &&
         Header.Deadline == HostActionContext.Deadline &&
         SamePrincipal(Caller, HostActionContext.Caller);

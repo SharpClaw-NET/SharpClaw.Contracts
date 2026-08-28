@@ -154,6 +154,13 @@ public sealed record ToolInvocation(
         HostActionContext.InvocationId == InvocationId &&
         HostActionContext.Contribution?.IngressBinding.Ingress == HostActionEntryIngress.Tool &&
         string.Equals(HostActionContext.Contribution.IngressBinding.PrimaryIdentity, ToolName, StringComparison.Ordinal) &&
+        (ConversationId is null
+            ? HostActionContext.Contribution.IngressBinding.SecondaryIdentity is null
+            : ConversationId != Guid.Empty &&
+              string.Equals(
+                  HostActionContext.Contribution.IngressBinding.SecondaryIdentity,
+                  ConversationId.Value.ToString("D"),
+                  StringComparison.Ordinal)) &&
         HostActionContext.IsWellFormed(now);
 }
 
