@@ -995,15 +995,9 @@ public sealed class SidecarCapabilityTransportTests
                 .SequenceEqual(SidecarCapabilityTransportCodec.Serialize(retriedReservation)));
         Assert.Equal(2, test.Source.Session.LastSequence);
 
-        var release = test.Source.Session.ReleaseHostEndpointTypedActionChildReservation(
-            retriedReservation!,
-            test.Source.Now);
-        Assert.True(release.Accepted, release.Message);
-        Assert.Equal(
-            SidecarCapabilityErrors.Replay,
-            test.Source.Session.ReleaseHostEndpointTypedActionChildReservation(
-                retriedReservation,
-                test.Source.Now).Code);
+        var abort = AbortUnimportedEndpointTypedActionChild(test, test.Source.Now);
+        Assert.Equal(1, test.Source.Session.LastSequence);
+        Assert.Equal(1, test.Receiving.Session.LastSequence);
 
         var laterCall = test.ChildCall with
         {
@@ -1028,9 +1022,11 @@ public sealed class SidecarCapabilityTransportTests
             laterReservation!,
             test.Source.Now).Accepted);
 
-        Assert.True(test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
-            test.Relay,
-            test.Receiving.Now).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.ConsumeHostEndpointTypedActionChildImportAbort(
+                abort,
+                test.Receiving.Now).Code);
         Assert.True(test.Receiving.Session.CompleteCall(
             test.ReceivingParent.Call.CallId,
             0).Accepted);
@@ -1590,18 +1586,16 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Equal(sequence, test.Receiving.Session.LastSequence);
         Assert.Equal(carriers, test.Receiving.Session.ActiveHostActionEntryCarrierCount);
 
-        Assert.True(test.Source.Session.ReleaseHostEndpointTypedActionChildReservation(
-            test.Relay.ReceivingReservation,
-            test.Source.Now).Accepted);
-        Assert.True(test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
-            test.WireRelay,
-            test.Receiving.Now).Accepted);
+        AbortUnimportedEndpointTypedActionChild(test, test.Source.Now);
         Assert.True(test.Source.Session.CompleteHostEndpointRouteRelay(
             test.RouteRelay,
             test.Source.Now).Accepted);
-        Assert.True(test.Source.Session.CompleteCall(
+        var sourceParentCompletion = test.Source.Session.CompleteCall(
             test.SourceParent.Call.CallId,
-            0).Accepted);
+            0);
+        Assert.True(
+            sourceParentCompletion.Accepted,
+            $"{sourceParentCompletion.Code}: {sourceParentCompletion.Message}");
         Assert.Equal(
             SidecarCapabilityErrors.Replay,
             test.Source.Session.CompleteHostActionEntryCarrier(
@@ -1638,12 +1632,7 @@ public sealed class SidecarCapabilityTransportTests
         HostEndpointTransport transport)
     {
         var test = CreateEndpointTypedActionChildCase(transport);
-        Assert.True(test.Source.Session.ReleaseHostEndpointTypedActionChildReservation(
-            test.Relay.ReceivingReservation,
-            test.Source.Now).Accepted);
-        Assert.True(test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
-            test.WireRelay,
-            test.Receiving.Now).Accepted);
+        AbortUnimportedEndpointTypedActionChild(test, test.Source.Now);
 
         var descriptor = NestedDescriptor(
             "endpoint.direct.parent.rejected",
@@ -1698,9 +1687,12 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(test.Source.Session.CompleteHostEndpointRouteRelay(
             test.RouteRelay,
             test.Source.Now).Accepted);
-        Assert.True(test.Source.Session.CompleteCall(
+        var sourceParentCompletion = test.Source.Session.CompleteCall(
             test.SourceParent.Call.CallId,
-            0).Accepted);
+            0);
+        Assert.True(
+            sourceParentCompletion.Accepted,
+            $"{sourceParentCompletion.Code}: {sourceParentCompletion.Message}");
         Assert.Equal(
             SidecarCapabilityErrors.Replay,
             test.Source.Session.CompleteHostActionEntryCarrier(
@@ -1746,7 +1738,6 @@ public sealed class SidecarCapabilityTransportTests
             SidecarEndpointTypedActionChildRelay relay,
             string hash) =>
             relay.Proof == KeyedEndpointProof("child-relay", hash);
-
         static (
             HostEndpointRouteRequest Request,
             SidecarCapabilityCallIdentity Call,
@@ -2077,7 +2068,7 @@ public sealed class SidecarCapabilityTransportTests
         Assert.False(issue.Accepted, $"{mutation}: {issue.Message}");
         Assert.Null(reservation);
         Assert.Equal(
-            1,
+            mutation == "disconnect" ? 0 : 1,
             test.Source.Session.ActiveHostActionEntryCarrierCount);
 
         if (inFlightCallId is not null)
@@ -2283,11 +2274,14 @@ public sealed class SidecarCapabilityTransportTests
             SidecarCapabilityTransportCodec.Deserialize<SidecarEndpointTypedActionChildRelay>(
                 SidecarCapabilityTransportCodec.Serialize(mutated)),
             test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
             out var rejectedRelay,
-            out var rejectedContext);
+            out var rejectedContext,
+            out var rejectedAcknowledgment);
         Assert.False(rejected.Accepted, rejected.Message);
         Assert.Null(rejectedRelay);
         Assert.Null(rejectedContext);
+        Assert.Null(rejectedAcknowledgment);
         Assert.Equal(sequence, test.Source.Session.LastSequence);
         Assert.Equal(contexts, test.Source.Session.IssuedHostActionEntryContextCount);
         Assert.Equal(carriers, test.Source.Session.ActiveHostActionEntryCarrierCount);
@@ -2295,9 +2289,13 @@ public sealed class SidecarCapabilityTransportTests
         var imported = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
             test.WireRelay,
             test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
             out var childRelay,
-            out _);
+            out var importContext,
+            out var importAcknowledgment);
         Assert.True(imported.Accepted, imported.Message);
+        Assert.NotNull(importContext);
+        Assert.NotNull(importAcknowledgment);
         Assert.True(test.Source.Session.BeginNestedHostActionEntryCall(
             childRelay!.Carrier,
             test.ChildCall,
@@ -2308,6 +2306,7 @@ public sealed class SidecarCapabilityTransportTests
         Assert.True(test.Source.Session.CompleteCall(test.ChildCall.CallId, 0).Accepted);
         Assert.True(test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
             test.Relay,
+            importAcknowledgment!,
             test.Receiving.Now).Accepted);
         Assert.True(test.Receiving.Session.CompleteCall(
             test.ReceivingParent.Call.CallId,
@@ -2351,7 +2350,10 @@ public sealed class SidecarCapabilityTransportTests
             SidecarEndpointTypedActionChildRelay relay,
             string hash) =>
             relay.Proof == KeyedEndpointProof("child-relay", hash);
-
+        static bool AuthenticateImportAcknowledgment(
+            SidecarEndpointTypedActionChildImportAcknowledgment acknowledgment,
+            string hash) =>
+            acknowledgment.Proof == KeyedEndpointProof("child-import", hash);
         var source = CreateFixture(
             actionInputBytes: 4096,
             protocolMessageBytes: 65536,
@@ -2364,7 +2366,8 @@ public sealed class SidecarCapabilityTransportTests
             authenticateEndpointRouteRelay: AuthenticateRelay,
             authenticateEndpointTypedActionChildReservation: AuthenticateChildReservation,
             authenticateEndpointTypedActionChildRelay: AuthenticateChildRelay,
-            protocolMessageBytes: 65536);
+            protocolMessageBytes: 65536,
+            authenticateEndpointTypedActionChildImportAcknowledgment: AuthenticateImportAcknowledgment);
         var sourceContext = IssueContext(
             source,
             new RequestPrincipal(
@@ -2513,16 +2516,37 @@ public sealed class SidecarCapabilityTransportTests
             out var childRelay);
         Assert.True(childRelayResult.Accepted, childRelayResult.Message);
         Assert.NotNull(childRelay);
+        Assert.Equal(2, receiving.Session.LastSequence);
+        var childRelayRetryResult = receiving.Session.IssueHostEndpointTypedActionChildRelay(
+            wireRelay.Authority,
+            receivingCall,
+            receivingContext!,
+            wireReservation,
+            receiving.Now,
+            (candidate, hash) => candidate.Proof == KeyedEndpointProof("child-reservation", hash),
+            candidate => KeyedEndpointProof(
+                "child-relay",
+                SidecarEndpointTypedActionChildValidation.ComputeRelayHash(candidate)),
+            out var childRelayRetry);
+        Assert.True(childRelayRetryResult.Accepted, childRelayRetryResult.Message);
+        Assert.NotNull(childRelayRetry);
+        Assert.True(
+            SidecarCapabilityTransportCodec.Serialize(childRelay)
+                .SequenceEqual(SidecarCapabilityTransportCodec.Serialize(childRelayRetry)));
+        Assert.Equal(2, receiving.Session.LastSequence);
         var wireChildRelay = SidecarCapabilityTransportCodec.Deserialize<
             SidecarEndpointTypedActionChildRelay>(
-            SidecarCapabilityTransportCodec.Serialize(childRelay));
+                SidecarCapabilityTransportCodec.Serialize(childRelay));
         var childImportResult = source.Session.ImportHostEndpointTypedActionChildRelay(
             wireChildRelay,
             source.Now,
+            IssueEndpointChildImportAcknowledgment,
             out var importedChildRelay,
-            out _);
+            out _,
+            out var childAcknowledgment);
         Assert.True(childImportResult.Accepted, childImportResult.Message);
         Assert.NotNull(importedChildRelay);
+        Assert.NotNull(childAcknowledgment);
         Assert.True(
             source.Session.BeginNestedHostActionEntryCall(
                 importedChildRelay!.Carrier,
@@ -2535,6 +2559,7 @@ public sealed class SidecarCapabilityTransportTests
         Assert.NotNull(childContext);
         Assert.True(receiving.Session.CompleteHostEndpointTypedActionChildRelay(
             wireChildRelay,
+            childAcknowledgment!,
             receiving.Now).Accepted);
         Assert.True(receiving.Session.TryGetActiveHostActionEntryCarrier(
             receivingContext!.CapabilityId,
@@ -2565,6 +2590,1150 @@ public sealed class SidecarCapabilityTransportTests
         receiving.BindingHashes.Add(rotated.Authentication.BindingHash);
         var rotation = receiving.Session.RotateBinding(rotated, receiving.Now);
         Assert.True(rotation.Accepted, rotation.Message);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_rejects_an_arbitrary_receiving_sequence(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var laterCall = test.ChildCall with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "endpoint-typed-child-gap",
+            Sequence = test.Source.Session.LastSequence + 1,
+        };
+        var issue = test.Source.Session.IssueHostEndpointTypedActionChildReservation(
+            test.SourceParent.Call,
+            test.SourceParent.ActiveContext,
+            laterCall,
+            test.Relay.Child.Descriptor,
+            test.ChildAction,
+            test.Source.Now,
+            candidate => KeyedEndpointProof(
+                "child-reservation",
+                SidecarEndpointTypedActionChildValidation.ComputeReservationHash(candidate)),
+            out var reservation);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(reservation);
+
+        var receivingSequence = test.Receiving.Session.LastSequence;
+        var gapReservation = reservation! with
+        {
+            Child = reservation.Child with
+            {
+                Call = reservation.Child.Call with
+                {
+                    Sequence = receivingSequence + 2,
+                },
+            },
+        };
+        gapReservation = gapReservation with
+        {
+            CanonicalBindingHash = SidecarEndpointTypedActionChildValidation.ComputeReservationHash(
+                gapReservation),
+        };
+        gapReservation = gapReservation with
+        {
+            Proof = KeyedEndpointProof(
+                "child-reservation",
+                gapReservation.CanonicalBindingHash),
+        };
+
+        var gapIssue = test.Receiving.Session.IssueHostEndpointTypedActionChildRelay(
+            test.ReceivingParent.Authority,
+            test.ReceivingParent.Call,
+            test.ReceivingParent.ActiveContext,
+            gapReservation,
+            test.Receiving.Now,
+            (candidate, hash) => candidate.Proof == KeyedEndpointProof("child-reservation", hash),
+            candidate => KeyedEndpointProof(
+                "child-relay",
+                SidecarEndpointTypedActionChildValidation.ComputeRelayHash(candidate)),
+            out var gapRelay);
+        Assert.False(gapIssue.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, gapIssue.Code);
+        Assert.Null(gapRelay);
+        Assert.Equal(receivingSequence, test.Receiving.Session.LastSequence);
+
+        Assert.True(test.Source.Session.ReleaseHostEndpointTypedActionChildReservation(
+            reservation,
+            test.Source.Now).Accepted);
+        AbortUnimportedEndpointTypedActionChild(test, test.Source.Now);
+        Assert.True(test.Receiving.Session.CompleteCall(
+            test.ReceivingParent.Call.CallId,
+            0).Accepted);
+        Assert.True(test.Receiving.Session.CompleteHostActionEntryCarrier(
+            test.ReceivingParent.Carrier,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            test.Receiving.Now).Accepted);
+        Assert.True(test.Source.Session.CompleteHostEndpointRouteRelay(
+            test.RouteRelay,
+            test.Source.Now).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(
+            test.SourceParent.Call.CallId,
+            0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostActionEntryCarrier(
+                test.SourceParent.Carrier,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                test.Source.Now).Code);
+        var sourceRotated = CreateRotatedBinding(test.Source, "endpoint-gap-source-rotation");
+        test.Source.BindingHashes.Add(sourceRotated.Authentication.BindingHash);
+        var sourceRotation = test.Source.Session.RotateBinding(sourceRotated, test.Source.Now);
+        Assert.True(sourceRotation.Accepted, sourceRotation.Message);
+        var receivingRotated = CreateRotatedBinding(test.Receiving, "endpoint-gap-receiving-rotation");
+        test.Receiving.BindingHashes.Add(receivingRotated.Authentication.BindingHash);
+        var receivingRotation = test.Receiving.Session.RotateBinding(receivingRotated, test.Receiving.Now);
+        Assert.True(receivingRotation.Accepted, receivingRotation.Message);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_release_preserves_sequence_for_next_root_relay(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+
+        var childImport = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var importedChildRelay,
+            out var importedChildContext,
+            out var childAcknowledgment);
+        Assert.True(childImport.Accepted, childImport.Message);
+        Assert.NotNull(importedChildRelay);
+        Assert.NotNull(importedChildContext);
+        Assert.NotNull(childAcknowledgment);
+        Assert.True(test.Source.Session.TryGetActiveHostActionEntryCarrier(
+            importedChildContext!.CapabilityId,
+            out var importedChildCarrier));
+        Assert.NotNull(importedChildCarrier);
+        Assert.True(test.Source.Session.BeginNestedHostActionEntryCall(
+            importedChildRelay!.Carrier,
+            test.ChildCall,
+            test.ChildAction,
+            test.ChildAction.ByteLength,
+            test.Source.Now,
+            out _).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(
+            test.ChildCall.CallId,
+            0).Accepted);
+        var childCarrierCompletion = test.Source.Session.CompleteHostActionEntryCarrier(
+            importedChildCarrier!,
+            HostActionEntryCarrierCompletionKind.Failed,
+            test.Source.Now);
+        Assert.Equal(SidecarCapabilityErrors.Replay, childCarrierCompletion.Code);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        var completion = test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.Relay,
+            childAcknowledgment!,
+            test.Receiving.Now);
+        Assert.True(completion.Accepted, completion.Message);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.ReleaseHostEndpointTypedActionChildRelay(
+                test.Relay,
+                test.Receiving.Now).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+                test.Relay,
+                childAcknowledgment,
+                test.Receiving.Now).Code);
+
+        CleanupEndpointTypedActionChildParents(test);
+        CompleteNextNormalRootRelay(test.Source, test.Receiving, transport, "endpoint-sequence-three");
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_pre_relay_release_rolls_back_sequence_for_next_root_relay(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildReservationOnlyCase(transport);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(1, test.Receiving.Session.LastSequence);
+
+        var release = test.Source.Session.ReleaseHostEndpointTypedActionChildReservation(
+            test.Reservation,
+            test.Source.Now);
+        Assert.True(release.Accepted, release.Message);
+        Assert.Equal(1, test.Source.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.ReleaseHostEndpointTypedActionChildReservation(
+                test.Reservation,
+                test.Source.Now).Code);
+
+        Assert.True(test.Receiving.Session.CompleteCall(
+            test.ReceivingParent.Call.CallId,
+            0).Accepted);
+        Assert.True(test.Receiving.Session.CompleteHostActionEntryCarrier(
+            test.ReceivingParent.Carrier,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            test.Receiving.Now).Accepted);
+        Assert.True(test.Source.Session.CompleteHostEndpointRouteRelay(
+            test.RouteRelay,
+            test.Source.Now).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(
+            test.SourceParent.Call.CallId,
+            0).Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Replay, test.Source.Session.CompleteHostActionEntryCarrier(
+            test.SourceParent.Carrier,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            test.Source.Now).Code);
+
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-sequence-two",
+            2);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_expiry_preserves_sequence_and_replay_protection(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var expiredAt = test.Relay.ExpiresAt.AddSeconds(1);
+        var abort = AbortUnimportedEndpointTypedActionChild(test, expiredAt);
+        Assert.Equal(1, test.Source.Session.LastSequence);
+        Assert.Equal(1, test.Receiving.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.ConsumeHostEndpointTypedActionChildImportAbort(
+                abort,
+                expiredAt).Code);
+
+        CleanupEndpointTypedActionChildParents(test);
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-expiry-sequence-two",
+            2);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_receiving_release_before_source_import_rolls_back_sequence(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+
+        var abort = AbortUnimportedEndpointTypedActionChild(test, test.Source.Now);
+        Assert.Equal(1, test.Source.Session.LastSequence);
+        Assert.Equal(1, test.Receiving.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.ConsumeHostEndpointTypedActionChildImportAbort(
+                abort,
+                test.Receiving.Now).Code);
+        CleanupEndpointTypedActionChildParents(test);
+
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-release-sequence-two",
+            2);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_completion_requires_source_import_acknowledgment(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var sourceSequence = test.Source.Session.LastSequence;
+        var receivingSequence = test.Receiving.Session.LastSequence;
+        var sourceCarriers = test.Source.Session.ActiveHostActionEntryCarrierCount;
+        var receivingCarriers = test.Receiving.Session.ActiveHostActionEntryCarrierCount;
+
+        var rejected = test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            null,
+            test.Receiving.Now);
+        Assert.False(rejected.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Unauthenticated, rejected.Code);
+        Assert.Equal(sourceSequence, test.Source.Session.LastSequence);
+        Assert.Equal(receivingSequence, test.Receiving.Session.LastSequence);
+        Assert.Equal(sourceCarriers, test.Source.Session.ActiveHostActionEntryCarrierCount);
+        Assert.Equal(receivingCarriers, test.Receiving.Session.ActiveHostActionEntryCarrierCount);
+
+        var retry = test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            null,
+            test.Receiving.Now);
+        Assert.Equal(SidecarCapabilityErrors.Unauthenticated, retry.Code);
+        Assert.Equal(receivingSequence, test.Receiving.Session.LastSequence);
+
+        AbortUnimportedEndpointTypedActionChild(test, test.Source.Now);
+        Assert.Equal(1, test.Source.Session.LastSequence);
+        Assert.Equal(1, test.Receiving.Session.LastSequence);
+
+        CleanupEndpointTypedActionChildParents(test);
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-ack-sequence-two",
+            2);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_import_retry_returns_exact_acknowledgment(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var import = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var importedChildRelay,
+            out var importedChildContext,
+            out var acknowledgment);
+        Assert.True(import.Accepted, import.Message);
+        Assert.NotNull(importedChildRelay);
+        Assert.NotNull(importedChildContext);
+        Assert.NotNull(acknowledgment);
+        var acknowledgmentBytes = SidecarCapabilityTransportCodec.Serialize(acknowledgment!);
+
+        var retry = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            SidecarCapabilityTransportCodec.Deserialize<SidecarEndpointTypedActionChildRelay>(
+                SidecarCapabilityTransportCodec.Serialize(test.WireRelay)),
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var retriedChildRelay,
+            out var retriedChildContext,
+            out var retriedAcknowledgment);
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.NotNull(retriedChildRelay);
+        Assert.NotNull(retriedChildContext);
+        Assert.NotNull(retriedAcknowledgment);
+        Assert.True(acknowledgmentBytes.SequenceEqual(
+            SidecarCapabilityTransportCodec.Serialize(retriedAcknowledgment!)));
+
+        Assert.True(test.Source.Session.TryGetActiveHostActionEntryCarrier(
+            importedChildContext!.CapabilityId,
+            out var childCarrier));
+        Assert.True(test.Source.Session.BeginNestedHostActionEntryCall(
+            importedChildRelay!.Carrier,
+            test.ChildCall,
+            test.ChildAction,
+            test.ChildAction.ByteLength,
+            test.Source.Now,
+            out _).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(test.ChildCall.CallId, 0).Accepted);
+
+        var completion = test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            retriedAcknowledgment!,
+            test.Receiving.Now);
+        Assert.True(completion.Accepted, completion.Message);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+                test.WireRelay,
+                retriedAcknowledgment,
+                test.Receiving.Now).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.ReleaseHostEndpointTypedActionChildRelay(
+                test.WireRelay,
+                test.Receiving.Now).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostActionEntryCarrier(
+                childCarrier!,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                test.Source.Now).Code);
+
+        CleanupEndpointTypedActionChildParents(test);
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-ack-sequence-three",
+            3);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http, "relay-hash")]
+    [InlineData(HostEndpointTransport.Http, "reservation")]
+    [InlineData(HostEndpointTransport.Http, "child-call")]
+    [InlineData(HostEndpointTransport.Http, "parent")]
+    [InlineData(HostEndpointTransport.Http, "binding")]
+    [InlineData(HostEndpointTransport.Http, "generation")]
+    [InlineData(HostEndpointTransport.Http, "deadline")]
+    [InlineData(HostEndpointTransport.Http, "cancellation")]
+    [InlineData(HostEndpointTransport.Http, "proof")]
+    [InlineData(HostEndpointTransport.Http, "expiry")]
+    [InlineData(HostEndpointTransport.WebSocket, "relay-hash")]
+    [InlineData(HostEndpointTransport.WebSocket, "reservation")]
+    [InlineData(HostEndpointTransport.WebSocket, "child-call")]
+    [InlineData(HostEndpointTransport.WebSocket, "parent")]
+    [InlineData(HostEndpointTransport.WebSocket, "binding")]
+    [InlineData(HostEndpointTransport.WebSocket, "generation")]
+    [InlineData(HostEndpointTransport.WebSocket, "deadline")]
+    [InlineData(HostEndpointTransport.WebSocket, "cancellation")]
+    [InlineData(HostEndpointTransport.WebSocket, "proof")]
+    [InlineData(HostEndpointTransport.WebSocket, "expiry")]
+    public void Endpoint_typed_child_import_acknowledgment_mutations_preserve_state(
+        HostEndpointTransport transport,
+        string mutation)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var import = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var importedChildRelay,
+            out var importedChildContext,
+            out var acknowledgment);
+        Assert.True(import.Accepted, import.Message);
+        Assert.NotNull(importedChildRelay);
+        Assert.NotNull(importedChildContext);
+        Assert.NotNull(acknowledgment);
+
+        var sourceSequence = test.Source.Session.LastSequence;
+        var receivingSequence = test.Receiving.Session.LastSequence;
+        var sourceCarriers = test.Source.Session.ActiveHostActionEntryCarrierCount;
+        var receivingCarriers = test.Receiving.Session.ActiveHostActionEntryCarrierCount;
+        var mutated = MutateEndpointChildImportAcknowledgment(acknowledgment!, mutation);
+        var wireMutation = SidecarCapabilityTransportCodec.Deserialize<
+            SidecarEndpointTypedActionChildImportAcknowledgment>(
+            SidecarCapabilityTransportCodec.Serialize(mutated));
+        var rejected = test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            wireMutation,
+            test.Receiving.Now);
+        Assert.False(rejected.Accepted, rejected.Message);
+        Assert.Equal(
+            mutation == "proof"
+                ? SidecarCapabilityErrors.Unauthenticated
+                : SidecarCapabilityErrors.SpoofedIdentity,
+            rejected.Code);
+        Assert.Equal(sourceSequence, test.Source.Session.LastSequence);
+        Assert.Equal(receivingSequence, test.Receiving.Session.LastSequence);
+        Assert.Equal(sourceCarriers, test.Source.Session.ActiveHostActionEntryCarrierCount);
+        Assert.Equal(receivingCarriers, test.Receiving.Session.ActiveHostActionEntryCarrierCount);
+
+        var validRetry = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var retryChildRelay,
+            out var retryChildContext,
+            out var retryAcknowledgment);
+        Assert.True(validRetry.Accepted, validRetry.Message);
+        Assert.NotNull(retryChildRelay);
+        Assert.NotNull(retryChildContext);
+        Assert.NotNull(retryAcknowledgment);
+        Assert.True(
+            SidecarCapabilityTransportCodec.Serialize(acknowledgment!)
+                .SequenceEqual(SidecarCapabilityTransportCodec.Serialize(retryAcknowledgment!)));
+
+        Assert.True(test.Source.Session.TryGetActiveHostActionEntryCarrier(
+            importedChildContext!.CapabilityId,
+            out var childCarrier));
+        Assert.True(test.Source.Session.BeginNestedHostActionEntryCall(
+            importedChildRelay!.Carrier,
+            test.ChildCall,
+            test.ChildAction,
+            test.ChildAction.ByteLength,
+            test.Source.Now,
+            out _).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(test.ChildCall.CallId, 0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostActionEntryCarrier(
+                childCarrier!,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                test.Source.Now).Code);
+        Assert.True(test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            retryAcknowledgment!,
+            test.Receiving.Now).Accepted);
+
+        CleanupEndpointTypedActionChildParents(test);
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            $"endpoint-ack-mutation-{mutation}",
+            3);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_acknowledgment_after_expiry_cleans_up_with_committed_sequence(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var import = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var importedChildRelay,
+            out var importedChildContext,
+            out var acknowledgment);
+        Assert.True(import.Accepted, import.Message);
+        Assert.NotNull(importedChildRelay);
+        Assert.NotNull(importedChildContext);
+        Assert.NotNull(acknowledgment);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+        var acknowledgmentBytes = SidecarCapabilityTransportCodec.Serialize(acknowledgment!);
+
+        Assert.True(test.Source.Session.TryGetActiveHostActionEntryCarrier(
+            importedChildContext!.CapabilityId,
+            out var childCarrier));
+        Assert.True(test.Source.Session.BeginNestedHostActionEntryCall(
+            importedChildRelay!.Carrier,
+            test.ChildCall,
+            test.ChildAction,
+            test.ChildAction.ByteLength,
+            test.Source.Now,
+            out _).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(test.ChildCall.CallId, 0).Accepted);
+
+        var expiry = test.Relay.ExpiresAt.AddSeconds(1);
+        test.Receiving.Session.SweepExpiredHostActionEntryCarriers(expiry);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+        var retry = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            SidecarCapabilityTransportCodec.Deserialize<SidecarEndpointTypedActionChildRelay>(
+                SidecarCapabilityTransportCodec.Serialize(test.WireRelay)),
+            expiry,
+            IssueEndpointChildImportAcknowledgment,
+            out var retriedChildRelay,
+            out var retriedChildContext,
+            out var retriedAcknowledgment);
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.Null(retriedChildRelay);
+        Assert.Null(retriedChildContext);
+        Assert.NotNull(retriedAcknowledgment);
+        Assert.True(acknowledgmentBytes.SequenceEqual(
+            SidecarCapabilityTransportCodec.Serialize(retriedAcknowledgment!)));
+        var delayed = test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            retriedAcknowledgment!,
+            expiry);
+        Assert.True(delayed.Accepted, delayed.Message);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+                test.WireRelay,
+                retriedAcknowledgment,
+                expiry).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostActionEntryCarrier(
+                childCarrier!,
+                HostActionEntryCarrierCompletionKind.Failed,
+                test.Source.Now).Code);
+
+        CleanupEndpointTypedActionChildParents(test);
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-ack-expiry-sequence-three",
+            3);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_unimported_expiry_sweep_rolls_back_sequence(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+
+        var expiry = test.Relay.ExpiresAt.AddSeconds(1);
+        test.Receiving.Session.SweepExpiredHostActionEntryCarriers(expiry);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Unauthenticated,
+            test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+                test.WireRelay,
+                null,
+                expiry).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Unauthenticated,
+            test.Receiving.Session.ReleaseHostEndpointTypedActionChildRelay(
+                test.WireRelay,
+                expiry).Code);
+
+        test.Source.Session.SweepExpiredHostActionEntryCarriers(expiry);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        var abort = AbortUnimportedEndpointTypedActionChild(test, expiry);
+        Assert.Equal(1, test.Source.Session.LastSequence);
+        Assert.Equal(1, test.Receiving.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.ConsumeHostEndpointTypedActionChildImportAbort(
+                abort,
+                expiry).Code);
+
+        CleanupEndpointTypedActionChildParents(test);
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-ack-unimported-expiry-sequence-two",
+            2);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_completed_import_recovers_exact_acknowledgment_without_execution_authority(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var imported = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var childRelay,
+            out var childContext,
+            out var acknowledgment);
+        Assert.True(imported.Accepted, imported.Message);
+        Assert.NotNull(childRelay);
+        Assert.NotNull(childContext);
+        Assert.NotNull(acknowledgment);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+
+        var competingAbort = test.Source.Session.IssueHostEndpointTypedActionChildImportAbort(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAbort,
+            out var abort);
+        Assert.Equal(SidecarCapabilityErrors.Replay, competingAbort.Code);
+        Assert.Null(abort);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+
+        Assert.True(test.Source.Session.TryGetActiveHostActionEntryCarrier(
+            childContext!.CapabilityId,
+            out var childCarrier));
+        Assert.NotNull(childCarrier);
+        Assert.True(test.Source.Session.BeginNestedHostActionEntryCall(
+            childRelay!.Carrier,
+            test.ChildCall,
+            test.ChildAction,
+            test.ChildAction.ByteLength,
+            test.Source.Now,
+            out _).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(test.ChildCall.CallId, 0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostActionEntryCarrier(
+                childCarrier!,
+                HostActionEntryCarrierCompletionKind.Failed,
+                test.Source.Now).Code);
+        var activeCarriersAfterCompletion = test.Source.Session.ActiveHostActionEntryCarrierCount;
+        var issuedContextsAfterCompletion = test.Source.Session.IssuedHostActionEntryContextCount;
+        var sequenceAfterCompletion = test.Source.Session.LastSequence;
+
+        var retry = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            SidecarCapabilityTransportCodec.Deserialize<SidecarEndpointTypedActionChildRelay>(
+                SidecarCapabilityTransportCodec.Serialize(test.WireRelay)),
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var retryRelay,
+            out var retryContext,
+            out var retryAcknowledgment);
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.Null(retryRelay);
+        Assert.Null(retryContext);
+        Assert.NotNull(retryAcknowledgment);
+        Assert.Equal(activeCarriersAfterCompletion, test.Source.Session.ActiveHostActionEntryCarrierCount);
+        Assert.Equal(issuedContextsAfterCompletion, test.Source.Session.IssuedHostActionEntryContextCount);
+        Assert.Equal(sequenceAfterCompletion, test.Source.Session.LastSequence);
+        Assert.True(SidecarCapabilityTransportCodec.Serialize(acknowledgment!).SequenceEqual(
+            SidecarCapabilityTransportCodec.Serialize(retryAcknowledgment!)));
+        var repeatedAbort = test.Source.Session.IssueHostEndpointTypedActionChildImportAbort(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAbort,
+            out var repeatedAbortAuthority);
+        Assert.Equal(SidecarCapabilityErrors.Replay, repeatedAbort.Code);
+        Assert.Null(repeatedAbortAuthority);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.BeginNestedHostActionEntryCall(
+                childRelay!.Carrier,
+                test.ChildCall,
+                test.ChildAction,
+                test.ChildAction.ByteLength,
+                test.Source.Now,
+                out _).Code);
+        var completed = test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            retryAcknowledgment,
+            test.Receiving.Now);
+        Assert.True(completed.Accepted, completed.Message);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+                test.WireRelay,
+                retryAcknowledgment,
+                test.Receiving.Now).Code);
+
+        CleanupEndpointTypedActionChildParents(test);
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-ack-lost-sequence-three",
+            3);
+
+        var replayExpiry = DateTimeOffset.UtcNow.AddMinutes(6);
+        test.Source.Session.SweepExpiredHostActionEntryCarriers(replayExpiry);
+        var expiredReplay = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            replayExpiry,
+            IssueEndpointChildImportAcknowledgment,
+            out var expiredChildRelay,
+            out var expiredChildContext,
+            out var expiredAcknowledgment);
+        Assert.False(expiredReplay.Accepted);
+        Assert.Null(expiredChildRelay);
+        Assert.Null(expiredChildContext);
+        Assert.Null(expiredAcknowledgment);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http, true)]
+    [InlineData(HostEndpointTransport.Http, false)]
+    [InlineData(HostEndpointTransport.WebSocket, true)]
+    [InlineData(HostEndpointTransport.WebSocket, false)]
+    public void Endpoint_typed_child_permanent_acknowledgment_loss_commits_at_shared_deadline(
+        HostEndpointTransport transport,
+        bool sweepSourceFirst)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var imported = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var childRelay,
+            out var childContext,
+            out var acknowledgment);
+        Assert.True(imported.Accepted, imported.Message);
+        Assert.NotNull(childRelay);
+        Assert.NotNull(childContext);
+        Assert.NotNull(acknowledgment);
+        Assert.True(test.Source.Session.BeginNestedHostActionEntryCall(
+            childRelay!.Carrier,
+            test.ChildCall,
+            test.ChildAction,
+            test.ChildAction.ByteLength,
+            test.Source.Now,
+            out _).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(test.ChildCall.CallId, 0).Accepted);
+
+        var outcomeDecisionAt = test.WireRelay.ReceivingReservation.OutcomeDecisionAt;
+        Assert.True(outcomeDecisionAt > test.WireRelay.ExpiresAt);
+        SweepEndpointTypedActionChildOutcome(test, outcomeDecisionAt, sweepSourceFirst);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+
+        var retry = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            outcomeDecisionAt,
+            IssueEndpointChildImportAcknowledgment,
+            out var retryRelay,
+            out var retryContext,
+            out var retryAcknowledgment);
+        Assert.False(retry.Accepted);
+        Assert.Null(retryRelay);
+        Assert.Null(retryContext);
+        Assert.Null(retryAcknowledgment);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+                test.WireRelay,
+                acknowledgment,
+                outcomeDecisionAt).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Expired,
+            test.Source.Session.IssueHostEndpointTypedActionChildImportAbort(
+                test.WireRelay,
+                outcomeDecisionAt,
+                IssueEndpointChildImportAbort,
+                out _).Code);
+
+        var rotated = CompleteAndRotateAfterEndpointTypedActionChildOutcome(
+            test,
+            outcomeDecisionAt,
+            $"permanent-ack-{transport}-{sweepSourceFirst}");
+        CompleteNextNormalRootRelay(
+            rotated.Source,
+            rotated.Receiving,
+            transport,
+            $"endpoint-permanent-ack-{transport}-{sweepSourceFirst}",
+            1);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http, true)]
+    [InlineData(HostEndpointTransport.Http, false)]
+    [InlineData(HostEndpointTransport.WebSocket, true)]
+    [InlineData(HostEndpointTransport.WebSocket, false)]
+    public void Endpoint_typed_child_lost_abort_commits_at_shared_deadline(
+        HostEndpointTransport transport,
+        bool sweepSourceFirst)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var issue = test.Source.Session.IssueHostEndpointTypedActionChildImportAbort(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAbort,
+            out var abort);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(abort);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+
+        var outcomeDecisionAt = test.WireRelay.ReceivingReservation.OutcomeDecisionAt;
+        SweepEndpointTypedActionChildOutcome(test, outcomeDecisionAt, sweepSourceFirst);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.ConsumeHostEndpointTypedActionChildImportAbort(
+                abort!,
+                outcomeDecisionAt).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostEndpointTypedActionChildImportAbort(
+                abort!,
+                outcomeDecisionAt).Code);
+
+        var rotated = CompleteAndRotateAfterEndpointTypedActionChildOutcome(
+            test,
+            outcomeDecisionAt,
+            $"lost-abort-{transport}-{sweepSourceFirst}");
+        CompleteNextNormalRootRelay(
+            rotated.Source,
+            rotated.Receiving,
+            transport,
+            $"endpoint-lost-abort-{transport}-{sweepSourceFirst}",
+            1);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_expired_parent_uses_authenticated_abort(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var parentExpiry = test.ReceivingParent.Carrier.ExpiresAt.AddSeconds(1);
+        var receivingRemoved = test.Receiving.Session.SweepExpiredHostActionEntryCarriers(parentExpiry);
+        Assert.True(receivingRemoved > 0);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+
+        var abort = AbortUnimportedEndpointTypedActionChild(test, parentExpiry);
+        Assert.Equal(1, test.Source.Session.LastSequence);
+        Assert.Equal(1, test.Receiving.Session.LastSequence);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.ConsumeHostEndpointTypedActionChildImportAbort(
+                abort,
+                parentExpiry).Code);
+
+        Assert.True(test.Receiving.Session.CompleteCall(
+            test.ReceivingParent.Call.CallId,
+            0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.CompleteHostActionEntryCarrier(
+                test.ReceivingParent.Carrier,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                parentExpiry).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostEndpointRouteRelay(
+                test.RouteRelay,
+                test.Source.Now).Code);
+        Assert.True(test.Source.Session.CompleteCall(
+            test.SourceParent.Call.CallId,
+            0).Accepted);
+        Assert.True(test.Source.Session.CompleteHostActionEntryCarrier(
+            test.SourceParent.Carrier,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            test.Source.Now).Accepted);
+
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-parent-expiry-sequence-two",
+            2);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_import_acknowledgment_survives_parent_expiry(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var imported = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var childRelay,
+            out var childContext,
+            out var acknowledgment);
+        Assert.True(imported.Accepted, imported.Message);
+        Assert.NotNull(childRelay);
+        Assert.NotNull(childContext);
+        Assert.NotNull(acknowledgment);
+        var acknowledgmentBytes = SidecarCapabilityTransportCodec.Serialize(acknowledgment!);
+        Assert.True(test.Source.Session.TryGetActiveHostActionEntryCarrier(
+            childContext!.CapabilityId,
+            out var childCarrier));
+        Assert.NotNull(childCarrier);
+        Assert.True(test.Source.Session.BeginNestedHostActionEntryCall(
+            childRelay!.Carrier,
+            test.ChildCall,
+            test.ChildAction,
+            test.ChildAction.ByteLength,
+            test.Source.Now,
+            out _).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(test.ChildCall.CallId, 0).Accepted);
+
+        var parentExpiry = test.ReceivingParent.Carrier.ExpiresAt.AddSeconds(1);
+        Assert.True(test.Receiving.Session.SweepExpiredHostActionEntryCarriers(parentExpiry) > 0);
+        Assert.Equal(2, test.Source.Session.LastSequence);
+        Assert.Equal(2, test.Receiving.Session.LastSequence);
+        var competingAbort = test.Source.Session.IssueHostEndpointTypedActionChildImportAbort(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAbort,
+            out var abort);
+        Assert.Equal(SidecarCapabilityErrors.Replay, competingAbort.Code);
+        Assert.Null(abort);
+
+        var retry = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            parentExpiry,
+            IssueEndpointChildImportAcknowledgment,
+            out var retryRelay,
+            out var retryContext,
+            out var retryAcknowledgment);
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.Null(retryRelay);
+        Assert.Null(retryContext);
+        Assert.NotNull(retryAcknowledgment);
+        Assert.True(acknowledgmentBytes.SequenceEqual(
+            SidecarCapabilityTransportCodec.Serialize(retryAcknowledgment!)));
+
+        var completion = test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            retryAcknowledgment,
+            parentExpiry);
+        Assert.True(completion.Accepted, completion.Message);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostActionEntryCarrier(
+                childCarrier!,
+                HostActionEntryCarrierCompletionKind.Failed,
+                test.Source.Now).Code);
+
+        Assert.True(test.Receiving.Session.CompleteCall(
+            test.ReceivingParent.Call.CallId,
+            0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.CompleteHostActionEntryCarrier(
+                test.ReceivingParent.Carrier,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                parentExpiry).Code);
+        Assert.True(test.Source.Session.CompleteHostEndpointRouteRelay(
+            test.RouteRelay,
+            test.Source.Now).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(
+            test.SourceParent.Call.CallId,
+            0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostActionEntryCarrier(
+                test.SourceParent.Carrier,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                test.Source.Now).Code);
+
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-parent-expiry-commit-sequence-three",
+            3);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_failed_import_signer_cannot_admit_pending_child(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        var sourceSequence = test.Source.Session.LastSequence;
+        var receivingSequence = test.Receiving.Session.LastSequence;
+        var sourceCarriers = test.Source.Session.ActiveHostActionEntryCarrierCount;
+        var receivingCarriers = test.Receiving.Session.ActiveHostActionEntryCarrierCount;
+        SidecarCapabilityValidationResult? reentrantAdmission = null;
+
+        var rejected = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            candidate =>
+            {
+                reentrantAdmission = test.Source.Session.BeginNestedHostActionEntryCall(
+                    candidate.Relay.ReceivingReservation.Child.Carrier!,
+                    candidate.Relay.ReceivingReservation.Child.Call,
+                    candidate.Relay.ReceivingReservation.Action,
+                    candidate.Relay.ReceivingReservation.Action.ByteLength,
+                    test.Source.Now,
+                    out _);
+                return string.Empty;
+            },
+            out var rejectedChildRelay,
+            out var rejectedContext,
+            out var rejectedAcknowledgment);
+
+        Assert.False(rejected.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.Unauthenticated, rejected.Code);
+        Assert.NotNull(reentrantAdmission);
+        Assert.Equal(SidecarCapabilityErrors.Replay, reentrantAdmission!.Code);
+        Assert.Null(rejectedChildRelay);
+        Assert.Null(rejectedContext);
+        Assert.Null(rejectedAcknowledgment);
+        Assert.Equal(sourceSequence, test.Source.Session.LastSequence);
+        Assert.Equal(receivingSequence, test.Receiving.Session.LastSequence);
+        Assert.Equal(sourceCarriers, test.Source.Session.ActiveHostActionEntryCarrierCount);
+        Assert.Equal(receivingCarriers, test.Receiving.Session.ActiveHostActionEntryCarrierCount);
+
+        var retry = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            IssueEndpointChildImportAcknowledgment,
+            out var childRelay,
+            out var childContext,
+            out var acknowledgment);
+        Assert.True(retry.Accepted, retry.Message);
+        Assert.NotNull(childRelay);
+        Assert.NotNull(childContext);
+        Assert.NotNull(acknowledgment);
+        Assert.True(test.Source.Session.BeginNestedHostActionEntryCall(
+            childRelay!.Carrier,
+            test.ChildCall,
+            test.ChildAction,
+            test.ChildAction.ByteLength,
+            test.Source.Now,
+            out _).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(test.ChildCall.CallId, 0).Accepted);
+        Assert.True(test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            acknowledgment!,
+            test.Receiving.Now).Accepted);
+
+        CleanupEndpointTypedActionChildParents(test);
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-ack-failed-signer",
+            3);
+    }
+
+    [Theory]
+    [InlineData(HostEndpointTransport.Http)]
+    [InlineData(HostEndpointTransport.WebSocket)]
+    public void Endpoint_typed_child_valid_import_signer_cannot_admit_before_finalization(
+        HostEndpointTransport transport)
+    {
+        var test = CreateEndpointTypedActionChildCase(transport, maxInFlight: 3);
+        SidecarCapabilityValidationResult? reentrantAdmission = null;
+
+        var imported = test.Source.Session.ImportHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            test.Source.Now,
+            candidate =>
+            {
+                reentrantAdmission = test.Source.Session.BeginNestedHostActionEntryCall(
+                    candidate.Relay.ReceivingReservation.Child.Carrier!,
+                    candidate.Relay.ReceivingReservation.Child.Call,
+                    candidate.Relay.ReceivingReservation.Action,
+                    candidate.Relay.ReceivingReservation.Action.ByteLength,
+                    test.Source.Now,
+                    out _);
+                return IssueEndpointChildImportAcknowledgment(candidate);
+            },
+            out var childRelay,
+            out var childContext,
+            out var acknowledgment);
+
+        Assert.True(imported.Accepted, imported.Message);
+        Assert.NotNull(reentrantAdmission);
+        Assert.Equal(SidecarCapabilityErrors.Replay, reentrantAdmission!.Code);
+        Assert.NotNull(childRelay);
+        Assert.NotNull(childContext);
+        Assert.NotNull(acknowledgment);
+        Assert.True(test.Source.Session.BeginNestedHostActionEntryCall(
+            childRelay!.Carrier,
+            test.ChildCall,
+            test.ChildAction,
+            test.ChildAction.ByteLength,
+            test.Source.Now,
+            out _).Accepted);
+        Assert.True(test.Source.Session.CompleteCall(test.ChildCall.CallId, 0).Accepted);
+        Assert.True(test.Receiving.Session.CompleteHostEndpointTypedActionChildRelay(
+            test.WireRelay,
+            acknowledgment!,
+            test.Receiving.Now).Accepted);
+
+        CleanupEndpointTypedActionChildParents(test);
+        CompleteNextNormalRootRelay(
+            test.Source,
+            test.Receiving,
+            transport,
+            "endpoint-ack-valid-signer",
+            3);
     }
 
     [Fact]
@@ -10428,6 +11597,8 @@ public sealed class SidecarCapabilityTransportTests
         Func<SidecarHostEndpointRouteRelay, string, bool>? authenticateEndpointRouteRelay = null,
         Func<SidecarEndpointTypedActionChildReservation, string, bool>? authenticateEndpointTypedActionChildReservation = null,
         Func<SidecarEndpointTypedActionChildRelay, string, bool>? authenticateEndpointTypedActionChildRelay = null,
+        Func<SidecarEndpointTypedActionChildImportAcknowledgment, string, bool>? authenticateEndpointTypedActionChildImportAcknowledgment = null,
+        Func<SidecarEndpointTypedActionChildImportAbort, string, bool>? authenticateEndpointTypedActionChildImportAbort = null,
         IReadOnlyList<SidecarCapabilityKind>? capabilities = null,
         int? maxInFlight = null,
         int? maxCalls = null,
@@ -10476,7 +11647,9 @@ public sealed class SidecarCapabilityTransportTests
             authenticateEndpointRouteAuthority,
             authenticateEndpointRouteRelay,
             authenticateEndpointTypedActionChildReservation,
-            authenticateEndpointTypedActionChildRelay);
+            authenticateEndpointTypedActionChildRelay,
+            authenticateEndpointTypedActionChildImportAcknowledgment,
+            authenticateEndpointTypedActionChildImportAbort);
         var call = new SidecarCapabilityCallIdentity(
             binding.SessionId,
             binding.RequestId,
@@ -10504,7 +11677,9 @@ public sealed class SidecarCapabilityTransportTests
         Func<SidecarEndpointTypedActionChildReservation, string, bool>? authenticateEndpointTypedActionChildReservation = null,
         Func<SidecarEndpointTypedActionChildRelay, string, bool>? authenticateEndpointTypedActionChildRelay = null,
         int actionInputBytes = 1024,
-        int protocolMessageBytes = 65536)
+        int protocolMessageBytes = 65536,
+        Func<SidecarEndpointTypedActionChildImportAcknowledgment, string, bool>? authenticateEndpointTypedActionChildImportAcknowledgment = null,
+        Func<SidecarEndpointTypedActionChildImportAbort, string, bool>? authenticateEndpointTypedActionChildImportAbort = null)
     {
         var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var expires = now.AddMinutes(5);
@@ -10558,7 +11733,9 @@ public sealed class SidecarCapabilityTransportTests
             authenticateEndpointRouteAuthority,
             authenticateEndpointRouteRelay,
             authenticateEndpointTypedActionChildReservation,
-            authenticateEndpointTypedActionChildRelay);
+            authenticateEndpointTypedActionChildRelay,
+            authenticateEndpointTypedActionChildImportAcknowledgment,
+            authenticateEndpointTypedActionChildImportAbort);
         var call = new SidecarCapabilityCallIdentity(
             binding.SessionId,
             binding.RequestId,
@@ -13502,6 +14679,110 @@ public sealed class SidecarCapabilityTransportTests
         return Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes($"{domain}:{hash}")));
     }
 
+    private static string IssueEndpointChildImportAcknowledgment(
+        SidecarEndpointTypedActionChildImportAcknowledgment acknowledgment) =>
+        KeyedEndpointProof(
+            "child-import",
+            SidecarEndpointTypedActionChildValidation.ComputeImportAcknowledgmentHash(acknowledgment));
+
+    private static string IssueEndpointChildImportAbort(
+        SidecarEndpointTypedActionChildImportAbort abort) =>
+        KeyedEndpointProof(
+            "child-import-abort",
+            SidecarEndpointTypedActionChildValidation.ComputeImportAbortHash(abort));
+
+    private static SidecarEndpointTypedActionChildImportAcknowledgment
+        MutateEndpointChildImportAcknowledgment(
+            SidecarEndpointTypedActionChildImportAcknowledgment acknowledgment,
+            string mutation)
+    {
+        var changedId = Guid.Parse("ffffffff-ffff-ffff-ffff-fffffffffff1");
+        var relay = acknowledgment.Relay;
+        var reservation = relay.ReceivingReservation;
+        var child = reservation.Child;
+        switch (mutation)
+        {
+            case "relay-hash":
+                relay = relay with { CanonicalBindingHash = "changed-relay-hash" };
+                break;
+            case "reservation":
+                relay = relay with
+                {
+                    ReceivingReservation = reservation with { ReservationId = changedId },
+                };
+                break;
+            case "child-call":
+                relay = relay with
+                {
+                    ReceivingReservation = reservation with
+                    {
+                        Child = child with
+                        {
+                            Call = child.Call with { CallId = changedId },
+                        },
+                    },
+                };
+                break;
+            case "parent":
+                relay = relay with
+                {
+                    SourceParentCall = relay.SourceParentCall with { CallId = changedId },
+                };
+                break;
+            case "binding":
+                acknowledgment = acknowledgment with
+                {
+                    ReceivingBindingHash = "changed-receiving-binding-hash",
+                };
+                break;
+            case "generation":
+                acknowledgment = acknowledgment with
+                {
+                    SourceBindingGeneration = acknowledgment.SourceBindingGeneration + 1,
+                };
+                break;
+            case "deadline":
+                relay = relay with
+                {
+                    SourceParentCall = relay.SourceParentCall with
+                    {
+                        Deadline = relay.SourceParentCall.Deadline.AddSeconds(-1),
+                    },
+                };
+                break;
+            case "cancellation":
+                relay = relay with
+                {
+                    ReceivingReservation = reservation with
+                    {
+                        Child = child with
+                        {
+                            Call = child.Call with { CancellationId = changedId },
+                        },
+                    },
+                };
+                break;
+            case "proof":
+                return acknowledgment with { Proof = "forged-child-import-proof" };
+            case "expiry":
+                acknowledgment = acknowledgment with
+                {
+                    ExpiresAt = acknowledgment.ExpiresAt.AddSeconds(1),
+                };
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(mutation));
+        }
+
+        var resigned = acknowledgment with { Relay = relay };
+        var hash = SidecarEndpointTypedActionChildValidation.ComputeImportAcknowledgmentHash(resigned);
+        return resigned with
+        {
+            CanonicalBindingHash = hash,
+            Proof = KeyedEndpointProof("child-import", hash),
+        };
+    }
+
     private static SidecarHostEndpointRouteRelay ResignEndpointRelay(
         SidecarHostEndpointRouteRelay relay)
     {
@@ -13516,9 +14797,12 @@ public sealed class SidecarCapabilityTransportTests
     private static SidecarCapabilitySessionBinding CreateRotatedBinding(
         Fixture fixture,
         string nonce,
-        int? actionResultBytes = null)
+        int? actionResultBytes = null,
+        DateTimeOffset? minimumExpiry = null)
     {
         var expiry = fixture.Binding.ExpiresAt.AddMinutes(1);
+        if (minimumExpiry is { } requiredExpiry && expiry < requiredExpiry)
+            expiry = requiredExpiry;
         var rotated = fixture.Binding with
         {
             SessionId = Guid.NewGuid(),
@@ -13572,11 +14856,490 @@ public sealed class SidecarCapabilityTransportTests
             canonicalBytes.Length);
     }
 
+    private static void CleanupEndpointTypedActionChildParents(
+        EndpointTypedActionChildCase test)
+    {
+        Assert.True(test.Receiving.Session.CompleteCall(
+            test.ReceivingParent.Call.CallId,
+            0).Accepted);
+        Assert.True(test.Receiving.Session.CompleteHostActionEntryCarrier(
+            test.ReceivingParent.Carrier,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            test.Receiving.Now).Accepted);
+        Assert.True(test.Source.Session.CompleteHostEndpointRouteRelay(
+            test.RouteRelay,
+            test.Source.Now).Accepted);
+        var cleanupSourceParentCompletion = test.Source.Session.CompleteCall(
+            test.SourceParent.Call.CallId,
+            0);
+        Assert.True(
+            cleanupSourceParentCompletion.Accepted,
+            $"{cleanupSourceParentCompletion.Code}: {cleanupSourceParentCompletion.Message}");
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostActionEntryCarrier(
+                test.SourceParent.Carrier,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                test.Source.Now).Code);
+    }
+
+    private static void SweepEndpointTypedActionChildOutcome(
+        EndpointTypedActionChildCase test,
+        DateTimeOffset now,
+        bool sweepSourceFirst)
+    {
+        if (sweepSourceFirst)
+        {
+            test.Source.Session.SweepExpiredHostActionEntryCarriers(now);
+            test.Receiving.Session.SweepExpiredHostActionEntryCarriers(now);
+            return;
+        }
+
+        test.Receiving.Session.SweepExpiredHostActionEntryCarriers(now);
+        test.Source.Session.SweepExpiredHostActionEntryCarriers(now);
+    }
+
+    private static EndpointTypedActionChildCase CompleteAndRotateAfterEndpointTypedActionChildOutcome(
+        EndpointTypedActionChildCase test,
+        DateTimeOffset now,
+        string key)
+    {
+        Assert.True(test.Receiving.Session.CompleteCall(
+            test.ReceivingParent.Call.CallId,
+            0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Receiving.Session.CompleteHostActionEntryCarrier(
+                test.ReceivingParent.Carrier,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                now).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostEndpointRouteRelay(
+                test.RouteRelay,
+                now).Code);
+        Assert.True(test.Source.Session.CompleteCall(
+            test.SourceParent.Call.CallId,
+            0).Accepted);
+        Assert.Equal(
+            SidecarCapabilityErrors.Replay,
+            test.Source.Session.CompleteHostActionEntryCarrier(
+                test.SourceParent.Carrier,
+                HostActionEntryCarrierCompletionKind.Succeeded,
+                now).Code);
+
+        var minimumExpiry = now.AddMinutes(2);
+        var sourceBinding = CreateRotatedBinding(
+            test.Source,
+            $"{key}-source-rotation",
+            minimumExpiry: minimumExpiry);
+        test.Source.BindingHashes.Add(sourceBinding.Authentication.BindingHash);
+        var sourceRotation = test.Source.Session.RotateBinding(sourceBinding, now);
+        Assert.True(
+            sourceRotation.Accepted,
+            $"{sourceRotation.Code}: {sourceRotation.Message}");
+
+        var receivingBinding = CreateRotatedBinding(
+            test.Receiving,
+            $"{key}-receiving-rotation",
+            minimumExpiry: minimumExpiry);
+        test.Receiving.BindingHashes.Add(receivingBinding.Authentication.BindingHash);
+        var receivingRotation = test.Receiving.Session.RotateBinding(receivingBinding, now);
+        Assert.True(
+            receivingRotation.Accepted,
+            $"{receivingRotation.Code}: {receivingRotation.Message}");
+
+        return test with
+        {
+            Source = WithRotatedBinding(test.Source, sourceBinding, now),
+            Receiving = WithRotatedBinding(test.Receiving, receivingBinding, now),
+        };
+    }
+
+    private static Fixture WithRotatedBinding(
+        Fixture fixture,
+        SidecarCapabilitySessionBinding binding,
+        DateTimeOffset now) =>
+        fixture with
+        {
+            Now = now,
+            Binding = binding,
+            Call = fixture.Call with
+            {
+                ModuleId = binding.ModuleId,
+                GraphId = binding.GraphId,
+                SessionId = binding.SessionId,
+                RequestId = binding.RequestId,
+                CancellationId = binding.CancellationId,
+                Deadline = now.AddMinutes(1),
+            },
+        };
+
+    private static SidecarEndpointTypedActionChildImportAbort
+        AbortUnimportedEndpointTypedActionChild(
+        EndpointTypedActionChildCase test,
+        DateTimeOffset now)
+    {
+        var issue = test.Source.Session.IssueHostEndpointTypedActionChildImportAbort(
+            test.WireRelay,
+            now,
+            IssueEndpointChildImportAbort,
+            out var abort);
+        Assert.True(issue.Accepted, issue.Message);
+        Assert.NotNull(abort);
+
+        var wireAbort = SidecarCapabilityTransportCodec.Deserialize<
+            SidecarEndpointTypedActionChildImportAbort>(
+            SidecarCapabilityTransportCodec.Serialize(abort!));
+        var consume = test.Receiving.Session.ConsumeHostEndpointTypedActionChildImportAbort(
+            wireAbort,
+            now);
+        Assert.True(consume.Accepted, consume.Message);
+
+        var complete = test.Source.Session.CompleteHostEndpointTypedActionChildImportAbort(
+            wireAbort,
+            now);
+        Assert.True(complete.Accepted, complete.Message);
+        return wireAbort;
+    }
+
+    private static void CompleteNextNormalRootRelay(
+        Fixture source,
+        Fixture receiving,
+        HostEndpointTransport transport,
+        string key,
+        long sequence = 3)
+    {
+        var descriptor = NestedDescriptor(
+            $"{key}.{transport}.root",
+            typeof(string).AssemblyQualifiedName!);
+        var action = Payload(descriptor.InputTypeIdentity, $"{key}-{transport}");
+        var context = IssueContext(
+            source,
+            new RequestPrincipal($"{key}-caller"),
+            HostActionEntryIngress.Cli,
+            lineage: new HostActionEntryLineage(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.DescriptorHash,
+                descriptor.InputTypeIdentity,
+                descriptor.InputSchemaVersion,
+                descriptor.InputSchemaHash,
+                null,
+                null));
+        var sourceCarrier = ActivateContext(source, context);
+        var sourceCall = ActionCall(source, sequence, $"{key}-source");
+        var peerCall = sourceCall with
+        {
+            SessionId = receiving.Binding.SessionId,
+            RequestId = receiving.Binding.RequestId,
+            CancellationId = receiving.Binding.CancellationId,
+            ModuleId = receiving.Binding.ModuleId,
+            GraphId = receiving.Binding.GraphId,
+            ReplayNonce = $"{key}-peer",
+        };
+        var sourceBegin = source.Session.BeginCall(
+            sourceCall,
+            SidecarCapabilityKind.Action,
+            action,
+            action.ByteLength,
+            source.Now,
+            context);
+        Assert.True(
+            sourceBegin.Accepted,
+            $"{sourceBegin.Code}: {sourceBegin.Message}; sequence={source.Session.LastSequence}");
+        var terminal = new SidecarActionTerminalRegistration(
+            Guid.NewGuid(),
+            descriptor.InputTypeIdentity,
+            descriptor.InputSchemaVersion,
+            descriptor.ResultTypeIdentity,
+            descriptor.ResultSchemaVersion,
+            descriptor.DescriptorHash);
+        var receipt = new SidecarTerminalReceipt(
+            $"{key}-source-receipt",
+            descriptor.Key,
+            descriptor.Version,
+            sourceCall.CallId,
+            1,
+            $"{key}-source-scope",
+            action.ContentHash);
+        Assert.True(source.Session.RecordTerminal(
+            sourceCall.CallId,
+            terminal.TerminalId,
+            receipt).Accepted);
+        var request = SidecarActionCapabilityRequest.HostEntry(
+            sourceCall,
+            descriptor,
+            action,
+            Cancellation(source),
+            sourceCall.Deadline,
+            context,
+            terminal);
+        var authority = CreateTerminalRequest(
+            source,
+            request,
+            new ActionPipelineSnapshot($"{key}-snapshot", []),
+            receipt).Authority with
+        {
+            RootPeerCall = peerCall,
+            ReceivingRootBudgetId = sourceCarrier.CapabilityId,
+            ReceivingPeerBindingGeneration = receiving.Session.BindingGeneration,
+        };
+        authority = authority with
+        {
+            CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(
+                authority),
+            Proof = string.Empty,
+        };
+        authority = authority with { Proof = authority.CanonicalBindingHash };
+
+        var rootRelayIssue = source.Session.IssueHostActionEntryPeerRootRelay(
+            sourceCall,
+            peerCall,
+            descriptor,
+            action,
+            terminal,
+            new ActionPipelineSnapshot($"{key}-snapshot", []),
+            receiving.Session,
+            authority,
+            source.Now,
+            out var issuedRelay);
+        Assert.True(
+            rootRelayIssue.Accepted,
+            $"{rootRelayIssue.Code}: {rootRelayIssue.Message}; source-sequence={source.Session.LastSequence}; receiving-sequence={receiving.Session.LastSequence}");
+        Assert.NotNull(issuedRelay);
+        var wireRelay = SidecarCapabilityTransportCodec.Deserialize<SidecarHostActionEntryRootRelay>(
+            SidecarCapabilityTransportCodec.Serialize(issuedRelay!));
+        Assert.True(receiving.Session.ImportHostActionEntryPeerRootRelay(
+            wireRelay,
+            receiving.Now,
+            out var receivingContext).Accepted);
+        Assert.NotNull(receivingContext);
+        var receivingRequest = SidecarActionCapabilityRequest.HostEntry(
+            peerCall,
+            descriptor,
+            action,
+            Cancellation(receiving),
+            peerCall.Deadline,
+            receivingContext,
+            terminal);
+        Assert.True(receiving.Session.BeginActionCall(
+            receivingRequest,
+            action.ByteLength,
+            receiving.Now,
+            out var terminalContext).Accepted);
+        Assert.NotNull(terminalContext);
+        Assert.True(receiving.Session.TryGetActiveHostActionEntryCarrier(
+            terminalContext!.CapabilityId,
+            out var receivingCarrier));
+        Assert.NotNull(receivingCarrier);
+        var receivingReceipt = receipt with
+        {
+            ReceiptId = $"{key}-peer-receipt",
+            CallId = peerCall.CallId,
+            IdempotencyScope = $"{key}-peer-scope",
+        };
+        Assert.True(receiving.Session.RecordTerminal(
+            peerCall.CallId,
+            terminal.TerminalId,
+            receivingReceipt).Accepted);
+        Assert.True(receiving.Session.CompleteCall(peerCall.CallId, 1).Accepted);
+        Assert.True(receiving.Session.CompleteHostActionEntryCarrier(
+            receivingCarrier!,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            receiving.Now).Accepted);
+        Assert.True(source.Session.CompleteCall(sourceCall.CallId, 1).Accepted);
+        Assert.True(source.Session.CompleteHostActionEntryCarrier(
+            sourceCarrier,
+            HostActionEntryCarrierCompletionKind.Succeeded,
+            source.Now).Accepted);
+
+        var sourceRotated = CreateRotatedBinding(source, $"{key}-source-rotation");
+        source.BindingHashes.Add(sourceRotated.Authentication.BindingHash);
+        var sourceRotation = source.Session.RotateBinding(sourceRotated, source.Now);
+        Assert.True(
+            sourceRotation.Accepted,
+            $"{sourceRotation.Code}: {sourceRotation.Message}; issued-contexts={source.Session.IssuedHostActionEntryContextCount}; active-carriers={source.Session.ActiveHostActionEntryCarrierCount}; sequence={source.Session.LastSequence}");
+        var receivingRotated = CreateRotatedBinding(receiving, $"{key}-receiving-rotation");
+        receiving.BindingHashes.Add(receivingRotated.Authentication.BindingHash);
+        Assert.True(receiving.Session.RotateBinding(receivingRotated, receiving.Now).Accepted);
+    }
+
+    private static EndpointTypedActionChildReservationCase CreateEndpointTypedActionChildReservationOnlyCase(
+        HostEndpointTransport transport)
+    {
+        static bool AuthenticateHostTerminal(SidecarHostTerminalAuthority authority, string hash) =>
+            authority.Proof == hash;
+        static bool AuthenticateRoute(HostEndpointRouteAuthority authority, string hash) =>
+            authority.Proof == KeyedEndpointProof("route", hash);
+        static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
+            relay.Proof == KeyedEndpointProof("relay", hash);
+
+        var source = CreateFixture(
+            maxInFlight: 3,
+            actionInputBytes: 4096,
+            protocolMessageBytes: 65536,
+            authenticateHostTerminalAuthority: AuthenticateHostTerminal,
+            authenticateEndpointRouteAuthority: AuthenticateRoute);
+        var receiving = CreateMirroredFixture(
+            source,
+            maxInFlight: 3,
+            actionInputBytes: 4096,
+            protocolMessageBytes: 65536,
+            authenticateHostTerminalAuthority: AuthenticateHostTerminal,
+            authenticateEndpointRouteAuthority: AuthenticateRoute,
+            authenticateEndpointRouteRelay: AuthenticateRelay);
+        var sourceContext = IssueContext(
+            source,
+            new RequestPrincipal(
+                "endpoint-user",
+                Roles: new HashSet<string>(["reader"], StringComparer.Ordinal)),
+            HostActionEntryIngress.Endpoint,
+            lineage: new HostActionEntryLineage(
+                new SharpClawActionKey("endpoint.invoke"),
+                1,
+                "endpoint-invoke-descriptor",
+                typeof(HostEndpointInvocation).AssemblyQualifiedName!,
+                1,
+                "endpoint-invoke-schema",
+                null,
+                null));
+        var request = EndpointRouteRequest(source, sourceContext, transport);
+        var sourceCall = ActionCall(source, 1, "endpoint-child-pre-relay-source");
+        var receivingCall = ActionCall(receiving, 1, "endpoint-child-pre-relay-receiving");
+        var routeReservationResult = receiving.Session.IssueHostEndpointRouteReservation(
+            request,
+            receivingCall,
+            receiving.Now,
+            reservation => KeyedEndpointProof(
+                "reservation",
+                SidecarCapabilityTransportValidation.ComputeEndpointRouteReservationBindingHash(
+                    reservation)),
+            out var routeReservation);
+        Assert.True(routeReservationResult.Accepted, routeReservationResult.Message);
+        Assert.NotNull(routeReservation);
+        var wireRouteReservation = SidecarCapabilityTransportCodec.Deserialize<
+            SidecarHostEndpointRouteReservation>(
+            SidecarCapabilityTransportCodec.Serialize(routeReservation));
+        var routeRelayResult = source.Session.IssueHostEndpointRouteRelay(
+            request,
+            sourceCall,
+            wireRouteReservation,
+            source.Now,
+            authority => KeyedEndpointProof(
+                "route",
+                HostEndpointRouteAuthorityValidator.ComputeBindingHash(authority)),
+            (candidate, hash) => candidate.Proof == KeyedEndpointProof("reservation", hash),
+            (candidate, hash) => KeyedEndpointProof("relay", hash),
+            out var routeRelay);
+        Assert.True(routeRelayResult.Accepted, routeRelayResult.Message);
+        Assert.NotNull(routeRelay);
+        var wireRouteRelay = SidecarCapabilityTransportCodec.Deserialize<
+            SidecarHostEndpointRouteRelay>(
+            SidecarCapabilityTransportCodec.Serialize(routeRelay));
+
+        var sourceCarrier = new HostActionEntryCarrierIdentity(
+            HostActionEntryIngress.Endpoint,
+            sourceContext.InvocationId,
+            sourceContext.Contribution!.IngressBinding);
+        var sourceCarrierResult = source.Session.BeginHostEndpointRouteCarrier(
+            request,
+            routeRelay!.Authority,
+            sourceCarrier,
+            source.Now,
+            out var sourceCarrierAuthority);
+        Assert.True(sourceCarrierResult.Accepted, sourceCarrierResult.Message);
+        Assert.NotNull(sourceCarrierAuthority);
+        var sourcePayload = EndpointInvocationPayload(
+            typeof(HostEndpointInvocation).AssemblyQualifiedName!,
+            request.Invocation);
+        Assert.True(source.Session.BeginCall(
+            sourceCall,
+            SidecarCapabilityKind.Action,
+            sourcePayload,
+            sourcePayload.ByteLength,
+            source.Now,
+            sourceContext).Accepted);
+        Assert.True(source.Session.TryGetActiveHostActionEntryContext(
+            sourceContext.CapabilityId,
+            out var activeSourceContext));
+        Assert.NotNull(activeSourceContext);
+
+        var routeImportResult = receiving.Session.ImportHostEndpointRouteRelay(
+            wireRouteRelay,
+            receiving.Now,
+            out var receivingContext);
+        Assert.True(routeImportResult.Accepted, routeImportResult.Message);
+        Assert.NotNull(receivingContext);
+        var receivingPayload = EndpointInvocationPayload(
+            typeof(HostEndpointInvocation).AssemblyQualifiedName!,
+            wireRouteRelay.Request.Invocation);
+        Assert.True(receiving.Session.BeginCall(
+            receivingCall,
+            SidecarCapabilityKind.Action,
+            receivingPayload,
+            receivingPayload.ByteLength,
+            receiving.Now,
+            receivingContext).Accepted);
+        Assert.True(receiving.Session.TryGetActiveHostActionEntryCarrier(
+            receivingContext!.CapabilityId,
+            out var receivingCarrier));
+        Assert.NotNull(receivingCarrier);
+
+        var sourceParent = new EndpointTypedActionChildParent(
+            request,
+            sourceCall,
+            routeRelay.Authority,
+            sourceCarrierAuthority!,
+            activeSourceContext!);
+        var receivingParent = new EndpointTypedActionChildParent(
+            request,
+            receivingCall,
+            wireRouteRelay.Authority,
+            receivingCarrier!,
+            receivingContext);
+        var descriptor = NestedDescriptor(
+            "endpoint.typed.pre-relay-child",
+            typeof(string).AssemblyQualifiedName!);
+        var action = Payload(descriptor.InputTypeIdentity, "pre-relay-child");
+        var childCall = sourceCall with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "endpoint-pre-relay-child",
+            Sequence = source.Session.LastSequence + 1,
+            Deadline = source.Now.AddSeconds(30),
+        };
+        var reservationResult = source.Session.IssueHostEndpointTypedActionChildReservation(
+            sourceParent.Call,
+            sourceParent.ActiveContext,
+            childCall,
+            descriptor,
+            action,
+            source.Now,
+            candidate => KeyedEndpointProof(
+                "child-reservation",
+                SidecarEndpointTypedActionChildValidation.ComputeReservationHash(candidate)),
+            out var reservation);
+        Assert.True(reservationResult.Accepted, reservationResult.Message);
+        Assert.NotNull(reservation);
+        return new EndpointTypedActionChildReservationCase(
+            source,
+            receiving,
+            sourceParent,
+            receivingParent,
+            childCall,
+            action,
+            routeRelay,
+            reservation!);
+    }
+
     private static EndpointTypedActionChildCase CreateEndpointTypedActionChildCase(
         HostEndpointTransport transport,
         int maxInFlight = 2,
         int maxCalls = 4)
     {
+        static bool AuthenticateHostTerminal(SidecarHostTerminalAuthority authority, string hash) =>
+            authority.Proof == hash;
         static bool AuthenticateRoute(HostEndpointRouteAuthority authority, string hash) =>
             authority.Proof == KeyedEndpointProof("route", hash);
         static bool AuthenticateRelay(SidecarHostEndpointRouteRelay relay, string hash) =>
@@ -13589,10 +15352,21 @@ public sealed class SidecarCapabilityTransportTests
             SidecarEndpointTypedActionChildRelay relay,
             string hash) =>
             relay.Proof == KeyedEndpointProof("child-relay", hash);
+        static bool AuthenticateImportAcknowledgment(
+            SidecarEndpointTypedActionChildImportAcknowledgment acknowledgment,
+            string hash) =>
+            acknowledgment.Proof == KeyedEndpointProof("child-import", hash);
+        static bool AuthenticateImportAbort(
+            SidecarEndpointTypedActionChildImportAbort abort,
+            string hash) =>
+            abort.Proof == KeyedEndpointProof("child-import-abort", hash);
 
         var source = CreateFixture(
+            maxInFlight: maxInFlight,
+            maxCalls: maxCalls,
             actionInputBytes: 4096,
             protocolMessageBytes: 65536,
+            authenticateHostTerminalAuthority: AuthenticateHostTerminal,
             authenticateEndpointRouteAuthority: AuthenticateRoute,
             authenticateEndpointTypedActionChildReservation: AuthenticateReservation,
             authenticateEndpointTypedActionChildRelay: AuthenticateChildRelay);
@@ -13602,10 +15376,13 @@ public sealed class SidecarCapabilityTransportTests
             maxCalls: maxCalls,
             actionInputBytes: 4096,
             protocolMessageBytes: 65536,
+            authenticateHostTerminalAuthority: AuthenticateHostTerminal,
             authenticateEndpointRouteAuthority: AuthenticateRoute,
             authenticateEndpointRouteRelay: AuthenticateRelay,
             authenticateEndpointTypedActionChildReservation: AuthenticateReservation,
-            authenticateEndpointTypedActionChildRelay: AuthenticateChildRelay);
+            authenticateEndpointTypedActionChildRelay: AuthenticateChildRelay,
+            authenticateEndpointTypedActionChildImportAcknowledgment: AuthenticateImportAcknowledgment,
+            authenticateEndpointTypedActionChildImportAbort: AuthenticateImportAbort);
 
         var sourceContext = IssueContext(
             source,
@@ -13828,6 +15605,16 @@ public sealed class SidecarCapabilityTransportTests
         SidecarHostEndpointRouteRelay RouteRelay,
         SidecarEndpointTypedActionChildRelay Relay,
         SidecarEndpointTypedActionChildRelay WireRelay);
+
+    private sealed record EndpointTypedActionChildReservationCase(
+        Fixture Source,
+        Fixture Receiving,
+        EndpointTypedActionChildParent SourceParent,
+        EndpointTypedActionChildParent ReceivingParent,
+        SidecarCapabilityCallIdentity ChildCall,
+        SidecarSerializedPayload ChildAction,
+        SidecarHostEndpointRouteRelay RouteRelay,
+        SidecarEndpointTypedActionChildReservation Reservation);
 
     private sealed record Fixture(
         DateTimeOffset Now,

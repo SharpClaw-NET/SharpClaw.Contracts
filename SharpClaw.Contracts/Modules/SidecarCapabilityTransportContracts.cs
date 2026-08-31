@@ -188,6 +188,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private readonly Func<SidecarHostEndpointRouteRelay, string, bool>? _authenticateEndpointRouteRelay;
     private readonly Func<SidecarEndpointTypedActionChildReservation, string, bool>? _authenticateEndpointTypedActionChildReservation;
     private readonly Func<SidecarEndpointTypedActionChildRelay, string, bool>? _authenticateEndpointTypedActionChildRelay;
+    private readonly Func<SidecarEndpointTypedActionChildImportAcknowledgment, string, bool>? _authenticateEndpointTypedActionChildImportAcknowledgment;
+    private readonly Func<SidecarEndpointTypedActionChildImportAbort, string, bool>? _authenticateEndpointTypedActionChildImportAbort;
     private readonly Func<string, bool> _registerAuthenticationNonce;
     private readonly Dictionary<Guid, SidecarCapabilityKind> _calls = [];
     private readonly Dictionary<Guid, SidecarCapabilityCallIdentity> _callIdentities = [];
@@ -202,6 +204,10 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private readonly Dictionary<Guid, SidecarHostEndpointRouteRelay> _issuedEndpointRouteRelays = [];
     private readonly Dictionary<Guid, EndpointTypedActionChildReservationState> _issuedEndpointTypedActionChildReservations = [];
     private readonly Dictionary<Guid, SidecarEndpointTypedActionChildRelay> _issuedEndpointTypedActionChildRelays = [];
+    private readonly Dictionary<Guid, EndpointTypedActionChildImportState> _endpointTypedActionChildImportStates = [];
+    private readonly Dictionary<Guid, CompletedEndpointTypedActionChildImportState> _completedEndpointTypedActionChildImports = [];
+    private readonly Dictionary<Guid, SidecarEndpointTypedActionChildImportAbort> _issuedEndpointTypedActionChildImportAborts = [];
+    private readonly Dictionary<Guid, EndpointTypedActionChildRelaySequenceState> _endpointTypedActionChildRelaySequences = [];
     private readonly Dictionary<Guid, HostActionEntryRequestContext> _activeEntryContexts = [];
     private readonly Dictionary<Guid, HostActionEntryCarrierAuthority> _activeEntryCarriers = [];
     private readonly Dictionary<Guid, Guid> _entryBudgetRoots = [];
@@ -264,6 +270,10 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private sealed record IssuedStorageContinuationState(
         SidecarHostEntryStorageContinuationAuthority Authority);
 
+    private sealed record EndpointTypedActionChildRelaySequenceState(
+        long Sequence,
+        string ReplayNonce);
+
     private sealed record EndpointRouteAdmissionState(
         HostEndpointRouteAuthority Authority,
         HostActionEntryRequestContext Context,
@@ -285,6 +295,18 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
     private sealed record EndpointTypedActionChildReservationState(
         SidecarEndpointTypedActionChildReservation Reservation,
         bool UsesBudgetExtension);
+
+    private sealed record EndpointTypedActionChildImportState(
+        SidecarEndpointTypedActionChildRelay Relay,
+        EndpointTypedActionChildReservationState ReservationState,
+        SidecarNestedHostActionEntryRelay ChildRelay,
+        HostActionEntryRequestContext Context,
+        SidecarEndpointTypedActionChildImportAcknowledgment? Acknowledgment);
+
+    private sealed record CompletedEndpointTypedActionChildImportState(
+        SidecarEndpointTypedActionChildRelay Relay,
+        SidecarEndpointTypedActionChildImportAcknowledgment Acknowledgment,
+        DateTimeOffset RetainUntil);
 
     private sealed record NestedCarrierState(
         SidecarNestedHostActionEntryCarrier Carrier,
@@ -317,7 +339,9 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         Func<HostEndpointRouteAuthority, string, bool>? authenticateEndpointRouteAuthority = null,
         Func<SidecarHostEndpointRouteRelay, string, bool>? authenticateEndpointRouteRelay = null,
         Func<SidecarEndpointTypedActionChildReservation, string, bool>? authenticateEndpointTypedActionChildReservation = null,
-        Func<SidecarEndpointTypedActionChildRelay, string, bool>? authenticateEndpointTypedActionChildRelay = null)
+        Func<SidecarEndpointTypedActionChildRelay, string, bool>? authenticateEndpointTypedActionChildRelay = null,
+        Func<SidecarEndpointTypedActionChildImportAcknowledgment, string, bool>? authenticateEndpointTypedActionChildImportAcknowledgment = null,
+        Func<SidecarEndpointTypedActionChildImportAbort, string, bool>? authenticateEndpointTypedActionChildImportAbort = null)
     {
         ArgumentNullException.ThrowIfNull(binding);
         ArgumentNullException.ThrowIfNull(authenticate);
@@ -331,6 +355,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         _authenticateEndpointRouteRelay = authenticateEndpointRouteRelay;
         _authenticateEndpointTypedActionChildReservation = authenticateEndpointTypedActionChildReservation;
         _authenticateEndpointTypedActionChildRelay = authenticateEndpointTypedActionChildRelay;
+        _authenticateEndpointTypedActionChildImportAcknowledgment = authenticateEndpointTypedActionChildImportAcknowledgment;
+        _authenticateEndpointTypedActionChildImportAbort = authenticateEndpointTypedActionChildImportAbort;
 
         var result = SidecarCapabilitySessionValidator.Validate(
             binding,
@@ -2400,6 +2426,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             candidate = candidate with
             {
                 ParentRouteAuthority = CloneTransport(routeAuthority),
+                OutcomeDecisionAt = expiresAt.Add(CarrierReplayRetention),
             };
             candidate = CloneTransport(candidate) with
             {
@@ -2563,6 +2590,22 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     "The endpoint child relay parent is not active.");
             }
 
+            var existingRelay = _issuedEndpointTypedActionChildRelays.Values.FirstOrDefault(
+                existing =>
+                    SidecarCapabilityTransportCodec.Serialize(existing.ParentRouteAuthority).SequenceEqual(
+                        SidecarCapabilityTransportCodec.Serialize(parentRouteAuthority)) &&
+                    SidecarCapabilityTransportCodec.Serialize(existing.SourceParentCall).SequenceEqual(
+                        SidecarCapabilityTransportCodec.Serialize(sourceParentCall)) &&
+                    SidecarCapabilityTransportCodec.Serialize(existing.SourceParentContext).SequenceEqual(
+                        SidecarCapabilityTransportCodec.Serialize(sourceParentContext)) &&
+                    SidecarCapabilityTransportCodec.Serialize(existing.ReceivingReservation).SequenceEqual(
+                        SidecarCapabilityTransportCodec.Serialize(receivingReservation)));
+            if (existingRelay is not null)
+            {
+                relay = CloneTransport(existingRelay);
+                return SidecarCapabilityValidationResult.Accept();
+            }
+
             sourceGeneration = _bindingGeneration;
             sourceBindingHash = Binding.Authentication.BindingHash;
         }
@@ -2593,6 +2636,10 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             receivingReservation.ExpiresAt,
             string.Empty,
             string.Empty);
+        candidate = candidate with
+        {
+            SourceBindingHash = sourceBindingHash,
+        };
         try
         {
             candidate = CloneTransport(candidate) with
@@ -2635,13 +2682,33 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 sourceParentContext,
                 now,
                 sourceGeneration,
-                sourceBindingHash);
+                sourceBindingHash,
+                out var localSequence);
             if (finalValidation is not null)
                 return SidecarCapabilityValidationResult.Reject(
                     finalValidation.Code,
                     finalValidation.Message);
 
-            _issuedEndpointTypedActionChildRelays.Add(receivingReservation.ReservationId, CloneTransport(signed));
+            if (!_issuedEndpointTypedActionChildRelays.TryAdd(
+                    receivingReservation.ReservationId,
+                    CloneTransport(signed)))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child relay was already issued.");
+            }
+
+            if (!_endpointTypedActionChildRelaySequences.TryAdd(
+                    receivingReservation.ReservationId,
+                    new(localSequence, signed.Child.Call.ReplayNonce)))
+            {
+                _issuedEndpointTypedActionChildRelays.Remove(receivingReservation.ReservationId);
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child relay sequence was already reserved.");
+            }
+            _lastSequence = localSequence;
+            _nonces.Add(signed.Child.Call.ReplayNonce);
             relay = CloneTransport(signed);
             return SidecarCapabilityValidationResult.Accept();
         }
@@ -2649,46 +2716,538 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
     public SidecarCapabilityValidationResult CompleteHostEndpointTypedActionChildRelay(
         SidecarEndpointTypedActionChildRelay relay,
+        SidecarEndpointTypedActionChildImportAcknowledgment? acknowledgment,
         DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(relay);
 
+        SidecarEndpointTypedActionChildRelay relaySnapshot;
+        SidecarEndpointTypedActionChildImportAcknowledgment? acknowledgmentSnapshot;
+        try
+        {
+            relaySnapshot = CloneTransport(relay);
+            acknowledgmentSnapshot = acknowledgment is null
+                ? null
+                : CloneTransport(acknowledgment);
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint child relay acknowledgment could not be read.");
+        }
+
+        var reservationId = relaySnapshot.ReceivingReservation?.ReservationId ?? Guid.Empty;
+        long generation;
+        string bindingHash;
         lock (_sync)
         {
-            if (relay.ReceivingReservation is null)
-                return SidecarCapabilityValidationResult.Reject(
-                    SidecarCapabilityErrors.SpoofedIdentity,
-                    "The endpoint child relay is incomplete.");
-
-            if (!_issuedEndpointTypedActionChildRelays.TryGetValue(
-                    relay.ReceivingReservation.ReservationId,
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (reservationId == Guid.Empty ||
+                !_issuedEndpointTypedActionChildRelays.TryGetValue(
+                    reservationId,
                     out var issuedRelay) ||
                 !SidecarCapabilityTransportCodec.Serialize(issuedRelay).SequenceEqual(
-                    SidecarCapabilityTransportCodec.Serialize(relay)))
+                    SidecarCapabilityTransportCodec.Serialize(relaySnapshot)))
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Replay,
                     "The endpoint child relay was already completed or revoked.");
             }
 
-            _issuedEndpointTypedActionChildRelays.Remove(relay.ReceivingReservation.ReservationId);
-            return now >= issuedRelay.ExpiresAt
-                ? SidecarCapabilityValidationResult.Reject(
+            if (acknowledgmentSnapshot is null)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The endpoint child relay requires authenticated source import evidence.");
+
+            generation = _bindingGeneration;
+            bindingHash = Binding.Authentication.BindingHash;
+            var validation = ValidateEndpointTypedActionChildImportAcknowledgmentLocked(
+                issuedRelay,
+                acknowledgmentSnapshot,
+                now,
+                generation,
+                bindingHash);
+            if (validation is not null)
+                return validation;
+
+            if (_authenticateEndpointTypedActionChildImportAcknowledgment is null)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The receiving session has no source import acknowledgment verifier.");
+        }
+
+        bool authenticated;
+        try
+        {
+            authenticated = _authenticateEndpointTypedActionChildImportAcknowledgment(
+                CloneTransport(acknowledgmentSnapshot),
+                acknowledgmentSnapshot.CanonicalBindingHash);
+        }
+        catch
+        {
+            authenticated = false;
+        }
+        if (!authenticated)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The source import acknowledgment proof was not accepted.");
+
+        lock (_sync)
+        {
+            if (!_issuedEndpointTypedActionChildRelays.TryGetValue(
+                    reservationId,
+                    out var issuedRelay) ||
+                !SidecarCapabilityTransportCodec.Serialize(issuedRelay).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(relaySnapshot)))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child relay was already completed or revoked.");
+            }
+
+            var validation = ValidateEndpointTypedActionChildImportAcknowledgmentLocked(
+                issuedRelay,
+                acknowledgmentSnapshot,
+                now,
+                generation,
+                bindingHash);
+            if (validation is not null)
+                return validation;
+
+            _issuedEndpointTypedActionChildRelays.Remove(reservationId);
+            _endpointTypedActionChildRelaySequences.Remove(reservationId);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult IssueHostEndpointTypedActionChildImportAbort(
+        SidecarEndpointTypedActionChildRelay relay,
+        DateTimeOffset now,
+        Func<SidecarEndpointTypedActionChildImportAbort, string> issueProof,
+        out SidecarEndpointTypedActionChildImportAbort? abort)
+    {
+        ArgumentNullException.ThrowIfNull(relay);
+        ArgumentNullException.ThrowIfNull(issueProof);
+        abort = null;
+
+        SidecarEndpointTypedActionChildRelay relaySnapshot;
+        try
+        {
+            relaySnapshot = CloneTransport(relay);
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint child relay could not be read for abort.");
+        }
+
+        var reservationId = relaySnapshot.ReceivingReservation?.ReservationId ?? Guid.Empty;
+        if (reservationId == Guid.Empty)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint child relay has no reservation identity for abort.");
+
+        if (relaySnapshot.ReceivingReservation.OutcomeDecisionAt <= now)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Expired,
+                "The endpoint child import abort outcome deadline has expired.");
+
+        long generation;
+        string bindingHash;
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            if (_issuedEndpointTypedActionChildImportAborts.TryGetValue(
+                    reservationId,
+                    out var existingAbort))
+            {
+                if (!SidecarCapabilityTransportCodec.Serialize(existingAbort.Relay).SequenceEqual(
+                        SidecarCapabilityTransportCodec.Serialize(relaySnapshot)))
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Replay,
+                        "The endpoint child import abort identity was already used.");
+
+                abort = CloneTransport(existingAbort);
+                return SidecarCapabilityValidationResult.Accept();
+            }
+
+            if (_disconnected ||
+                !relaySnapshot.IsWellFormed ||
+                relaySnapshot.Child.Call.SessionId != Binding.SessionId ||
+                relaySnapshot.SourceBindingGeneration != _bindingGeneration ||
+                !string.Equals(
+                    relaySnapshot.SourceBindingHash,
+                    Binding.Authentication.BindingHash,
+                    StringComparison.Ordinal) ||
+                now > Binding.ExpiresAt)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    _disconnected
+                        ? SidecarCapabilityErrors.Disconnected
+                        : SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint child import abort is not available.");
+            }
+
+            var pendingMatches =
+                _issuedEndpointTypedActionChildReservations.TryGetValue(
+                    reservationId,
+                    out var pendingState) &&
+                !_endpointTypedActionChildImportStates.ContainsKey(reservationId) &&
+                SidecarCapabilityTransportCodec.Serialize(pendingState.Reservation).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(relaySnapshot.ReceivingReservation));
+            if (!pendingMatches)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child import outcome is already committed or unavailable.");
+
+            var rollbackState = pendingState;
+            var childCall = rollbackState.Reservation.Child.Call;
+            if (childCall.Sequence != _lastSequence ||
+                _calls.ContainsKey(childCall.CallId) ||
+                _callEntryContexts.ContainsKey(childCall.CallId) ||
+                _terminalCalls.ContainsKey(childCall.CallId) ||
+                _completedCalls.Contains(childCall.CallId))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint child import abort is not available after child execution.");
+            }
+
+            generation = _bindingGeneration;
+            bindingHash = Binding.Authentication.BindingHash;
+        }
+
+        var outcomeExpiresAt = relaySnapshot.ReceivingReservation.OutcomeDecisionAt;
+
+        SidecarEndpointTypedActionChildImportAbort candidate;
+        try
+        {
+            candidate = new SidecarEndpointTypedActionChildImportAbort(
+                relaySnapshot,
+                Binding.SessionId,
+                bindingHash,
+                generation,
+                relaySnapshot.SourceParentCall.SessionId,
+                relaySnapshot.SourceBindingHash,
+                relaySnapshot.SourceBindingGeneration,
+                now,
+                outcomeExpiresAt,
+                string.Empty,
+                string.Empty);
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint child import abort snapshot could not be prepared.");
+        }
+
+        candidate = candidate with
+        {
+            CanonicalBindingHash = SidecarEndpointTypedActionChildValidation.ComputeImportAbortHash(candidate),
+        };
+        if (!(candidate with { Proof = "pending-proof" }).IsWellFormed)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint child import abort snapshot is invalid.");
+
+        SidecarEndpointTypedActionChildImportAbort signerSnapshot;
+        byte[] signerBytes;
+        try
+        {
+            signerSnapshot = CloneTransport(candidate);
+            signerBytes = SidecarCapabilityTransportCodec.Serialize(signerSnapshot);
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint child import abort snapshot could not be serialized.");
+        }
+
+        string? proof;
+        try
+        {
+            proof = issueProof(signerSnapshot);
+            if (!signerBytes.SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(signerSnapshot)))
+                proof = null;
+        }
+        catch
+        {
+            proof = null;
+        }
+        if (string.IsNullOrWhiteSpace(proof))
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The host did not issue an endpoint child import abort proof.");
+
+        var signedAbort = candidate with { Proof = proof };
+        lock (_sync)
+        {
+            if (_disconnected ||
+                _bindingGeneration != generation ||
+                !string.Equals(
+                    Binding.Authentication.BindingHash,
+                    bindingHash,
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    signedAbort.CanonicalBindingHash,
+                    SidecarEndpointTypedActionChildValidation.ComputeImportAbortHash(signedAbort),
+                    StringComparison.OrdinalIgnoreCase) ||
+                !signedAbort.IsWellFormed)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    _disconnected
+                        ? SidecarCapabilityErrors.Disconnected
+                    : SidecarCapabilityErrors.Replay,
+                    "The endpoint child import abort is no longer available.");
+            }
+
+            var pendingMatches =
+                _issuedEndpointTypedActionChildReservations.TryGetValue(
+                    reservationId,
+                    out var pendingState) &&
+                !_endpointTypedActionChildImportStates.ContainsKey(reservationId) &&
+                SidecarCapabilityTransportCodec.Serialize(pendingState.Reservation).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(relaySnapshot.ReceivingReservation));
+            if (!pendingMatches)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child import outcome is already committed or unavailable.");
+
+            var rollbackState = pendingState;
+            var childCall = rollbackState.Reservation.Child.Call;
+            if (childCall.Sequence != _lastSequence ||
+                _calls.ContainsKey(childCall.CallId) ||
+                _callEntryContexts.ContainsKey(childCall.CallId) ||
+                _terminalCalls.ContainsKey(childCall.CallId) ||
+                _completedCalls.Contains(childCall.CallId))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child import abort is no longer available after child execution.");
+            }
+
+            if (!_issuedEndpointTypedActionChildImportAborts.TryAdd(
+                    reservationId,
+                    CloneTransport(signedAbort)))
+            {
+                abort = CloneTransport(_issuedEndpointTypedActionChildImportAborts[reservationId]);
+                return SidecarCapabilityValidationResult.Accept();
+            }
+
+            abort = CloneTransport(signedAbort);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult ConsumeHostEndpointTypedActionChildImportAbort(
+        SidecarEndpointTypedActionChildImportAbort abort,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(abort);
+        if (_authenticateEndpointTypedActionChildImportAbort is null)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The receiving session has no endpoint child import abort verifier.");
+
+        SidecarEndpointTypedActionChildImportAbort snapshot;
+        try
+        {
+            snapshot = CloneTransport(abort);
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint child import abort could not be read.");
+        }
+
+        var reservationId = snapshot.Relay?.ReceivingReservation?.ReservationId ?? Guid.Empty;
+        if (reservationId == Guid.Empty)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint child import abort has no reservation identity.");
+
+        long generation;
+        string bindingHash;
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (!_issuedEndpointTypedActionChildRelays.TryGetValue(
+                    reservationId,
+                    out var issuedRelay) ||
+                !SidecarCapabilityTransportCodec.Serialize(issuedRelay).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(snapshot.Relay)))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child relay was already completed or revoked.");
+
+            generation = _bindingGeneration;
+            bindingHash = Binding.Authentication.BindingHash;
+            var validation = ValidateEndpointTypedActionChildImportAbortLocked(
+                issuedRelay,
+                snapshot,
+                now,
+                generation,
+                bindingHash);
+            if (validation is not null)
+                return validation;
+        }
+
+        bool authenticated;
+        try
+        {
+            authenticated = _authenticateEndpointTypedActionChildImportAbort(
+                CloneTransport(snapshot),
+                snapshot.CanonicalBindingHash);
+        }
+        catch
+        {
+            authenticated = false;
+        }
+        if (!authenticated)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint child import abort proof was not accepted.");
+
+        lock (_sync)
+        {
+            if (!_issuedEndpointTypedActionChildRelays.TryGetValue(
+                    reservationId,
+                    out var issuedRelay) ||
+                !SidecarCapabilityTransportCodec.Serialize(issuedRelay).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(snapshot.Relay)))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child relay was already completed or revoked.");
+
+            var validation = ValidateEndpointTypedActionChildImportAbortLocked(
+                issuedRelay,
+                snapshot,
+                now,
+                generation,
+                bindingHash);
+            if (validation is not null)
+                return validation;
+
+            _issuedEndpointTypedActionChildRelays.Remove(reservationId);
+            ReleaseEndpointTypedActionChildRelaySequence(reservationId);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult CompleteHostEndpointTypedActionChildImportAbort(
+        SidecarEndpointTypedActionChildImportAbort abort,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(abort);
+
+        SidecarEndpointTypedActionChildImportAbort snapshot;
+        try
+        {
+            snapshot = CloneTransport(abort);
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint child import abort could not be read for source completion.");
+        }
+
+        var reservationId = snapshot.Relay?.ReceivingReservation?.ReservationId ?? Guid.Empty;
+        lock (_sync)
+        {
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+            if (reservationId == Guid.Empty ||
+                !_issuedEndpointTypedActionChildImportAborts.TryGetValue(
+                    reservationId,
+                    out var issuedAbort) ||
+                !SidecarCapabilityTransportCodec.Serialize(issuedAbort).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(snapshot)) ||
+                !_issuedEndpointTypedActionChildReservations.TryGetValue(
+                    reservationId,
+                    out var reservationState) ||
+                _endpointTypedActionChildImportStates.ContainsKey(reservationId) ||
+                !SidecarCapabilityTransportCodec.Serialize(reservationState.Reservation).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(snapshot.Relay.ReceivingReservation)))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child import abort was already completed or is unavailable.");
+            }
+
+            if (snapshot.ExpiresAt <= now)
+                return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.Expired,
-                    "The endpoint child relay has expired.")
-                : SidecarCapabilityValidationResult.Accept();
+                    "The endpoint child import abort outcome deadline has expired.");
+
+            ReleaseEndpointTypedActionChildReservation(reservationState);
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
+
+    public SidecarCapabilityValidationResult ReleaseHostEndpointTypedActionChildRelay(
+        SidecarEndpointTypedActionChildRelay relay,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(relay);
+
+        SidecarEndpointTypedActionChildRelay snapshot;
+        try
+        {
+            snapshot = CloneTransport(relay);
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint child relay could not be read.");
+        }
+
+        lock (_sync)
+        {
+            if (snapshot.ReceivingReservation is null)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The endpoint child relay is incomplete.");
+
+            if (!_issuedEndpointTypedActionChildRelays.TryGetValue(
+                    snapshot.ReceivingReservation.ReservationId,
+                    out var issuedRelay) ||
+                !SidecarCapabilityTransportCodec.Serialize(issuedRelay).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(snapshot)))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child relay was already released or completed.");
+            }
+
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint child relay requires an authenticated source import outcome.");
         }
     }
 
     public SidecarCapabilityValidationResult ImportHostEndpointTypedActionChildRelay(
         SidecarEndpointTypedActionChildRelay relay,
         DateTimeOffset now,
+        Func<SidecarEndpointTypedActionChildImportAcknowledgment, string> issueAcknowledgment,
         out SidecarNestedHostActionEntryRelay? childRelay,
-        out HostActionEntryRequestContext? hostContext)
+        out HostActionEntryRequestContext? hostContext,
+        out SidecarEndpointTypedActionChildImportAcknowledgment? acknowledgment)
     {
         ArgumentNullException.ThrowIfNull(relay);
+        ArgumentNullException.ThrowIfNull(issueAcknowledgment);
         childRelay = null;
         hostContext = null;
+        acknowledgment = null;
 
         try
         {
@@ -2701,6 +3260,12 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 "The endpoint child relay could not be read.");
         }
 
+        var reservationId = relay.ReceivingReservation?.ReservationId ?? Guid.Empty;
+        if (reservationId == Guid.Empty)
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint child relay has no reservation identity.");
+
         if (_authenticateEndpointTypedActionChildReservation is null ||
             _authenticateEndpointTypedActionChildRelay is null)
             return SidecarCapabilityValidationResult.Reject(
@@ -2711,6 +3276,47 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         string bindingHash;
         lock (_sync)
         {
+            SweepCompletedEntryCarriers(now);
+            if (_completedEndpointTypedActionChildImports.TryGetValue(
+                    reservationId,
+                    out var completedImport))
+            {
+                if (!SidecarCapabilityTransportCodec.Serialize(completedImport.Relay).SequenceEqual(
+                        SidecarCapabilityTransportCodec.Serialize(relay)))
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Replay,
+                        "The endpoint child relay import identity was already used.");
+
+                acknowledgment = CloneTransport(completedImport.Acknowledgment);
+                return SidecarCapabilityValidationResult.Accept();
+            }
+
+            if (_endpointTypedActionChildImportStates.TryGetValue(
+                    reservationId,
+                    out var existingImport))
+            {
+                if (!SidecarCapabilityTransportCodec.Serialize(existingImport.Relay).SequenceEqual(
+                        SidecarCapabilityTransportCodec.Serialize(relay)))
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Replay,
+                        "The endpoint child relay import identity was already used.");
+
+                if (existingImport.Relay.ReceivingReservation.OutcomeDecisionAt <= now)
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Expired,
+                        "The endpoint child import outcome deadline has expired.");
+
+                if (existingImport.Acknowledgment is null)
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.Unauthenticated,
+                        "The endpoint child relay import acknowledgment is not ready.");
+
+                childRelay = CloneTransport(existingImport.ChildRelay);
+                hostContext = CloneTransport(existingImport.Context);
+                acknowledgment = CloneTransport(existingImport.Acknowledgment);
+                return SidecarCapabilityValidationResult.Accept();
+            }
+
             SweepExpiredEntryContexts(now);
             SweepCompletedEntryCarriers(now);
             if (_disconnected)
@@ -2757,6 +3363,166 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             var privateContext = CloneTransport(privateReservation.Child.Carrier is not null
                 ? BuildEndpointTypedActionChildContext(privateReservation)
                 : throw new InvalidOperationException());
+            var privateRelay = CloneTransport(relay);
+            _endpointTypedActionChildImportStates.Add(
+                reservationId,
+                new EndpointTypedActionChildImportState(
+                    privateRelay,
+                    new EndpointTypedActionChildReservationState(
+                        CloneTransport(state.Reservation),
+                        state.UsesBudgetExtension),
+                    CloneTransport(privateChild),
+                    CloneTransport(privateContext),
+                    null));
+        }
+
+        SidecarEndpointTypedActionChildImportAcknowledgment candidate;
+        try
+        {
+            candidate = new SidecarEndpointTypedActionChildImportAcknowledgment(
+                CloneTransport(relay),
+                Binding.SessionId,
+                bindingHash,
+                relay.ReceivingReservation.ReceivingBindingGeneration,
+                relay.SourceParentCall.SessionId,
+                relay.SourceBindingHash,
+                relay.SourceBindingGeneration,
+                now,
+                relay.ReceivingReservation.OutcomeDecisionAt,
+                string.Empty,
+                string.Empty);
+            candidate = candidate with
+            {
+                CanonicalBindingHash = SidecarEndpointTypedActionChildValidation.ComputeImportAcknowledgmentHash(candidate),
+            };
+            if (!(candidate with { Proof = "pending-proof" }).IsWellFormed)
+                throw new InvalidOperationException();
+        }
+        catch
+        {
+            lock (_sync)
+            {
+                if (_endpointTypedActionChildImportStates.TryGetValue(
+                        reservationId,
+                        out var importState))
+                    RollbackEndpointTypedActionChildImportLocked(reservationId, importState);
+            }
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint child import acknowledgment snapshot could not be prepared.");
+        }
+
+        SidecarEndpointTypedActionChildImportAcknowledgment signerSnapshot;
+        byte[] signerBytes;
+        try
+        {
+            signerSnapshot = CloneTransport(candidate);
+            signerBytes = SidecarCapabilityTransportCodec.Serialize(signerSnapshot);
+        }
+        catch
+        {
+            lock (_sync)
+            {
+                if (_endpointTypedActionChildImportStates.TryGetValue(
+                        reservationId,
+                        out var importState))
+                    RollbackEndpointTypedActionChildImportLocked(reservationId, importState);
+            }
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The endpoint child import acknowledgment snapshot could not be prepared.");
+        }
+
+        string? proof;
+        try
+        {
+            proof = issueAcknowledgment(signerSnapshot);
+            if (!signerBytes.SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(signerSnapshot)))
+                proof = null;
+        }
+        catch
+        {
+            proof = null;
+        }
+        if (string.IsNullOrWhiteSpace(proof))
+        {
+            lock (_sync)
+            {
+                if (_endpointTypedActionChildImportStates.TryGetValue(
+                        reservationId,
+                        out var importState))
+                    RollbackEndpointTypedActionChildImportLocked(reservationId, importState);
+            }
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.Unauthenticated,
+                "The source did not issue an endpoint child import acknowledgment proof.");
+        }
+
+        var signedAcknowledgment = candidate with { Proof = proof };
+        lock (_sync)
+        {
+            if (!_endpointTypedActionChildImportStates.TryGetValue(
+                    reservationId,
+                    out var importState) ||
+                !SidecarCapabilityTransportCodec.Serialize(importState.Relay).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(relay)))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child relay import state is no longer available.");
+            }
+
+            if (importState.Acknowledgment is not null)
+            {
+                childRelay = CloneTransport(importState.ChildRelay);
+                hostContext = CloneTransport(importState.Context);
+                acknowledgment = CloneTransport(importState.Acknowledgment);
+                return SidecarCapabilityValidationResult.Accept();
+            }
+
+            var relayValidation = ValidateEndpointTypedActionChildRelayLocked(
+                relay,
+                now,
+                generation,
+                bindingHash);
+            if (relayValidation is not null)
+            {
+                RollbackEndpointTypedActionChildImportLocked(reservationId, importState);
+                return relayValidation;
+            }
+
+            if (_disconnected ||
+                _bindingGeneration != generation ||
+                !string.Equals(Binding.Authentication.BindingHash, bindingHash, StringComparison.Ordinal) ||
+                !signedAcknowledgment.IsWellFormed ||
+                !string.Equals(
+                    signedAcknowledgment.CanonicalBindingHash,
+                    SidecarEndpointTypedActionChildValidation.ComputeImportAcknowledgmentHash(
+                        signedAcknowledgment),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                RollbackEndpointTypedActionChildImportLocked(reservationId, importState);
+                return SidecarCapabilityValidationResult.Reject(
+                    _disconnected
+                        ? SidecarCapabilityErrors.Disconnected
+                        : SidecarCapabilityErrors.Replay,
+                    "The endpoint child import acknowledgment is no longer available.");
+            }
+
+            var privateReservation = importState.ReservationState.Reservation;
+            var privateChild = importState.ChildRelay;
+            var privateContext = importState.Context;
+            if (_activeEntryCarriers.ContainsKey(privateContext.CapabilityId) ||
+                _activeEntryContexts.ContainsKey(privateContext.CapabilityId) ||
+                _nestedCarrierStates.ContainsKey(privateContext.CapabilityId))
+            {
+                RollbackEndpointTypedActionChildImportLocked(reservationId, importState);
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child import carrier identity was already used.");
+            }
+
             var carrierAuthority = new HostActionEntryCarrierAuthority(
                 Binding.ModuleId,
                 Binding.GraphId,
@@ -2768,11 +3534,12 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     privateContext.Ingress,
                     privateContext.InvocationId,
                     privateContext.Contribution!.IngressBinding),
-                _bindingGeneration,
+                generation,
                 now,
                 privateReservation.ExpiresAt,
-                HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(privateContext.CapabilityHandle));
-
+                HostActionEntryAuthorityValidator.ComputeCapabilityHandleHash(
+                    privateContext.CapabilityHandle));
+            var storedAcknowledgment = CloneTransport(signedAcknowledgment);
             _issuedEndpointTypedActionChildReservations.Remove(privateReservation.ReservationId);
             _activeEntryCarriers.Add(privateContext.CapabilityId, carrierAuthority);
             _activeEntryContexts.Add(privateContext.CapabilityId, privateContext);
@@ -2786,10 +3553,32 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     privateReservation.Action,
                     privateContext,
                     carrierAuthority));
-            childRelay = CloneTransport(privateChild);
-            hostContext = CloneTransport(privateContext);
+            _endpointTypedActionChildImportStates[reservationId] =
+                importState with { Acknowledgment = storedAcknowledgment };
+            childRelay = CloneTransport(importState.ChildRelay);
+            hostContext = CloneTransport(importState.Context);
+            acknowledgment = CloneTransport(storedAcknowledgment);
             return SidecarCapabilityValidationResult.Accept();
         }
+    }
+
+    private bool RollbackEndpointTypedActionChildImportLocked(
+        Guid reservationId,
+        EndpointTypedActionChildImportState expectedState)
+    {
+        if (!_endpointTypedActionChildImportStates.TryGetValue(
+                reservationId,
+                out var currentState) ||
+            currentState.Acknowledgment is not null ||
+            !SidecarCapabilityTransportCodec.Serialize(currentState.Relay).SequenceEqual(
+                SidecarCapabilityTransportCodec.Serialize(expectedState.Relay)))
+            return false;
+
+        _endpointTypedActionChildImportStates.Remove(reservationId);
+        _activeEntryCarriers.Remove(currentState.Context.CapabilityId);
+        _activeEntryContexts.Remove(currentState.Context.CapabilityId);
+        _nestedCarrierStates.Remove(currentState.Context.CapabilityId);
+        return true;
     }
 
     private SidecarCapabilityValidationResult? ValidateEndpointRouteRelayStateLocked(
@@ -3398,8 +4187,10 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         HostActionEntryRequestContext sourceParentContext,
         DateTimeOffset now,
         long expectedGeneration,
-        string expectedBindingHash)
+        string expectedBindingHash,
+        out long localSequence)
     {
+        localSequence = _lastSequence + 1;
         var relayWellFormed = relay.IsWellFormed;
         var sourceCallMatches = relay.SourceParentCall == sourceParentCall;
         var sourceContextMatches = HostActionEntryAuthorityValidator.SameContextIgnoringPayload(
@@ -3429,7 +4220,19 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 relay.ReceivingReservation.Action.ContentHash,
                 StringComparison.OrdinalIgnoreCase) &&
             relay.Child.Contribution.Lineage.PayloadByteLength ==
-                relay.ReceivingReservation.Action.ByteLength;
+            relay.ReceivingReservation.Action.ByteLength;
+        var childSequenceMatches = relay.Child.Call.Sequence == localSequence;
+        var childCallCollidesLocally =
+            _calls.ContainsKey(relay.Child.Call.CallId) ||
+            _callIdentities.ContainsKey(relay.Child.Call.CallId) ||
+            _callPayloads.ContainsKey(relay.Child.Call.CallId) ||
+            _reservedNestedCalls.ContainsKey(relay.Child.Call.CallId) ||
+            _callEntryContexts.ContainsKey(relay.Child.Call.CallId) ||
+            _completedCalls.Contains(relay.Child.Call.CallId) ||
+            _nonces.Contains(relay.Child.Call.ReplayNonce) ||
+            _endpointTypedActionChildRelaySequences.Values.Any(state =>
+                state.Sequence == relay.Child.Call.Sequence ||
+                string.Equals(state.ReplayNonce, relay.Child.Call.ReplayNonce, StringComparison.Ordinal));
         if (_disconnected ||
             _bindingGeneration != expectedGeneration ||
             !string.Equals(Binding.Authentication.BindingHash, expectedBindingHash, StringComparison.Ordinal) ||
@@ -3447,10 +4250,12 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             !receivingRouteMatches ||
             !contextTransformationMatches ||
             !childCallValid ||
-            relay.Child.Call.Capability != SidecarCapabilityKind.Action ||
-            relay.Child.Call.Deadline <= now ||
-            relay.Child.Call.Deadline > relay.ReceivingReservation.ExpiresAt ||
-            !childGenerationMatches ||
+             relay.Child.Call.Capability != SidecarCapabilityKind.Action ||
+             relay.Child.Call.Deadline <= now ||
+             relay.Child.Call.Deadline > relay.ReceivingReservation.ExpiresAt ||
+             !childSequenceMatches ||
+             childCallCollidesLocally ||
+             !childGenerationMatches ||
             relay.Child.Carrier.ParentCallId != relay.ReceivingReservation.ParentEndpointCall.CallId ||
             !childPayloadMatches ||
             _issuedEndpointTypedActionChildRelays.ContainsKey(
@@ -3489,6 +4294,141 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             : payloadResult;
     }
 
+    private SidecarCapabilityValidationResult? ValidateEndpointTypedActionChildImportAcknowledgmentLocked(
+        SidecarEndpointTypedActionChildRelay issuedRelay,
+        SidecarEndpointTypedActionChildImportAcknowledgment acknowledgment,
+        DateTimeOffset now,
+        long expectedGeneration,
+        string expectedBindingHash)
+    {
+        try
+        {
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The receiving capability session is disconnected.");
+
+            if (_bindingGeneration != expectedGeneration ||
+                !string.Equals(
+                    Binding.Authentication.BindingHash,
+                    expectedBindingHash,
+                    StringComparison.Ordinal))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child relay binding changed during completion.");
+
+            if (!acknowledgment.IsWellFormed ||
+                !SidecarCapabilityTransportCodec.Serialize(acknowledgment.Relay).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(issuedRelay)) ||
+                !string.Equals(
+                    acknowledgment.CanonicalBindingHash,
+                    SidecarEndpointTypedActionChildValidation.ComputeImportAcknowledgmentHash(
+                        acknowledgment),
+                    StringComparison.OrdinalIgnoreCase) ||
+                acknowledgment.SourceSessionId != issuedRelay.Child.Call.SessionId ||
+                acknowledgment.SourceBindingGeneration !=
+                    issuedRelay.ReceivingReservation.ReceivingBindingGeneration ||
+                acknowledgment.ReceivingSessionId != Binding.SessionId ||
+                acknowledgment.ReceivingBindingHash != issuedRelay.SourceBindingHash ||
+                acknowledgment.ReceivingBindingGeneration != issuedRelay.SourceBindingGeneration ||
+                acknowledgment.IssuedAt < issuedRelay.IssuedAt ||
+                acknowledgment.IssuedAt >= acknowledgment.ExpiresAt ||
+                acknowledgment.IssuedAt > now ||
+                acknowledgment.ExpiresAt != issuedRelay.ReceivingReservation.OutcomeDecisionAt ||
+                issuedRelay.IssuedAt > now ||
+                acknowledgment.IssuedAt >= issuedRelay.ExpiresAt ||
+                issuedRelay.ReceivingReservation.OutcomeDecisionAt <= now)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    issuedRelay.ReceivingReservation.OutcomeDecisionAt <= now
+                        ? SidecarCapabilityErrors.Expired
+                        : SidecarCapabilityErrors.SpoofedIdentity,
+                    issuedRelay.ReceivingReservation.OutcomeDecisionAt <= now
+                        ? "The endpoint child relay outcome deadline has expired."
+                        : "The source import acknowledgment is not authorized for the endpoint child relay.");
+            }
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The source import acknowledgment is not authorized for the endpoint child relay.");
+        }
+
+        return null;
+    }
+
+    private SidecarCapabilityValidationResult? ValidateEndpointTypedActionChildImportAbortLocked(
+        SidecarEndpointTypedActionChildRelay issuedRelay,
+        SidecarEndpointTypedActionChildImportAbort abort,
+        DateTimeOffset now,
+        long expectedGeneration,
+        string expectedBindingHash)
+    {
+        try
+        {
+            if (_disconnected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Disconnected,
+                    "The receiving capability session is disconnected.");
+
+            if (_bindingGeneration != expectedGeneration ||
+                !string.Equals(
+                    Binding.Authentication.BindingHash,
+                    expectedBindingHash,
+                    StringComparison.Ordinal))
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child relay binding changed during abort.");
+
+            if (!abort.IsWellFormed ||
+                !SidecarCapabilityTransportCodec.Serialize(abort.Relay).SequenceEqual(
+                    SidecarCapabilityTransportCodec.Serialize(issuedRelay)) ||
+                abort.SourceSessionId != issuedRelay.Child.Call.SessionId ||
+                abort.SourceBindingHash != issuedRelay.SourceBindingHash ||
+                abort.SourceBindingGeneration != issuedRelay.SourceBindingGeneration ||
+                abort.ReceivingSessionId != Binding.SessionId ||
+                abort.ReceivingBindingHash != Binding.Authentication.BindingHash ||
+                abort.ReceivingBindingGeneration != _bindingGeneration ||
+                abort.IssuedAt < issuedRelay.IssuedAt ||
+                abort.IssuedAt > now ||
+                abort.IssuedAt >= issuedRelay.ReceivingReservation.OutcomeDecisionAt ||
+                abort.ExpiresAt != issuedRelay.ReceivingReservation.OutcomeDecisionAt ||
+                abort.ExpiresAt <= now)
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    abort.ExpiresAt <= now
+                        ? SidecarCapabilityErrors.Expired
+                        : SidecarCapabilityErrors.SpoofedIdentity,
+                    abort.ExpiresAt <= now
+                        ? "The endpoint child import abort has expired."
+                        : "The endpoint child import abort is not authorized for the endpoint child relay.");
+            }
+
+            if (!_endpointTypedActionChildRelaySequences.TryGetValue(
+                    issuedRelay.ReceivingReservation.ReservationId,
+                    out var sequenceState) ||
+                sequenceState.Sequence != _lastSequence ||
+                !string.Equals(
+                    sequenceState.ReplayNonce,
+                    issuedRelay.Child.Call.ReplayNonce,
+                    StringComparison.Ordinal))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The endpoint child import abort sequence is no longer pending.");
+            }
+        }
+        catch
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.SpoofedIdentity,
+                "The endpoint child import abort is not authorized for the endpoint child relay.");
+        }
+
+        return null;
+    }
+
     private void ReleaseEndpointTypedActionChildReservation(
         EndpointTypedActionChildReservationState state)
     {
@@ -3506,6 +4446,44 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             MaybeRemoveBudgetReservation(rootBudgetId);
         _inFlight = Math.Max(0, _inFlight - 1);
     }
+
+    private void CommitEndpointTypedActionChildReservationOutcome(
+        EndpointTypedActionChildReservationState state)
+    {
+        var child = state.Reservation.Child;
+        _issuedEndpointTypedActionChildReservations.Remove(state.Reservation.ReservationId);
+        _reservedNestedCalls.Remove(child.Call.CallId);
+        if (!state.UsesBudgetExtension)
+            _totalCalls = Math.Max(0, _totalCalls - 1);
+        else
+            _budgetExtensionClaims.Remove(child.Carrier.CarrierId);
+        if (_entryBudgetRoots.Remove(child.Carrier.CarrierId, out var rootBudgetId))
+            MaybeRemoveBudgetReservation(rootBudgetId);
+        _inFlight = Math.Max(0, _inFlight - 1);
+    }
+
+    private void ReleaseEndpointTypedActionChildRelaySequence(Guid reservationId)
+    {
+        if (!_endpointTypedActionChildRelaySequences.Remove(
+                reservationId,
+                out var sequenceState))
+        {
+            return;
+        }
+
+        _nonces.Remove(sequenceState.ReplayNonce);
+        if (_lastSequence == sequenceState.Sequence)
+            _lastSequence = Math.Max(0, _lastSequence - 1);
+    }
+
+    private void CommitEndpointTypedActionChildRelaySequence(Guid reservationId) =>
+        _endpointTypedActionChildRelaySequences.Remove(reservationId);
+
+    private bool HasPendingEndpointTypedActionChildOutcomeLocked(Guid capabilityId)
+        => _endpointTypedActionChildImportStates.Values.Any(state =>
+            state.Acknowledgment is not null &&
+            state.Context.CapabilityId == capabilityId &&
+            !_completedCalls.Contains(state.ReservationState.Reservation.Child.Call.CallId));
 
     private bool HasEndpointRouteRelayCallCollision(SidecarCapabilityCallIdentity call) =>
         _calls.ContainsKey(call.CallId) ||
@@ -5887,6 +6865,9 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     SidecarCapabilityErrors.Disconnected,
                     "The sidecar capability session is disconnected.");
 
+            SweepExpiredEntryContexts(now);
+            SweepCompletedEntryCarriers(now);
+
             var validation = SidecarCapabilitySessionValidator.Validate(
                 replacement,
                 _authenticate,
@@ -5919,6 +6900,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 _issuedEndpointRouteRelays.Count != 0 ||
                 _issuedEndpointTypedActionChildReservations.Count != 0 ||
                 _issuedEndpointTypedActionChildRelays.Count != 0 ||
+                _endpointTypedActionChildImportStates.Count != 0 ||
                 _endpointRouteAdmissions.Count != 0 ||
                 _endpointRouteRelayAdmissions.Count != 0 ||
                 _rootHostActionEntryStates.Count != 0 ||
@@ -6579,6 +7561,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         if (_callEntryContexts.TryGetValue(callId, out var completedContext))
         {
             RevokeNestedCarriersForParent(callId, now);
+            _rootHostActionEntryStates.Remove(completedContext.CapabilityId);
             if (_nestedCarrierIds.Remove(completedContext.CapabilityId))
                 RemoveEntryCarrier(completedContext.CapabilityId, now);
             _nestedCarrierParents.Remove(completedContext.CapabilityId);
@@ -6590,6 +7573,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         _activeEndpointRouteRelayParents.Remove(callId);
 
         _completedCalls.Add(callId);
+        FinalizeEndpointTypedActionChildImportLocked(callId, now);
         _terminalCalls.Remove(callId);
         _terminalReceipts.Remove(callId);
         _callPayloads.Remove(callId);
@@ -6620,6 +7604,28 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         foreach (var rootId in rootsToClean)
             MaybeRemoveBudgetReservation(rootId);
         _inFlight = Math.Max(0, _inFlight - 1);
+    }
+
+    private void FinalizeEndpointTypedActionChildImportLocked(
+        Guid completedCallId,
+        DateTimeOffset now)
+    {
+        foreach (var import in _endpointTypedActionChildImportStates
+            .Where(pair =>
+                pair.Value.Acknowledgment is not null &&
+                pair.Value.ReservationState.Reservation.Child.Call.CallId == completedCallId)
+            .ToArray())
+        {
+            _endpointTypedActionChildImportStates.Remove(import.Key);
+            _completedEndpointTypedActionChildImports[import.Key] =
+                new CompletedEndpointTypedActionChildImportState(
+                    CloneTransport(import.Value.Relay),
+                    CloneTransport(import.Value.Acknowledgment!),
+                    import.Value.Relay.ReceivingReservation.OutcomeDecisionAt);
+            var childCarrierId = import.Value.ReservationState.Reservation.Child.Carrier.CarrierId;
+            if (_entryBudgetRoots.Remove(childCarrierId, out var rootBudgetId))
+                MaybeRemoveBudgetReservation(rootBudgetId);
+        }
     }
 
     private int SweepExpiredEntryContexts(DateTimeOffset now)
@@ -6665,12 +7671,31 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _inFlight = Math.Max(0, _inFlight - 1);
             removed++;
         }
+
         foreach (var state in _issuedEndpointTypedActionChildReservations.Values
-            .Where(state => state.Reservation.ExpiresAt <= now)
+            .Where(state => state.Reservation.OutcomeDecisionAt <= now)
             .ToArray())
         {
-            ReleaseEndpointTypedActionChildReservation(state);
+            CommitEndpointTypedActionChildReservationOutcome(state);
             removed++;
+        }
+
+        foreach (var relay in _issuedEndpointTypedActionChildRelays.Values
+            .Where(relay => relay.ReceivingReservation.OutcomeDecisionAt <= now)
+            .ToArray())
+        {
+            var reservationId = relay.ReceivingReservation.ReservationId;
+            _issuedEndpointTypedActionChildRelays.Remove(reservationId);
+            CommitEndpointTypedActionChildRelaySequence(reservationId);
+            removed++;
+        }
+
+        foreach (var abort in _issuedEndpointTypedActionChildImportAborts
+            .Where(pair => pair.Value.ExpiresAt <= now)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _issuedEndpointTypedActionChildImportAborts.Remove(abort);
         }
         foreach (var authorityId in _issuedEndpointRouteRelays
             .Where(pair => pair.Value.ExpiresAt <= now)
@@ -6679,14 +7704,6 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         {
             _issuedEndpointRouteRelays.Remove(authorityId);
         }
-        foreach (var relayId in _issuedEndpointTypedActionChildRelays
-            .Where(pair => pair.Value.ExpiresAt <= now)
-            .Select(pair => pair.Key)
-            .ToArray())
-        {
-            _issuedEndpointTypedActionChildRelays.Remove(relayId);
-        }
-
         foreach (var admission in _endpointRouteAdmissions.Values
             .Where(state => state.Authority.ExpiresAt <= now)
             .Select(state => state.Context.CapabilityId)
@@ -6710,7 +7727,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             .Select(pair => pair.Key)
             .ToArray())
         {
-            if (_nestedCarrierStates.TryGetValue(capabilityId, out var expiredState))
+            if (!HasPendingEndpointTypedActionChildOutcomeLocked(capabilityId) &&
+                _nestedCarrierStates.TryGetValue(capabilityId, out var expiredState))
                 ReleaseNestedReservation(expiredState.Carrier.CarrierId, expiredState.Call.CallId);
             _nestedCarrierStates.Remove(capabilityId);
             RemoveEntryCarrier(capabilityId, now);
@@ -6722,7 +7740,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             .ToArray())
         {
             _nestedCarrierStates.Remove(state.Carrier.CarrierId);
-            ReleaseNestedReservation(state.Carrier.CarrierId, state.Call.CallId);
+            if (!HasPendingEndpointTypedActionChildOutcomeLocked(state.Carrier.CarrierId))
+                ReleaseNestedReservation(state.Carrier.CarrierId, state.Call.CallId);
             RemoveEntryCarrier(state.Carrier.CarrierId, now);
             removed++;
         }
@@ -7026,19 +8045,18 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 _inFlight = Math.Max(0, _inFlight - 1);
             }
         }
-        foreach (var state in _issuedEndpointTypedActionChildReservations.Values
-            .Where(state =>
-                state.Reservation.ParentEndpointContext.CapabilityId == capabilityId)
-            .ToArray())
-        {
-            ReleaseEndpointTypedActionChildReservation(state);
-        }
-        foreach (var relayId in _issuedEndpointTypedActionChildRelays
-            .Where(pair => pair.Value.SourceParentContext.CapabilityId == capabilityId)
+        var preservePendingChildOutcome = HasPendingEndpointTypedActionChildOutcomeLocked(capabilityId);
+        foreach (var importId in _endpointTypedActionChildImportStates
+            .Where(pair =>
+                pair.Value.Context.CapabilityId == capabilityId ||
+                pair.Value.ChildRelay.Carrier.CarrierId == capabilityId)
             .Select(pair => pair.Key)
             .ToArray())
         {
-            _issuedEndpointTypedActionChildRelays.Remove(relayId);
+            if (!_endpointTypedActionChildImportStates.TryGetValue(importId, out var importState) ||
+                importState.Acknowledgment is null ||
+                _completedCalls.Contains(importState.ReservationState.Reservation.Child.Call.CallId))
+                _endpointTypedActionChildImportStates.Remove(importId);
         }
         foreach (var callId in _activeEndpointRouteAuthorities
             .Where(pair => pair.Value.HostActionContext.CapabilityId == capabilityId)
@@ -7056,6 +8074,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         }
         _issuedEntryContexts.Remove(capabilityId);
         _activeEntryContexts.Remove(capabilityId);
+        _nestedCarrierStates.Remove(capabilityId);
         if (_rootHostActionEntryStates.Remove(capabilityId, out var rootState))
         {
             if (_reservedNestedCalls.Remove(rootState.Relay.PeerCall.CallId))
@@ -7080,7 +8099,8 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         }
 
         _consumedEntryCarriers.Remove(capabilityId);
-        if (_entryBudgetRoots.Remove(capabilityId, out var budgetRootId))
+        if (!preservePendingChildOutcome &&
+            _entryBudgetRoots.Remove(capabilityId, out var budgetRootId))
         {
             if (_budgetExtensionClaims.Remove(capabilityId, out var claimedRootId) &&
                 _entryBudgetReservations.TryGetValue(claimedRootId, out var reservation))
@@ -7227,6 +8247,14 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
 
     private void SweepCompletedEntryCarriers(DateTimeOffset now)
     {
+        foreach (var reservationId in _completedEndpointTypedActionChildImports
+            .Where(pair => pair.Value.RetainUntil <= now)
+            .Select(pair => pair.Key)
+            .ToArray())
+        {
+            _completedEndpointTypedActionChildImports.Remove(reservationId);
+        }
+
         foreach (var capabilityId in _completedEntryCarriers
             .Where(pair => pair.Value.RetainUntil <= now)
             .Select(pair => pair.Key)
@@ -7453,6 +8481,10 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             _issuedEndpointRouteRelays.Clear();
             _issuedEndpointTypedActionChildReservations.Clear();
             _issuedEndpointTypedActionChildRelays.Clear();
+            _endpointTypedActionChildImportStates.Clear();
+            _completedEndpointTypedActionChildImports.Clear();
+            _issuedEndpointTypedActionChildImportAborts.Clear();
+            _endpointTypedActionChildRelaySequences.Clear();
             _endpointRouteAdmissions.Clear();
             _endpointRouteRelayAdmissions.Clear();
             _activeEndpointRouteAuthorities.Clear();
@@ -7925,6 +8957,8 @@ public sealed record SidecarEndpointTypedActionChildReservation(
 {
     public HostEndpointRouteAuthority? ParentRouteAuthority { get; init; }
 
+    public DateTimeOffset OutcomeDecisionAt { get; init; }
+
     public bool IsWellFormed =>
         ReservationId != Guid.Empty &&
         ParentEndpointCall is not null &&
@@ -7952,6 +8986,7 @@ public sealed record SidecarEndpointTypedActionChildReservation(
         ParentRouteAuthority.InvocationId == ParentEndpointContext.InvocationId &&
         ReceivingBindingGeneration > 0 &&
         IssuedAt <= ExpiresAt &&
+        OutcomeDecisionAt > ExpiresAt &&
         !string.IsNullOrWhiteSpace(CanonicalBindingHash) &&
         !string.IsNullOrWhiteSpace(Proof);
 }
@@ -7969,6 +9004,8 @@ public sealed record SidecarEndpointTypedActionChildRelay(
     string Proof)
 {
     public SidecarNestedHostActionEntryRelay Child => ReceivingReservation.Child;
+
+    public string SourceBindingHash { get; init; } = string.Empty;
 
     public bool IsWellFormed =>
         ParentRouteAuthority is not null &&
@@ -7988,9 +9025,102 @@ public sealed record SidecarEndpointTypedActionChildRelay(
         ReceivingReservation.ParentEndpointCall.IsValid &&
         ReceivingReservation.ParentEndpointCall.Capability == SidecarCapabilityKind.Action &&
         SourceBindingGeneration > 0 &&
+        !string.IsNullOrWhiteSpace(SourceBindingHash) &&
         IssuedAt <= ExpiresAt &&
         !string.IsNullOrWhiteSpace(CanonicalBindingHash) &&
         !string.IsNullOrWhiteSpace(Proof);
+}
+
+/// <summary>Authenticated evidence that a source session imported one endpoint child relay.</summary>
+public sealed record SidecarEndpointTypedActionChildImportAcknowledgment(
+    SidecarEndpointTypedActionChildRelay Relay,
+    Guid SourceSessionId,
+    string SourceBindingHash,
+    long SourceBindingGeneration,
+    Guid ReceivingSessionId,
+    string ReceivingBindingHash,
+    long ReceivingBindingGeneration,
+    DateTimeOffset IssuedAt,
+    DateTimeOffset ExpiresAt,
+    string CanonicalBindingHash,
+    string Proof)
+{
+    public bool IsWellFormed
+    {
+        get
+        {
+            try
+            {
+                return Relay is not null &&
+                    Relay.IsWellFormed &&
+                    SourceSessionId != Guid.Empty &&
+                    SourceSessionId == Relay.Child.Call.SessionId &&
+                    !string.IsNullOrWhiteSpace(SourceBindingHash) &&
+                    SourceBindingGeneration > 0 &&
+                    SourceBindingGeneration == Relay.ReceivingReservation.ReceivingBindingGeneration &&
+                    ReceivingSessionId != Guid.Empty &&
+                    ReceivingSessionId == Relay.SourceParentCall.SessionId &&
+                    !string.IsNullOrWhiteSpace(ReceivingBindingHash) &&
+                    ReceivingBindingGeneration > 0 &&
+                    ReceivingBindingGeneration == Relay.SourceBindingGeneration &&
+                    IssuedAt >= Relay.IssuedAt &&
+                    IssuedAt <= ExpiresAt &&
+                    ExpiresAt == Relay.ReceivingReservation.OutcomeDecisionAt &&
+                    !string.IsNullOrWhiteSpace(CanonicalBindingHash) &&
+                    !string.IsNullOrWhiteSpace(Proof);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+}
+
+/// <summary>Authenticated evidence that a source session abandoned one endpoint child import.</summary>
+public sealed record SidecarEndpointTypedActionChildImportAbort(
+    SidecarEndpointTypedActionChildRelay Relay,
+    Guid SourceSessionId,
+    string SourceBindingHash,
+    long SourceBindingGeneration,
+    Guid ReceivingSessionId,
+    string ReceivingBindingHash,
+    long ReceivingBindingGeneration,
+    DateTimeOffset IssuedAt,
+    DateTimeOffset ExpiresAt,
+    string CanonicalBindingHash,
+    string Proof)
+{
+    public bool IsWellFormed
+    {
+        get
+        {
+            try
+            {
+                return Relay is not null &&
+                    Relay.IsWellFormed &&
+                    SourceSessionId != Guid.Empty &&
+                    SourceSessionId == Relay.Child.Call.SessionId &&
+                    !string.IsNullOrWhiteSpace(SourceBindingHash) &&
+                    SourceBindingGeneration > 0 &&
+                    SourceBindingGeneration == Relay.ReceivingReservation.ReceivingBindingGeneration &&
+                    ReceivingSessionId != Guid.Empty &&
+                    ReceivingSessionId == Relay.SourceParentCall.SessionId &&
+                    !string.IsNullOrWhiteSpace(ReceivingBindingHash) &&
+                    ReceivingBindingGeneration > 0 &&
+                    ReceivingBindingGeneration == Relay.SourceBindingGeneration &&
+                    IssuedAt >= Relay.IssuedAt &&
+                    IssuedAt < Relay.ReceivingReservation.OutcomeDecisionAt &&
+                    ExpiresAt == Relay.ReceivingReservation.OutcomeDecisionAt &&
+                    !string.IsNullOrWhiteSpace(CanonicalBindingHash) &&
+                    !string.IsNullOrWhiteSpace(Proof);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
 }
 
 public static class SidecarEndpointTypedActionChildValidation
@@ -8018,6 +9148,34 @@ public static class SidecarEndpointTypedActionChildValidation
         };
         return SidecarCapabilityTransportCodec.ComputeSha256(
             SidecarCapabilityTransportCodec.Serialize(canonical));
+    }
+
+    public static string ComputeImportAcknowledgmentHash(
+        SidecarEndpointTypedActionChildImportAcknowledgment acknowledgment)
+    {
+        ArgumentNullException.ThrowIfNull(acknowledgment);
+        var canonical = acknowledgment with
+        {
+            CanonicalBindingHash = string.Empty,
+            Proof = string.Empty,
+        };
+        return SidecarCapabilityTransportCodec.ComputeSha256(
+            SidecarCapabilityTransportCodec.Serialize(canonical));
+    }
+
+    public static string ComputeImportAbortHash(
+        SidecarEndpointTypedActionChildImportAbort abort)
+    {
+        ArgumentNullException.ThrowIfNull(abort);
+        var canonical = abort with
+        {
+            CanonicalBindingHash = string.Empty,
+            Proof = string.Empty,
+        };
+        return SidecarCapabilityTransportCodec.ComputeSha256(
+            Encoding.UTF8.GetBytes("endpoint-child-import-abort\0")
+                .Concat(SidecarCapabilityTransportCodec.Serialize(canonical))
+                .ToArray());
     }
 }
 
