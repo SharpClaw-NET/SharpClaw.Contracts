@@ -1270,6 +1270,7 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             {
                 InvocationContentHash = request.InvocationContentHash,
                 InvocationByteLength = request.InvocationByteLength,
+                RouteValues = request.RouteValues,
             };
             try
             {

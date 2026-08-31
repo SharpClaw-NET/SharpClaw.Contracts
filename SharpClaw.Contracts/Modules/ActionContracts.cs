@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -398,6 +399,9 @@ public sealed record HostEndpointRouteRequest(
     IReadOnlyDictionary<string, string[]> Query,
     byte[] Body)
 {
+    public IReadOnlyDictionary<string, string[]> RouteValues { get; init; } =
+        ImmutableDictionary<string, string[]>.Empty;
+
     public string ContentHash =>
         Body is null ? string.Empty : Convert.ToHexString(SHA256.HashData(Body));
 
@@ -423,6 +427,7 @@ public sealed record HostEndpointRouteRequest(
                 Route is not null &&
                 Route.IsWellFormed &&
                 string.Equals(Route.HandlerIdentity, Invocation.Endpoint, StringComparison.Ordinal) &&
+                HostEndpointRouteAuthorityValidator.IsRouteValueMetadataWellFormed(RouteValues) &&
                 HostEndpointRouteAuthorityValidator.IsHeaderMetadataWellFormed(Headers) &&
                 HostEndpointRouteAuthorityValidator.IsQueryMetadataWellFormed(Query) &&
                 Body is not null;
@@ -456,6 +461,9 @@ public sealed record HostEndpointRouteAuthority(
     string CanonicalBindingHash,
     string Proof)
 {
+    public IReadOnlyDictionary<string, string[]> RouteValues { get; init; } =
+        ImmutableDictionary<string, string[]>.Empty;
+
     public string InvocationContentHash { get; init; } = string.Empty;
 
     public int InvocationByteLength { get; init; } = -1;
@@ -467,6 +475,7 @@ public sealed record HostEndpointRouteAuthority(
         InvocationId != Guid.Empty &&
         Route is not null &&
         Route.IsWellFormed &&
+        HostEndpointRouteAuthorityValidator.IsRouteValueMetadataWellFormed(RouteValues) &&
         HostEndpointRouteAuthorityValidator.IsHeaderMetadataWellFormed(Headers) &&
         HostEndpointRouteAuthorityValidator.IsQueryMetadataWellFormed(Query) &&
         !string.IsNullOrWhiteSpace(RequestContentHash) &&
@@ -489,6 +498,8 @@ public static class HostEndpointRouteAuthorityValidator
             Call = Convert.ToBase64String(SidecarCapabilityTransportCodec.Serialize(authority.Call)),
             authority.InvocationId,
             Route = Convert.ToBase64String(SidecarCapabilityTransportCodec.Serialize(authority.Route)),
+            RouteValues = Convert.ToBase64String(
+                SerializeMetadata(authority.RouteValues, caseInsensitiveKeys: false)),
             Headers = Convert.ToBase64String(SerializeMetadata(authority.Headers, caseInsensitiveKeys: true)),
             Query = Convert.ToBase64String(SerializeMetadata(authority.Query, caseInsensitiveKeys: false)),
             authority.RequestContentHash,
@@ -546,6 +557,10 @@ public static class HostEndpointRouteAuthorityValidator
 
         if (authority.InvocationId != request.Invocation.InvocationId ||
             !SameRoute(authority.Route, request.Route) ||
+            !SameMetadata(
+                authority.RouteValues,
+                request.RouteValues,
+                caseInsensitiveKeys: false) ||
             !SameMetadata(authority.Headers, request.Headers, caseInsensitiveKeys: true) ||
             !SameMetadata(authority.Query, request.Query, caseInsensitiveKeys: false) ||
             !string.Equals(
@@ -603,6 +618,18 @@ public static class HostEndpointRouteAuthorityValidator
             validateHeaderNames: false,
             validateHeaderValues: false);
 
+    internal static bool IsRouteValueMetadataWellFormed(
+        IReadOnlyDictionary<string, string[]>? metadata) =>
+        IsMetadataWellFormed(
+            metadata,
+            StringComparer.Ordinal,
+            validateHeaderNames: false,
+            validateHeaderValues: false) &&
+        metadata!.All(pair =>
+            pair.Key == pair.Key.Trim() &&
+            pair.Value.Length == 1 &&
+            pair.Value[0] == pair.Value[0].Trim());
+
     private static bool IsMetadataWellFormed(
         IReadOnlyDictionary<string, string[]>? metadata,
         StringComparer keyComparer,
@@ -647,6 +674,7 @@ public static class HostEndpointRouteAuthorityValidator
         if (request is null || limits is null || !limits.IsValid ||
             request.Body is null ||
             request.Body.Length > limits.ActionInputBytes ||
+            !IsMetadataWithinLimits(request.RouteValues) ||
             !IsMetadataWithinLimits(request.Headers) ||
             !IsMetadataWithinLimits(request.Query))
             return false;

@@ -832,6 +832,29 @@ public sealed class SidecarCapabilityTransportTests
                 authority!,
                 fixture.Now,
                 Authenticate).Accepted);
+
+        var changedRouteValue = request with
+        {
+            RouteValues = new Dictionary<string, string[]>(StringComparer.Ordinal)
+            {
+                ["Id"] = request.RouteValues["id"],
+            },
+        };
+        Assert.False(
+            HostEndpointRouteAuthorityValidator.Validate(
+                changedRouteValue,
+                authority!,
+                fixture.Now,
+                Authenticate).Accepted);
+
+        var multipleRouteValues = request with
+        {
+            RouteValues = new Dictionary<string, string[]>(StringComparer.Ordinal)
+            {
+                ["id"] = ["one", "two"],
+            },
+        };
+        Assert.False(multipleRouteValues.IsWellFormed(fixture.Now));
     }
 
     [Theory]
@@ -3988,6 +4011,7 @@ public sealed class SidecarCapabilityTransportTests
     [Theory]
     [InlineData("roles")]
     [InlineData("features")]
+    [InlineData("route-values")]
     [InlineData("headers")]
     [InlineData("query")]
     public void Endpoint_route_authority_signer_cannot_mutate_shared_input(string mutation)
@@ -4031,6 +4055,9 @@ public sealed class SidecarCapabilityTransportTests
                                 1,
                                 JsonDocument.Parse("{}").RootElement.Clone()));
                         break;
+                    case "route-values":
+                        authority.RouteValues["id"][0] = "mutated";
+                        break;
                     case "headers":
                         authority.Headers["x-request"][0] = "mutated";
                         break;
@@ -4058,6 +4085,7 @@ public sealed class SidecarCapabilityTransportTests
     [Theory]
     [InlineData("roles")]
     [InlineData("features")]
+    [InlineData("route-values")]
     [InlineData("headers")]
     [InlineData("query")]
     [InlineData("body")]
@@ -4113,6 +4141,9 @@ public sealed class SidecarCapabilityTransportTests
                                 "module-a",
                                 1,
                                 JsonDocument.Parse("{}").RootElement.Clone()));
+                        break;
+                    case "route-values":
+                        relay.Request.RouteValues["id"][0] = "mutated";
                         break;
                     case "headers":
                         relay.Request.Headers["x-request"][0] = "mutated";
@@ -4278,6 +4309,7 @@ public sealed class SidecarCapabilityTransportTests
     [Theory]
     [InlineData("invocation")]
     [InlineData("route")]
+    [InlineData("route-values")]
     [InlineData("headers")]
     [InlineData("query")]
     [InlineData("metadata-array")]
@@ -4347,6 +4379,7 @@ public sealed class SidecarCapabilityTransportTests
     [InlineData("path")]
     [InlineData("method")]
     [InlineData("transport")]
+    [InlineData("route-values")]
     [InlineData("headers")]
     [InlineData("query")]
     [InlineData("body")]
@@ -4403,6 +4436,18 @@ public sealed class SidecarCapabilityTransportTests
                 break;
             case "transport":
                 mutated = original with { Request = original.Request with { Route = original.Request.Route with { Transport = HostEndpointTransport.WebSocket } } };
+                break;
+            case "route-values":
+                mutated = original with
+                {
+                    Request = original.Request with
+                    {
+                        RouteValues = new Dictionary<string, string[]>(original.Request.RouteValues)
+                        {
+                            ["id"] = ["changed"],
+                        },
+                    },
+                };
                 break;
             case "headers":
                 mutated = original with { Request = original.Request with { Headers = new Dictionary<string, string[]>(original.Request.Headers) { ["x-request"] = ["changed"] } } };
@@ -5373,6 +5418,7 @@ public sealed class SidecarCapabilityTransportTests
     [InlineData("path")]
     [InlineData("method")]
     [InlineData("transport")]
+    [InlineData("route-values")]
     [InlineData("headers")]
     [InlineData("query")]
     [InlineData("body")]
@@ -5442,6 +5488,15 @@ public sealed class SidecarCapabilityTransportTests
                 mutatedRequest = request with
                 {
                     Route = request.Route with { Transport = HostEndpointTransport.WebSocket },
+                };
+                break;
+            case "route-values":
+                mutatedRequest = request with
+                {
+                    RouteValues = new Dictionary<string, string[]>(request.RouteValues)
+                    {
+                        ["id"] = ["changed"],
+                    },
                 };
                 break;
             case "headers":
@@ -14635,7 +14690,13 @@ public sealed class SidecarCapabilityTransportTests
             {
                 ["tag"] = ["one", "two"],
             },
-            [0, 255, 1, 2]);
+            [0, 255, 1, 2])
+        {
+            RouteValues = new Dictionary<string, string[]>(StringComparer.Ordinal)
+            {
+                ["id"] = ["71e8f8f6-b8f3-4aaf-bcc1-c0879b0f0eb2"],
+            },
+        };
 
     private static HostEndpointRouteRequest MalformedEndpointRouteRequest(
         HostEndpointRouteRequest request,
@@ -14646,6 +14707,7 @@ public sealed class SidecarCapabilityTransportTests
                 Invocation = request.Invocation with { Endpoint = null! },
             },
             "route" => request with { Route = null! },
+            "route-values" => request with { RouteValues = null! },
             "headers" => request with { Headers = null! },
             "query" => request with { Query = null! },
             "metadata-array" => request with
