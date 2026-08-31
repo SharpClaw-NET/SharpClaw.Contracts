@@ -97,7 +97,11 @@ public interface IChatLifecycleBuilder
 
 public interface IEndpointContributionBuilder
 {
-    void Add<TContribution>();
+    void AddHttp<THandler>(ModuleEndpointRouteDescriptor descriptor)
+        where THandler : class, IModuleHttpEndpointHandler;
+
+    void AddWebSocket<THandler>(ModuleEndpointRouteDescriptor descriptor)
+        where THandler : class, IModuleWebSocketEndpointHandler;
 }
 
 public interface ICliContributionBuilder
