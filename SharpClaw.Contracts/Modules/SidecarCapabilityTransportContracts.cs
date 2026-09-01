@@ -568,33 +568,76 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     out var receivingParentCall,
                     out var parentContext,
                     out var activeCarrier,
-                    out var activeRoot) ||
-                authority.CarrierId != activeCarrier!.CapabilityId ||
-                (crossSidecarState is null
-                    ? rootPeerRelayState is null
-                        ? !MatchesCarrierAuthority(authority.CarrierAuthority, activeCarrier)
-                        : !MatchesMirroredCarrierAuthority(
-                            authority.CarrierAuthority,
-                            activeCarrier,
-                            activeCarrier.IssuedAt,
-                            activeCarrier.ExpiresAt,
-                            authority.IssuedAt)
-                    : !MatchesMirroredCarrierAuthority(
-                        authority.CarrierAuthority,
-                        activeCarrier,
-                        crossSidecarState.Carrier.Authority.IssuedAt,
-                        crossSidecarState.Carrier.ExpiresAt,
-                        authority.IssuedAt)) ||
-                !HostActionEntryAuthorityValidator.SameContext(authority.ParentContext, parentContext!) ||
-                activeRoot != authority.RootBudgetId ||
-                crossSidecarState is not null &&
-                !MatchesCrossSidecarStorageContinuationParentReceipt(
+                    out var activeRoot))
+            {
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.SpoofedIdentity,
+                    "The storage continuation authority does not match the active HostEntry carrier.");
+            }
+
+            var ordinaryParent = crossSidecarState is null &&
+                rootPeerRelayState is null &&
+                authority.CarrierId == activeCarrier!.CapabilityId &&
+                MatchesCarrierAuthority(authority.CarrierAuthority, activeCarrier) &&
+                HostActionEntryAuthorityValidator.SameContext(
+                    authority.ParentContext,
+                    parentContext!) &&
+                activeRoot == authority.RootBudgetId &&
+                MatchesDirectStorageContinuationParentReceipt(
+                    authority,
+                    receivingParentCall!);
+            var directRootParent = crossSidecarState is null &&
+                rootPeerRelayState is null &&
+                authority.IssuerCall == authority.ParentCall &&
+                receivingParentCall == authority.ParentCall &&
+                authority.CarrierId == activeCarrier!.CapabilityId &&
+                MatchesMirroredCarrierAuthority(
+                    authority.CarrierAuthority,
+                    activeCarrier,
+                    activeCarrier.IssuedAt,
+                    activeCarrier.ExpiresAt,
+                    authority.IssuedAt) &&
+                HostActionEntryAuthorityValidator.SameContextIgnoringPayload(
+                    authority.ParentContext,
+                    parentContext!) &&
+                activeRoot == authority.RootBudgetId &&
+                MatchesDirectStorageContinuationParentReceipt(
+                    authority,
+                    receivingParentCall!);
+            var crossSidecarParent = crossSidecarState is not null &&
+                authority.CarrierId == activeCarrier!.CapabilityId &&
+                MatchesMirroredCarrierAuthority(
+                    authority.CarrierAuthority,
+                    activeCarrier,
+                    crossSidecarState.Carrier.Authority.IssuedAt,
+                    crossSidecarState.Carrier.ExpiresAt,
+                    authority.IssuedAt) &&
+                HostActionEntryAuthorityValidator.SameContext(
+                    authority.ParentContext,
+                    parentContext!) &&
+                activeRoot == authority.RootBudgetId &&
+                MatchesCrossSidecarStorageContinuationParentReceipt(
                     crossSidecarState,
-                    receivingParentCall!) ||
-                rootPeerRelayState is not null &&
-                !MatchesRootRelayStorageContinuationParentReceipt(
+                    receivingParentCall!);
+            var rootPeerParent = rootPeerRelayState is not null &&
+                authority.CarrierId == activeCarrier!.CapabilityId &&
+                MatchesMirroredCarrierAuthority(
+                    authority.CarrierAuthority,
+                    activeCarrier,
+                    activeCarrier.IssuedAt,
+                    activeCarrier.ExpiresAt,
+                    authority.IssuedAt) &&
+                HostActionEntryAuthorityValidator.SameContext(
+                    authority.ParentContext,
+                    parentContext!) &&
+                activeRoot == authority.RootBudgetId &&
+                MatchesRootRelayStorageContinuationParentReceipt(
                     rootPeerRelayState,
-                    receivingParentCall!))
+                    receivingParentCall!);
+            if (!ordinaryParent &&
+                !directRootParent &&
+                !crossSidecarParent &&
+                !rootPeerParent)
             {
                 return SidecarCapabilityValidationResult.Reject(
                     SidecarCapabilityErrors.SpoofedIdentity,
@@ -815,6 +858,35 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 receipt.ContentHash,
                 rootState.Relay.Action.ContentHash,
                 StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool MatchesDirectStorageContinuationParentReceipt(
+        SidecarHostEntryStorageContinuationAuthority authority,
+        SidecarCapabilityCallIdentity receivingParentCall)
+    {
+        var lineage = authority.ParentContext.Contribution?.Lineage;
+        if (lineage is null ||
+            !_terminalReceipts.TryGetValue(receivingParentCall.CallId, out var receipt) ||
+            !_callPayloads.TryGetValue(receivingParentCall.CallId, out var activePayload) ||
+            activePayload is null)
+        {
+            return false;
+        }
+
+        return receipt.ActionKey == lineage.ActionKey &&
+            receipt.ActionVersion == lineage.ActionVersion &&
+            receipt.CallId == receivingParentCall.CallId &&
+            receipt.Attempt == authority.ParentContext.Attempt &&
+            string.Equals(
+                receipt.ContentHash,
+                activePayload.ContentHash,
+                StringComparison.OrdinalIgnoreCase) &&
+            (!lineage.IsPayloadBound ||
+             string.Equals(
+                 lineage.PayloadContentHash,
+                 activePayload.ContentHash,
+                 StringComparison.OrdinalIgnoreCase) &&
+             lineage.PayloadByteLength == activePayload.ByteLength);
     }
 
     private bool MatchesCrossSidecarStorageContinuationParentReceipt(

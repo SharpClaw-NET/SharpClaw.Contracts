@@ -9061,7 +9061,7 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
-    public async Task HostEntryStorageContinuationUsesAuthenticatedSequenceNineAuthorityOnce()
+    public async Task HostEntryStorageContinuationAcceptsMirroredUnboundParentWithActiveReceiptOnce()
     {
         var fixture = CreateFixture(
             maxInFlight: 4,
@@ -9137,12 +9137,13 @@ public sealed class SidecarCapabilityTransportTests
             PayloadType("agent_job_imports.result"),
             Cancellation(fixture),
             continuationCall.Deadline);
+        var continuationNow = fixture.Now.AddMilliseconds(1);
         var issue = fixture.Session.IssueHostEntryStorageContinuation(
             fixture.Session,
             parentCall,
             parentCall,
             continuationRequest,
-            fixture.Now,
+            continuationNow,
             (_, hash) => hash,
             out var authority);
         Assert.True(issue.Accepted, issue.Message);
@@ -9150,12 +9151,68 @@ public sealed class SidecarCapabilityTransportTests
 
         var wireAuthority = SidecarCapabilityTransportCodec.Deserialize<SidecarHostEntryStorageContinuationAuthority>(
             SidecarCapabilityTransportCodec.Serialize(authority));
+        Assert.True(wireAuthority.ParentContext.Contribution!.Lineage.IsPayloadBound);
+        wireAuthority = wireAuthority with
+        {
+            CarrierAuthority = wireAuthority.CarrierAuthority with
+            {
+                IssuedAt = wireAuthority.IssuedAt,
+            },
+            ParentContext = wireAuthority.ParentContext with
+            {
+                Contribution = wireAuthority.ParentContext.Contribution! with
+                {
+                    Lineage = wireAuthority.ParentContext.Contribution.Lineage with
+                    {
+                        PayloadContentHash = null,
+                        PayloadByteLength = null,
+                    },
+                },
+            },
+        };
+        wireAuthority = wireAuthority with
+        {
+            CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(
+                wireAuthority),
+        };
+        wireAuthority = wireAuthority with { Proof = wireAuthority.CanonicalBindingHash };
+        Assert.False(wireAuthority.ParentContext.Contribution!.Lineage.IsPayloadBound);
         var requestWithAuthority = continuationRequest with
         {
             HostEntryContinuationAuthority = wireAuthority,
         };
 
-        Assert.True(fixture.Session.ImportHostEntryStorageContinuationAuthority(wireAuthority, fixture.Now).Accepted);
+        var changedDescriptorAuthority = wireAuthority with
+        {
+            ParentContext = wireAuthority.ParentContext with
+            {
+                Contribution = wireAuthority.ParentContext.Contribution! with
+                {
+                    Lineage = wireAuthority.ParentContext.Contribution.Lineage with
+                    {
+                        ActionKey = new SharpClawActionKey("storage.changed"),
+                    },
+                },
+            },
+        };
+        changedDescriptorAuthority = changedDescriptorAuthority with
+        {
+            CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(
+                changedDescriptorAuthority),
+        };
+        changedDescriptorAuthority = changedDescriptorAuthority with
+        {
+            Proof = changedDescriptorAuthority.CanonicalBindingHash,
+        };
+        Assert.Equal(
+            SidecarCapabilityErrors.SpoofedIdentity,
+            fixture.Session.ImportHostEntryStorageContinuationAuthority(
+                changedDescriptorAuthority,
+                continuationNow).Code);
+
+        Assert.True(fixture.Session.ImportHostEntryStorageContinuationAuthority(
+            wireAuthority,
+            continuationNow).Accepted);
 
         var changedAuthority = wireAuthority with { RootBudgetId = Guid.NewGuid() };
         Assert.Equal(
@@ -9163,14 +9220,14 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Session.BeginStorageContinuationCall(
                 requestWithAuthority with { HostEntryContinuationAuthority = changedAuthority },
                 continuationPayload.ByteLength,
-                fixture.Now,
+                continuationNow,
                 out _).Code);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             fixture.Session.BeginStorageContinuationCall(
                 requestWithAuthority with { RequestPayload = Payload("agent_job_imports.request", new { jobId = "job-2" }) },
                 continuationPayload.ByteLength,
-                fixture.Now,
+                continuationNow,
                 out _).Code);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
@@ -9180,7 +9237,7 @@ public sealed class SidecarCapabilityTransportTests
                     Cancellation = requestWithAuthority.Cancellation with { AuthorityHash = "changed-cancellation" },
                 },
                 continuationPayload.ByteLength,
-                fixture.Now,
+                continuationNow,
                 out _).Code);
 
         var concurrent = await Task.WhenAll(
@@ -9189,7 +9246,7 @@ public sealed class SidecarCapabilityTransportTests
                 var result = fixture.Session.BeginStorageContinuationCall(
                     requestWithAuthority,
                     continuationPayload.ByteLength,
-                    fixture.Now,
+                    continuationNow,
                     out var context);
                 return (result, context);
             }),
@@ -9198,7 +9255,7 @@ public sealed class SidecarCapabilityTransportTests
                 var result = fixture.Session.BeginStorageContinuationCall(
                     requestWithAuthority,
                     continuationPayload.ByteLength,
-                    fixture.Now,
+                    continuationNow,
                     out var context);
                 return (result, context);
             }));
@@ -9210,13 +9267,89 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Session.BeginStorageContinuationCall(
                 requestWithAuthority,
                 continuationPayload.ByteLength,
-                fixture.Now,
+                continuationNow,
                 out _).Code);
         Assert.Equal(
             SidecarCapabilityErrors.InvalidBinding,
             fixture.Session.CompleteCall(parentCall.CallId, 1).Code);
         Assert.True(fixture.Session.CompleteCall(continuationCall.CallId, 0).Accepted);
         Assert.True(fixture.Session.CompleteCall(parentCall.CallId, 1).Accepted);
+    }
+
+    [Fact]
+    public void HostEntryStorageContinuationRejectsReceiptForDifferentActivePayload()
+    {
+        var fixture = CreateFixture(
+            maxInFlight: 2,
+            maxCalls: 1,
+            authenticateStorageContinuationAuthority: (authority, hash) =>
+                hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority));
+        var parentCall = ActionCall(fixture, 1, "storage-receipt-parent");
+        var parentDescriptor = NestedDescriptor("storage.receipt.parent", "storage.receipt.input");
+        var parentContext = IssueContext(
+            fixture,
+            new RequestPrincipal("storage-receipt-caller"),
+            HostActionEntryIngress.CrossModule,
+            lineage: new HostActionEntryLineage(
+                parentDescriptor.Key,
+                parentDescriptor.Version,
+                parentDescriptor.DescriptorHash,
+                parentDescriptor.InputTypeIdentity,
+                parentDescriptor.InputSchemaVersion,
+                parentDescriptor.InputSchemaHash,
+                null,
+                null));
+        var parentAction = Payload(parentDescriptor.InputTypeIdentity, new { value = 1 });
+        ActivateContext(fixture, parentContext);
+        Assert.True(fixture.Session.BeginCall(
+            parentCall,
+            SidecarCapabilityKind.Action,
+            parentAction,
+            parentAction.ByteLength,
+            fixture.Now,
+            parentContext).Accepted);
+        Assert.True(fixture.Session.RecordTerminal(
+            parentCall.CallId,
+            Guid.NewGuid(),
+            new SidecarTerminalReceipt(
+                "storage-receipt-mismatch",
+                parentDescriptor.Key,
+                parentDescriptor.Version,
+                parentCall.CallId,
+                1,
+                "storage-receipt-scope",
+                Payload(parentDescriptor.InputTypeIdentity, new { value = 2 }).ContentHash)).Accepted);
+
+        var storageCall = fixture.Call with
+        {
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "storage-receipt-continuation",
+            Sequence = 2,
+            Deadline = parentCall.Deadline,
+        };
+        var storagePayload = Payload("storage.receipt.request", new { value = 3 });
+        var storageRequest = SidecarStorageCapabilityRequest.Invoke(
+            storageCall,
+            fixture.Binding.ModuleId,
+            "storage_receipt/get",
+            storagePayload,
+            PayloadType("storage.receipt.result"),
+            Cancellation(fixture),
+            storageCall.Deadline);
+        Assert.True(fixture.Session.IssueHostEntryStorageContinuation(
+            fixture.Session,
+            parentCall,
+            parentCall,
+            storageRequest,
+            fixture.Now,
+            (_, hash) => hash,
+            out var authority).Accepted);
+        Assert.NotNull(authority);
+
+        var import = fixture.Session.ImportHostEntryStorageContinuationAuthority(
+            authority!,
+            fixture.Now);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, import.Code);
     }
 
     [Fact]
