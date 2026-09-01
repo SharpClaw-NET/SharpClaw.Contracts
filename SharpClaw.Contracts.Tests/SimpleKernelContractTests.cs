@@ -798,6 +798,7 @@ public sealed class SimpleKernelContractTests
             HasIrreversibleEffects: false,
             new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "demo"),
             null,
+            TimeSpan.FromSeconds(30),
             [ActionSafePoint.BeforeTerminal],
             ContractVersionRange.Exact(1));
         var discovery = new SidecarDiscoveryEnvelope(
@@ -855,6 +856,65 @@ public sealed class SimpleKernelContractTests
         Assert.DoesNotContain(
             typeof(SidecarDiscoveryEnvelope).GetProperties(),
             property => property.Name.Contains("Approval", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void SerializedExternalDescriptorPreservesTypedIdentityAndRejectsChangedSemantics()
+    {
+        var input = new JsonSchemaReference("neutral.input", 1, "neutral-input-hash");
+        var result = new JsonSchemaReference("neutral.result", 1, "neutral-result-hash");
+        var descriptor = new ActionDescriptor<string, string>(
+            new SharpClawActionKey("neutral.external"),
+            2,
+            "neutral",
+            ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel,
+            ContainsSensitiveData: false,
+            HasIrreversibleEffects: true,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "neutral"),
+            null,
+            TimeSpan.FromSeconds(15))
+        {
+            InputSchema = input,
+            ResultSchema = result,
+            SafePoints = [ActionSafePoint.BeforeTerminal],
+        };
+        var identity = new SidecarActionDescriptorIdentity(
+            descriptor.Key,
+            descriptor.Version,
+            descriptor.Category,
+            typeof(string).AssemblyQualifiedName!,
+            input.ContentHash!,
+            input.Version,
+            typeof(string).AssemblyQualifiedName!,
+            result.ContentHash!,
+            result.Version,
+            HostActionEntryAuthorityValidator.ComputeDescriptorHash(descriptor));
+        var definition = new SidecarActionDefinition(
+            descriptor.Key,
+            descriptor.Version,
+            descriptor.Category,
+            input,
+            result,
+            descriptor.Capabilities,
+            descriptor.ContainsSensitiveData,
+            descriptor.HasIrreversibleEffects,
+            descriptor.RepeatPolicy,
+            descriptor.ContinuationPolicy,
+            descriptor.DefaultTimeout,
+            descriptor.SafePoints,
+            descriptor.ProtocolVersionRange);
+
+        Assert.True(
+            SidecarExternalActionDispatchAuthorityValidator.DescriptorMatchesDefinition(
+                identity,
+                definition));
+        Assert.Equal(
+            identity.DescriptorHash,
+            HostActionEntryAuthorityValidator.ComputeDescriptorHash(definition, identity));
+        Assert.False(
+            SidecarExternalActionDispatchAuthorityValidator.DescriptorMatchesDefinition(
+                identity,
+                definition with { HasIrreversibleEffects = false }));
     }
 
     [Fact]
@@ -1033,6 +1093,7 @@ public sealed class SimpleKernelContractTests
             HasIrreversibleEffects: false,
             new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "forged"),
             null,
+            TimeSpan.FromSeconds(30),
             [ActionSafePoint.BeforeTerminal],
             ContractVersionRange.Exact(1));
         var discovery = new SidecarDiscoveryEnvelope(

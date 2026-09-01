@@ -1236,6 +1236,58 @@ public static class HostActionEntryAuthorityValidator
         return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(canonical)));
     }
 
+    /// <summary>Computes the typed descriptor hash from neutral sidecar metadata.</summary>
+    public static string ComputeDescriptorHash(
+        SidecarActionDefinition definition,
+        SidecarActionDescriptorIdentity identity)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        ArgumentNullException.ThrowIfNull(identity);
+        var canonical = new
+        {
+            Key = definition.ActionKey.Value,
+            definition.Version,
+            definition.Category,
+            Capabilities = (int)definition.Capabilities,
+            definition.ContainsSensitiveData,
+            definition.HasIrreversibleEffects,
+            Repeat = new
+            {
+                Kind = definition.RepeatPolicy.Kind.ToString(),
+                definition.RepeatPolicy.MaximumAttempts,
+                MinimumBackoffTicks = definition.RepeatPolicy.MinimumBackoff.Ticks,
+                definition.RepeatPolicy.IdempotencyScope,
+            },
+            Continuation = definition.ContinuationPolicy is null
+                ? null
+                : new
+                {
+                    MaximumLifetimeTicks = definition.ContinuationPolicy.MaximumLifetime.Ticks,
+                    definition.ContinuationPolicy.Durable,
+                    definition.ContinuationPolicy.SingleClaim,
+                },
+            DefaultTimeoutTicks = definition.DefaultTimeout.Ticks,
+            ProtocolMinimum = definition.ProtocolVersionRange.Minimum,
+            ProtocolMaximum = definition.ProtocolVersionRange.Maximum,
+            SafePoints = definition.SafePoints.Select(point => point.ToString()).ToArray(),
+            InputSchema = new
+            {
+                definition.InputSchema.ContractName,
+                definition.InputSchema.Version,
+                definition.InputSchema.ContentHash,
+            },
+            ResultSchema = new
+            {
+                definition.ResultSchema.ContractName,
+                definition.ResultSchema.Version,
+                definition.ResultSchema.ContentHash,
+            },
+            identity.InputTypeIdentity,
+            identity.ResultTypeIdentity,
+        };
+        return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(canonical)));
+    }
+
     public static string ComputeAuthorityHash(HostActionEntryAuthority authority)
     {
         ArgumentNullException.ThrowIfNull(authority);
@@ -1411,11 +1463,6 @@ public static class SidecarExternalActionDispatchAuthorityValidator
         ArgumentNullException.ThrowIfNull(descriptor);
         ArgumentNullException.ThrowIfNull(snapshot);
 
-        if (!authority.IsWellFormed)
-            return Reject("sidecar_external_invalid_authority", "The external action authority is incomplete.");
-
-        var effective = authority.EffectiveHostEntry.EffectiveContext;
-        var hostAuthority = authority.EffectiveHostEntry.Authority;
         var expectedDescriptor = CreateDescriptorIdentity<TAction, TResult>(descriptor);
         byte[] actionBytes;
         try
@@ -1427,10 +1474,77 @@ public static class SidecarExternalActionDispatchAuthorityValidator
             return Reject("sidecar_external_invalid_payload", "The external action payload is not canonical.");
         }
 
+        return ValidateCore(
+            authority,
+            expectedDescriptor,
+            actionBytes,
+            snapshot,
+            now);
+    }
+
+    /// <summary>Validates one serialized external action against exact sidecar metadata.</summary>
+    public static SidecarCapabilityValidationResult ValidateSerialized(
+        SidecarExternalActionDispatchAuthority authority,
+        SidecarActionDefinition definition,
+        SidecarActionDescriptorIdentity descriptor,
+        JsonElement action,
+        ActionPipelineSnapshot snapshot,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(authority);
+        ArgumentNullException.ThrowIfNull(definition);
+        ArgumentNullException.ThrowIfNull(descriptor);
+        ArgumentNullException.ThrowIfNull(snapshot);
+
+        if (!DescriptorMatchesDefinition(descriptor, definition))
+        {
+            return Reject(
+                "sidecar_external_invalid_descriptor",
+                "The serialized external action descriptor is incomplete or inconsistent.");
+        }
+
+        byte[] actionBytes;
+        try
+        {
+            actionBytes = SidecarCapabilityTransportCodec.Serialize(action);
+        }
+        catch (Exception exception) when (exception is JsonException or NotSupportedException)
+        {
+            return Reject("sidecar_external_invalid_payload", "The external action payload is not canonical.");
+        }
+
+        return ValidateCore(
+            authority,
+            descriptor,
+            actionBytes,
+            snapshot,
+            now);
+    }
+
+    private static SidecarCapabilityValidationResult ValidateCore(
+        SidecarExternalActionDispatchAuthority authority,
+        SidecarActionDescriptorIdentity expectedDescriptor,
+        byte[] actionBytes,
+        ActionPipelineSnapshot snapshot,
+        DateTimeOffset now)
+    {
+        if (!authority.IsWellFormed)
+            return Reject("sidecar_external_invalid_authority", "The external action authority is incomplete.");
+
+        var effective = authority.EffectiveHostEntry.EffectiveContext;
+        var hostAuthority = authority.EffectiveHostEntry.Authority;
         if (!SameDescriptor(authority.Descriptor, expectedDescriptor) ||
             !SameDescriptor(effective.Descriptor, expectedDescriptor) ||
-            !SamePayload(authority.Action, actionBytes, TypeIdentity<TAction>(), descriptor.InputSchema?.Version ?? 0) ||
-            !SamePayload(effective.EffectiveAction, actionBytes, TypeIdentity<TAction>(), descriptor.InputSchema?.Version ?? 0) ||
+            !SamePayload(
+                authority.Action,
+                actionBytes,
+                expectedDescriptor.InputTypeIdentity,
+                expectedDescriptor.InputSchemaVersion) ||
+            !SamePayload(
+                effective.EffectiveAction,
+                actionBytes,
+                expectedDescriptor.InputTypeIdentity,
+                expectedDescriptor.InputSchemaVersion) ||
             !string.Equals(authority.ModuleId, authority.Call.ModuleId, StringComparison.Ordinal) ||
             !string.Equals(authority.GraphId, authority.Call.GraphId, StringComparison.Ordinal) ||
             !string.Equals(authority.ModuleId, hostAuthority.ModuleId, StringComparison.Ordinal) ||
@@ -1441,8 +1555,8 @@ public static class SidecarExternalActionDispatchAuthorityValidator
             hostAuthority.CancellationId != authority.Call.CancellationId ||
             hostAuthority.CallId != authority.Call.CallId ||
             hostAuthority.Invocation != effective.Invocation ||
-            hostAuthority.ActionKey != descriptor.Key ||
-            hostAuthority.ActionVersion != descriptor.Version ||
+            hostAuthority.ActionKey != expectedDescriptor.Key ||
+            hostAuthority.ActionVersion != expectedDescriptor.Version ||
             hostAuthority.TerminalId != authority.Terminal.TerminalId ||
             authority.Terminal.ActionTypeIdentity != expectedDescriptor.InputTypeIdentity ||
             authority.Terminal.ActionSchemaVersion != expectedDescriptor.InputSchemaVersion ||
@@ -1494,6 +1608,34 @@ public static class SidecarExternalActionDispatchAuthorityValidator
         }
 
         return SidecarCapabilityValidationResult.Accept();
+    }
+
+    /// <summary>Gets whether one transport identity matches its complete discovered definition.</summary>
+    public static bool DescriptorMatchesDefinition(
+        SidecarActionDescriptorIdentity descriptor,
+        SidecarActionDefinition definition)
+    {
+        ArgumentNullException.ThrowIfNull(descriptor);
+        ArgumentNullException.ThrowIfNull(definition);
+        return descriptor.IsWellFormed &&
+            definition.ActionKey == descriptor.Key &&
+            definition.Version == descriptor.Version &&
+            string.Equals(definition.Category, descriptor.Category, StringComparison.Ordinal) &&
+            definition.DefaultTimeout > TimeSpan.Zero &&
+            definition.InputSchema.Version == descriptor.InputSchemaVersion &&
+            string.Equals(
+                definition.InputSchema.ContentHash,
+                descriptor.InputSchemaHash,
+                StringComparison.Ordinal) &&
+            definition.ResultSchema.Version == descriptor.ResultSchemaVersion &&
+            string.Equals(
+                definition.ResultSchema.ContentHash,
+                descriptor.ResultSchemaHash,
+                StringComparison.Ordinal) &&
+            string.Equals(
+                HostActionEntryAuthorityValidator.ComputeDescriptorHash(definition, descriptor),
+                descriptor.DescriptorHash,
+                StringComparison.Ordinal);
     }
 
     private static SidecarActionDescriptorIdentity CreateDescriptorIdentity<TAction, TResult>(
@@ -1565,6 +1707,16 @@ public interface IActionDispatcher
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
         Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
+        ActionPipelineSnapshot snapshot,
+        SidecarExternalActionDispatchAuthority authority,
+        CancellationToken ct);
+
+    /// <summary>Runs one external action without loading its optional CLR contract types.</summary>
+    ValueTask<IActionOutcome<JsonElement>> RunExternalSerializedAsync(
+        SidecarActionDefinition definition,
+        SidecarActionDescriptorIdentity descriptor,
+        JsonElement action,
+        Func<ActionContext<JsonElement>, CancellationToken, ValueTask<JsonElement>> terminal,
         ActionPipelineSnapshot snapshot,
         SidecarExternalActionDispatchAuthority authority,
         CancellationToken ct);

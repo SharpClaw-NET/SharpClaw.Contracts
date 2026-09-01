@@ -190,6 +190,7 @@ public sealed record SidecarActionDefinition(
     bool HasIrreversibleEffects,
     ActionRepeatPolicy RepeatPolicy,
     ActionContinuationPolicy? ContinuationPolicy,
+    TimeSpan DefaultTimeout,
     IReadOnlyList<ActionSafePoint> SafePoints,
     ContractVersionRange ProtocolVersionRange);
 
