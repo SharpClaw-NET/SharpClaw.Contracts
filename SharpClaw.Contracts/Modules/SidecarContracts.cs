@@ -209,6 +209,9 @@ public sealed record SidecarToolHandlerDefinition(
     string ToolName,
     string HandlerId,
     string Description,
+    JsonElement ParametersSchema,
+    int Version,
+    bool ContainsSensitiveData,
     JsonSchemaReference InputSchema,
     JsonSchemaReference ResultSchema,
     bool SupportsStreaming,
@@ -589,6 +592,26 @@ public static class SidecarDiscoveryValidator
             discovery.LifecycleHandlers.GroupBy(item => (item.Call, item.HandlerId)).Any(group => group.Count() > 1))
         {
             return Reject(SidecarProtocolErrors.DuplicateDescriptor, "The discovery contains duplicate handler definitions.");
+        }
+
+        if (discovery.ToolHandlers.Any(item =>
+                string.IsNullOrWhiteSpace(item.ToolName) ||
+                string.IsNullOrWhiteSpace(item.HandlerId) ||
+                string.IsNullOrWhiteSpace(item.Description) ||
+                item.ParametersSchema.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null ||
+                item.Version < 1 ||
+                item.InputSchema is null ||
+                string.IsNullOrWhiteSpace(item.InputSchema.ContractName) ||
+                item.InputSchema.Version < 1 ||
+                string.IsNullOrWhiteSpace(item.InputSchema.ContentHash) ||
+                item.ResultSchema is null ||
+                string.IsNullOrWhiteSpace(item.ResultSchema.ContractName) ||
+                item.ResultSchema.Version < 1 ||
+                string.IsNullOrWhiteSpace(item.ResultSchema.ContentHash)))
+        {
+            return Reject(
+                SidecarProtocolErrors.MalformedMessage,
+                "The discovery contains an invalid tool handler definition.");
         }
 
         if (discovery.ActionDefinitions.Any(item => hostCatalog.ContainsActionKey(item.ActionKey)))

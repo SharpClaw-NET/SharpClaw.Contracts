@@ -823,8 +823,11 @@ public sealed class SimpleKernelContractTests
                 "demo.tool",
                 "handler-1",
                 "Demo tool",
-                new JsonSchemaReference("demo.tool.input", 1),
-                new JsonSchemaReference("demo.tool.result", 1),
+                ToolSchemas.EmptyObject,
+                1,
+                ContainsSensitiveData: false,
+                new JsonSchemaReference("demo.tool.input", 1, "demo-tool-input-hash"),
+                new JsonSchemaReference("demo.tool.result", 1, "demo-tool-result-hash"),
                 SupportsStreaming: true,
                 Durable: false,
                 RequiresApproval: false)],
@@ -3596,6 +3599,32 @@ public sealed class SimpleKernelContractTests
         Assert.Single(contribution.SystemPromptSegments);
         Assert.Equal(ActionOutcomeKind.Completed, result.Kind);
         Assert.Equal("12:00", result.Result!.Content);
+    }
+
+    [Fact]
+    public void ChatOperationContextKeepsHostActionEntryProcessLocal()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var context = new ChatOperationContext(
+            Guid.NewGuid(),
+            null,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            0,
+            1,
+            now.AddMinutes(1),
+            new RequestPrincipal("user-1"),
+            ExtensionFeatureSet.Empty,
+            new RecordingHostActionEntry());
+
+        var json = JsonSerializer.Serialize(context, JsonOptions);
+        var roundTrip = JsonSerializer.Deserialize<ChatOperationContext>(json, JsonOptions)!;
+
+        Assert.True(context.IsWellFormed(now));
+        Assert.DoesNotContain("HostActionEntry", json, StringComparison.Ordinal);
+        Assert.Null(roundTrip.HostActionEntry);
+        Assert.Equal(context.InvocationId, roundTrip.InvocationId);
+        Assert.Equal(context.Caller, roundTrip.Caller);
     }
 
     [Fact]

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Contracts.Modules;
@@ -15,6 +16,31 @@ public sealed record ChatTurnInput(
     RequestPrincipal? Caller = null,
     ExtensionFeatureSet? Features = null,
     string? ClientType = null);
+
+/// <summary>Immutable host authority for one chat operation.</summary>
+public sealed record ChatOperationContext(
+    Guid InvocationId,
+    Guid? ParentInvocationId,
+    Guid TraceId,
+    Guid IdempotencyKey,
+    int Depth,
+    int Attempt,
+    DateTimeOffset Deadline,
+    RequestPrincipal Caller,
+    ExtensionFeatureSet Features,
+    [property: JsonIgnore] IHostActionEntry? HostActionEntry = null)
+{
+    public bool IsWellFormed(DateTimeOffset now) =>
+        InvocationId != Guid.Empty &&
+        TraceId != Guid.Empty &&
+        IdempotencyKey != Guid.Empty &&
+        Depth >= 0 &&
+        Attempt >= 1 &&
+        Deadline > now &&
+        Caller is not null &&
+        !string.IsNullOrWhiteSpace(Caller.SubjectId) &&
+        Features is not null;
+}
 
 /// <summary>Result of conversation resolution for one turn.</summary>
 public sealed record ConversationSelection(
@@ -60,6 +86,7 @@ public interface IConversationResolver
 {
     ValueTask<ConversationSelection> ResolveAsync(
         ChatTurnInput input,
+        ChatOperationContext context,
         CancellationToken ct);
 }
 
@@ -67,6 +94,7 @@ public interface IChatProfileResolver
 {
     ValueTask<ChatProfile> ResolveAsync(
         ChatTurnContext turn,
+        ChatOperationContext context,
         CancellationToken ct);
 }
 
@@ -74,6 +102,7 @@ public interface IChatContextContributor
 {
     ValueTask<ChatContextContribution> ContributeAsync(
         ChatContextRequest request,
+        ChatOperationContext context,
         CancellationToken ct);
 }
 
@@ -88,10 +117,12 @@ public interface IConversationStore
 {
     ValueTask<IReadOnlyList<ChatCompletionMessage>> LoadHistoryAsync(
         Guid conversationId,
+        ChatOperationContext context,
         CancellationToken ct);
 
     ValueTask CommitExchangeAsync(
         ChatExchange exchange,
+        ChatOperationContext context,
         CancellationToken ct);
 }
 
