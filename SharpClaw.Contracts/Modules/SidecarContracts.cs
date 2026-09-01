@@ -16,6 +16,12 @@ public enum SidecarHookTargetKind
     Wildcard,
 }
 
+public enum SidecarEventSubscriptionKind
+{
+    Interceptor,
+    Listener,
+}
+
 public enum SidecarContinuationCommand
 {
     ContinueOriginal,
@@ -499,6 +505,7 @@ public sealed record SidecarEventSubscription(
     ContractVersionRange VersionRange,
     JsonSchemaReference PayloadSchema,
     EventInterceptionCapabilities Capabilities,
+    SidecarEventSubscriptionKind Kind,
     EventDelivery Delivery,
     SidecarPayloadMode PayloadMode,
     HookOrdering Ordering,

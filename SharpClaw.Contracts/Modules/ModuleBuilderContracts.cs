@@ -14,6 +14,59 @@ public interface ISharpClawModuleBuilder
     IChatLifecycleBuilder Chat { get; }
 }
 
+/// <summary>
+/// Registers neutral module contributions whose handler instances are already bound to an
+/// authenticated external module connection.
+/// </summary>
+public interface IBoundModuleContributionBuilder
+{
+    void AddActionHook(
+        SidecarActionSubscription subscription,
+        IAnyActionInterceptor interceptor,
+        string handlerId);
+
+    void AddEventInterceptor(
+        SidecarEventSubscription subscription,
+        IAnyEventInterceptor interceptor,
+        string handlerId);
+
+    void AddEventListener(
+        SidecarEventSubscription subscription,
+        IAnyEventListener listener,
+        string handlerId);
+
+    void AddTool(
+        ToolDescriptor descriptor,
+        IToolHandler handler,
+        string handlerId);
+
+    void UseConversationResolver(
+        IConversationResolver resolver,
+        ExclusiveRegistration registration,
+        string handlerId);
+
+    void UseChatProfileResolver(
+        IChatProfileResolver resolver,
+        ExclusiveRegistration registration,
+        string handlerId);
+
+    void UseConversationStore(
+        IConversationStore store,
+        string handlerId);
+
+    void AddContextContributor(
+        IChatContextContributor contributor,
+        string handlerId);
+}
+
+/// <summary>Exposes the exact host authorization that binds one external module.</summary>
+public interface IAuthorizedExternalModule
+{
+    SidecarHostAuthorization Authorization { get; }
+
+    SidecarDiscoveryEnvelope Discovery { get; }
+}
+
 public interface ISharpClawApplicationBuilder
 {
     IEndpointContributionBuilder Endpoints { get; }

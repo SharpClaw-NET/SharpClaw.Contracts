@@ -10053,6 +10053,19 @@ public static class SidecarCapabilityTransportValidation
         SidecarCapabilitySessionBinding binding,
         DateTimeOffset now,
         Func<SidecarHostTerminalAuthority, string, bool>? authenticateEffectiveHostEntryContext = null)
+        => ValidateActionRequest(
+            request,
+            binding,
+            now,
+            authenticateEffectiveHostEntryContext,
+            authorizeHostEntryCarrierChild: null);
+
+    public static SidecarCapabilityValidationResult ValidateActionRequest(
+        SidecarActionCapabilityRequest request,
+        SidecarCapabilitySessionBinding binding,
+        DateTimeOffset now,
+        Func<SidecarHostTerminalAuthority, string, bool>? authenticateEffectiveHostEntryContext,
+        Func<SidecarActionCapabilityRequest, bool>? authorizeHostEntryCarrierChild)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(binding);
@@ -10127,20 +10140,8 @@ public static class SidecarCapabilityTransportValidation
         }
 
         if (hostEntry && request.HostContext is not null &&
-            (request.HostContext.Contribution?.Lineage is null ||
-             !string.Equals(request.HostContext.Contribution.Lineage.ActionKey.Value, request.Descriptor.Key.Value, StringComparison.Ordinal) ||
-             request.HostContext.Contribution.Lineage.ActionVersion != request.Descriptor.Version ||
-             !string.Equals(request.HostContext.Contribution.Lineage.DescriptorHash, request.Descriptor.DescriptorHash, StringComparison.Ordinal) ||
-             !string.Equals(request.HostContext.Contribution.Lineage.InputTypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) ||
-             request.HostContext.Contribution.Lineage.InputSchemaVersion != request.Descriptor.InputSchemaVersion ||
-             !string.Equals(request.HostContext.Contribution.Lineage.InputSchemaHash, request.Descriptor.InputSchemaHash, StringComparison.Ordinal) ||
-              request.EffectiveHostEntryContext is null &&
-              request.HostContext.Contribution.Lineage.IsPayloadBound &&
-             (!string.Equals(
-                 request.HostContext.Contribution.Lineage.PayloadContentHash,
-                 request.Action.ContentHash,
-                 StringComparison.OrdinalIgnoreCase) ||
-              request.HostContext.Contribution.Lineage.PayloadByteLength != request.Action.ByteLength)))
+            !MatchesHostEntryDescriptorAndPayload(request) &&
+            authorizeHostEntryCarrierChild?.Invoke(request) != true)
         {
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.SpoofedIdentity,
@@ -10214,6 +10215,26 @@ public static class SidecarCapabilityTransportValidation
         }
 
         return SidecarCapabilityValidationResult.Accept();
+    }
+
+    private static bool MatchesHostEntryDescriptorAndPayload(
+        SidecarActionCapabilityRequest request)
+    {
+        var lineage = request.HostContext?.Contribution?.Lineage;
+        return lineage is not null &&
+               string.Equals(lineage.ActionKey.Value, request.Descriptor.Key.Value, StringComparison.Ordinal) &&
+               lineage.ActionVersion == request.Descriptor.Version &&
+               string.Equals(lineage.DescriptorHash, request.Descriptor.DescriptorHash, StringComparison.Ordinal) &&
+               string.Equals(lineage.InputTypeIdentity, request.Descriptor.InputTypeIdentity, StringComparison.Ordinal) &&
+               lineage.InputSchemaVersion == request.Descriptor.InputSchemaVersion &&
+               string.Equals(lineage.InputSchemaHash, request.Descriptor.InputSchemaHash, StringComparison.Ordinal) &&
+               (request.EffectiveHostEntryContext is not null ||
+                !lineage.IsPayloadBound ||
+                string.Equals(
+                    lineage.PayloadContentHash,
+                    request.Action.ContentHash,
+                    StringComparison.OrdinalIgnoreCase) &&
+                lineage.PayloadByteLength == request.Action.ByteLength);
     }
 
     public static SidecarCapabilityValidationResult ValidateEffectiveHostEntryContext(

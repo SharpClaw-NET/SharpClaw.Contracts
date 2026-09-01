@@ -7962,6 +7962,123 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
+    public void Host_entry_carrier_child_requires_explicit_authorization()
+    {
+        var fixture = CreateFixture();
+        var call = fixture.Call with
+        {
+            Capability = SidecarCapabilityKind.Action,
+            CallId = Guid.NewGuid(),
+            ReplayNonce = "application-carrier-child",
+        };
+        var rootDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("runtime.cli.execute"),
+            1,
+            "runtime.cli",
+            "runtime.cli.input",
+            "runtime-cli-input",
+            1,
+            "runtime.cli.result",
+            "runtime-cli-result",
+            1,
+            "runtime-cli-descriptor");
+        var childDescriptor = new SidecarActionDescriptorIdentity(
+            new SharpClawActionKey("module.application.command"),
+            1,
+            "module.application",
+            "module.application.input",
+            "module-application-input",
+            1,
+            "module.application.result",
+            "module-application-result",
+            1,
+            "module-application-descriptor");
+        var context = IssueContext(
+            fixture,
+            new RequestPrincipal("application-caller"),
+            HostActionEntryIngress.Cli,
+            actionDeadline: call.Deadline,
+            lineage: new HostActionEntryLineage(
+                rootDescriptor.Key,
+                rootDescriptor.Version,
+                rootDescriptor.DescriptorHash,
+                rootDescriptor.InputTypeIdentity,
+                rootDescriptor.InputSchemaVersion,
+                rootDescriptor.InputSchemaHash,
+                null,
+                null));
+        var action = Payload(childDescriptor.InputTypeIdentity, new { value = "child" });
+        var request = SidecarActionCapabilityRequest.HostEntry(
+            call,
+            childDescriptor,
+            action,
+            new SidecarCancellationIdentity(
+                call.CancellationId,
+                "application-carrier-cancellation",
+                call.Deadline),
+            call.Deadline,
+            context,
+            new SidecarActionTerminalRegistration(
+                Guid.NewGuid(),
+                childDescriptor.InputTypeIdentity,
+                childDescriptor.InputSchemaVersion,
+                childDescriptor.ResultTypeIdentity,
+                childDescriptor.ResultSchemaVersion,
+                childDescriptor.DescriptorHash));
+
+        var defaultResult = SidecarCapabilityTransportValidation.ValidateActionRequest(
+            request,
+            fixture.Binding,
+            fixture.Now);
+        Assert.False(defaultResult.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, defaultResult.Code);
+
+        var deniedResult = SidecarCapabilityTransportValidation.ValidateActionRequest(
+            request,
+            fixture.Binding,
+            fixture.Now,
+            authenticateEffectiveHostEntryContext: null,
+            authorizeHostEntryCarrierChild: _ => false);
+        Assert.False(deniedResult.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, deniedResult.Code);
+
+        SidecarActionCapabilityRequest? authorizedRequest = null;
+        var acceptedResult = SidecarCapabilityTransportValidation.ValidateActionRequest(
+            request,
+            fixture.Binding,
+            fixture.Now,
+            authenticateEffectiveHostEntryContext: null,
+            authorizeHostEntryCarrierChild: candidate =>
+            {
+                authorizedRequest = candidate;
+                return true;
+            });
+        Assert.True(acceptedResult.Accepted, acceptedResult.Message);
+        Assert.Same(request, authorizedRequest);
+
+        var invalidPayload = SidecarCapabilityTransportValidation.ValidateActionRequest(
+            request with { Action = request.Action with { SchemaVersion = 2 } },
+            fixture.Binding,
+            fixture.Now,
+            authenticateEffectiveHostEntryContext: null,
+            authorizeHostEntryCarrierChild: _ => true);
+        Assert.False(invalidPayload.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.InvalidPayload, invalidPayload.Code);
+
+        var invalidTerminal = SidecarCapabilityTransportValidation.ValidateActionRequest(
+            request with
+            {
+                Terminal = request.Terminal! with { DescriptorHash = "other-descriptor" },
+            },
+            fixture.Binding,
+            fixture.Now,
+            authenticateEffectiveHostEntryContext: null,
+            authorizeHostEntryCarrierChild: _ => true);
+        Assert.False(invalidTerminal.Accepted);
+        Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, invalidTerminal.Code);
+    }
+
+    [Fact]
     public async Task Host_action_entry_proxy_sends_typed_request_through_existing_transport()
     {
         var fixture = CreateFixture();

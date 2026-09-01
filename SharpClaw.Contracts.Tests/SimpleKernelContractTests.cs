@@ -2232,6 +2232,7 @@ public sealed class SimpleKernelContractTests
             ContractVersionRange.Exact(1),
             payloadSchema,
             EventInterceptionCapabilities.Inspect,
+            SidecarEventSubscriptionKind.Interceptor,
             EventDelivery.Inline,
             SidecarPayloadMode.Untyped,
             new HookOrdering("demo"),
