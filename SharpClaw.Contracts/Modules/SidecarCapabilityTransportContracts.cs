@@ -560,6 +560,9 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 state.Active &&
                 state.Carrier.CarrierId == authority.CarrierId &&
                 state.Carrier.Authority.PeerCall == authority.ParentCall);
+            var rootPeerRelayState = _rootHostActionEntryStates.Values.FirstOrDefault(state =>
+                state.Context.CapabilityId == authority.CarrierId &&
+                state.Relay.PeerCall == authority.ParentCall);
             if (!TryResolveStorageContinuationParentLocked(
                     authority.ParentCall,
                     out var receivingParentCall,
@@ -568,7 +571,14 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                     out var activeRoot) ||
                 authority.CarrierId != activeCarrier!.CapabilityId ||
                 (crossSidecarState is null
-                    ? !MatchesCarrierAuthority(authority.CarrierAuthority, activeCarrier)
+                    ? rootPeerRelayState is null
+                        ? !MatchesCarrierAuthority(authority.CarrierAuthority, activeCarrier)
+                        : !MatchesMirroredCarrierAuthority(
+                            authority.CarrierAuthority,
+                            activeCarrier,
+                            activeCarrier.IssuedAt,
+                            activeCarrier.ExpiresAt,
+                            authority.IssuedAt)
                     : !MatchesMirroredCarrierAuthority(
                         authority.CarrierAuthority,
                         activeCarrier,
@@ -580,6 +590,10 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 crossSidecarState is not null &&
                 !MatchesCrossSidecarStorageContinuationParentReceipt(
                     crossSidecarState,
+                    receivingParentCall!) ||
+                rootPeerRelayState is not null &&
+                !MatchesRootRelayStorageContinuationParentReceipt(
+                    rootPeerRelayState,
                     receivingParentCall!))
             {
                 return SidecarCapabilityValidationResult.Reject(
@@ -739,6 +753,28 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
             return true;
         }
 
+        foreach (var state in _rootHostActionEntryStates.Values)
+        {
+            if (state.Relay.PeerCall != parentCall ||
+                !_calls.TryGetValue(state.Relay.Call.CallId, out capability) ||
+                capability != SidecarCapabilityKind.Action ||
+                !_callIdentities.TryGetValue(state.Relay.Call.CallId, out activeParent) ||
+                activeParent != state.Relay.Call ||
+                !_callEntryContexts.TryGetValue(state.Relay.Call.CallId, out context) ||
+                context.CapabilityId != state.Context.CapabilityId ||
+                !_activeEntryCarriers.TryGetValue(context.CapabilityId, out carrier) ||
+                !MatchesCarrierContext(context, carrier) ||
+                !_entryBudgetRoots.TryGetValue(context.CapabilityId, out rootBudgetId) ||
+                rootBudgetId != state.Relay.RootBudgetId ||
+                !_terminalCalls.ContainsKey(state.Relay.Call.CallId))
+            {
+                continue;
+            }
+
+            receivingParentCall = state.Relay.Call;
+            return true;
+        }
+
         foreach (var state in _crossSidecarStates.Values)
         {
             if (state.IsSource ||
@@ -762,6 +798,23 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
         }
 
         return false;
+    }
+
+    private bool MatchesRootRelayStorageContinuationParentReceipt(
+        RootHostActionEntryState rootState,
+        SidecarCapabilityCallIdentity receivingParentCall)
+    {
+        if (!_terminalReceipts.TryGetValue(receivingParentCall.CallId, out var receipt))
+            return false;
+
+        return receipt.ActionKey == rootState.Relay.Descriptor.Key &&
+            receipt.ActionVersion == rootState.Relay.Descriptor.Version &&
+            receipt.CallId == receivingParentCall.CallId &&
+            receipt.Attempt == rootState.Relay.Authority.Attempt &&
+            string.Equals(
+                receipt.ContentHash,
+                rootState.Relay.Action.ContentHash,
+                StringComparison.OrdinalIgnoreCase);
     }
 
     private bool MatchesCrossSidecarStorageContinuationParentReceipt(
