@@ -12,8 +12,8 @@
     <FileVersion>0.5.0.0</FileVersion>
     <InformationalVersion>0.5.0-beta.40</InformationalVersion>
     <Authors>mkn8rn</Authors>
-    <Description>Neutral contracts for SharpClaw direct chat, unified tools, module features, action and event hooks, continuations, and sidecar messages.</Description>
-    <PackageTags>sharpclaw;modules;contracts;sdk</PackageTags>
+    <Description>Neutral contracts for SharpClaw direct chat, unified tools, registration features, action and event hooks, continuations, and sidecar messages.</Description>
+    <PackageTags>sharpclaw;registrations;contracts;sdk</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/SharpClaw-NET/SharpClaw.Contracts</RepositoryUrl>
     <RepositoryType>git</RepositoryType>

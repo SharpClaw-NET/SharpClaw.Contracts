@@ -1,20 +1,16 @@
 # SharpClaw.Gateway.Contracts
 
-SharpClaw.Gateway.Contracts is the MIT-licensed gateway contract package for
-SharpClaw modules that publish endpoint groups through the gateway process.
-Use it when module or gateway host code needs the shared gateway interfaces and
-response models without taking a dependency on the SharpClaw runtime app.
+SharpClaw.Gateway.Contracts is the MIT-licensed transport contract package for
+the SharpClaw Gateway. It provides request dispatch, internal API, queue, and
+response types without a dependency on the Runtime application.
 
 ```bash
 dotnet add package SharpClaw.Gateway.Contracts
 ```
 
-Modules implement `IGatewayModuleExtension` when they need to expose gateway
-routes. The gateway passes an `IGatewayEndpointGroupBuilder` into the module so
-routes are enrolled through the gateway-owned path prefix, rate limiting, and
-gating pipeline. Module code can use `IGatewayInternalApi` for read-only
-forwarding and `IGatewayDispatcher` for queued mutation forwarding.
+Gateway code can use `IGatewayInternalApi` for direct reads. It can use
+`IGatewayDispatcher` for queued mutation requests. `QueuedResponse` preserves
+the upstream status and response body through the Gateway boundary.
 
-The package intentionally keeps ASP.NET endpoint types in the gateway contract
-surface because module endpoint mapping is expressed with ASP.NET minimal API
-types such as `RouteHandlerBuilder` and `IResult`.
+The package keeps `IResult` in its public surface. This type lets Gateway
+handlers return a `QueuedResponse` through ASP.NET without a local response model.

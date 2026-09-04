@@ -1,7 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 
 namespace SharpClaw.Contracts.Tests;
 
@@ -16,7 +16,7 @@ public sealed class SidecarCapabilityTransportTests
 
         Assert.Equal(first, second);
         var roundTrip = SidecarCapabilityTransportCodec.Deserialize<SidecarCapabilitySessionBinding>(first);
-        Assert.Equal(fixture.Binding.ModuleId, roundTrip.ModuleId);
+        Assert.Equal(fixture.Binding.SourceId, roundTrip.SourceId);
         Assert.Equal(
             SidecarCapabilityTransportCodec.ComputeSha256(first),
             SidecarCapabilityTransportCodec.ComputeSha256(
@@ -510,21 +510,21 @@ public sealed class SidecarCapabilityTransportTests
             fixture,
             new RequestPrincipal("tool"),
             HostActionEntryIngress.Tool);
-        var crossModuleContext = IssueContext(
+        var crossRegistrationContext = IssueContext(
             fixture,
-            new RequestPrincipal("cross-module"),
-            HostActionEntryIngress.CrossModule);
+            new RequestPrincipal("cross-registration"),
+            HostActionEntryIngress.CrossRegistration);
 
         var endpoint = new HostEndpointInvocation(
             endpointContext.InvocationId,
             "/demo",
             endpointContext);
-        var crossModule = new CrossModuleActionInvocation(
-            crossModuleContext.InvocationId,
-            "source.module",
-            "target.module",
-            crossModuleContext);
-        var cli = new ModuleCliInvocation(
+        var crossRegistration = new CrossSourceActionInvocation(
+            crossRegistrationContext.InvocationId,
+            "source.registration",
+            "target.registration",
+            crossRegistrationContext);
+        var cli = new CliInvocation(
             cliContext.InvocationId,
             "demo",
             [],
@@ -539,23 +539,23 @@ public sealed class SidecarCapabilityTransportTests
 
         var endpointRoundTrip = SidecarCapabilityTransportCodec.Deserialize<HostEndpointInvocation>(
             SidecarCapabilityTransportCodec.Serialize(endpoint));
-        var crossModuleRoundTrip = SidecarCapabilityTransportCodec.Deserialize<CrossModuleActionInvocation>(
-            SidecarCapabilityTransportCodec.Serialize(crossModule));
-        var cliRoundTrip = SidecarCapabilityTransportCodec.Deserialize<ModuleCliInvocation>(
+        var crossRegistrationRoundTrip = SidecarCapabilityTransportCodec.Deserialize<CrossSourceActionInvocation>(
+            SidecarCapabilityTransportCodec.Serialize(crossRegistration));
+        var cliRoundTrip = SidecarCapabilityTransportCodec.Deserialize<CliInvocation>(
             SidecarCapabilityTransportCodec.Serialize(cli));
         var toolRoundTrip = SidecarCapabilityTransportCodec.Deserialize<ToolInvocation>(
             SidecarCapabilityTransportCodec.Serialize(tool));
 
         Assert.True(endpointRoundTrip.IsWellFormed(fixture.Now));
-        Assert.True(crossModuleRoundTrip.IsWellFormed(fixture.Now));
+        Assert.True(crossRegistrationRoundTrip.IsWellFormed(fixture.Now));
         Assert.Equal(HostActionEntryIngress.Cli, cliRoundTrip.HostActionContext.Ingress);
         Assert.Equal(HostActionEntryIngress.Tool, toolRoundTrip.HostActionContext.Ingress);
         Assert.Equal(endpointContext.CapabilityId, endpointRoundTrip.HostActionContext.CapabilityId);
-        Assert.Equal(crossModuleContext.CapabilityId, crossModuleRoundTrip.HostActionContext.CapabilityId);
+        Assert.Equal(crossRegistrationContext.CapabilityId, crossRegistrationRoundTrip.HostActionContext.CapabilityId);
         Assert.False(endpointContext.Contribution!.Lineage.IsPayloadBound);
         Assert.False(cliContext.Contribution!.Lineage.IsPayloadBound);
         Assert.False(toolContext.Contribution!.Lineage.IsPayloadBound);
-        Assert.False(crossModuleContext.Contribution!.Lineage.IsPayloadBound);
+        Assert.False(crossRegistrationContext.Contribution!.Lineage.IsPayloadBound);
     }
 
     [Theory]
@@ -1382,7 +1382,7 @@ public sealed class SidecarCapabilityTransportTests
     [InlineData("session")]
     [InlineData("request")]
     [InlineData("cancellation")]
-    [InlineData("module")]
+    [InlineData("registration")]
     [InlineData("graph")]
     [InlineData("capability")]
     [InlineData("call")]
@@ -1426,8 +1426,8 @@ public sealed class SidecarCapabilityTransportTests
             case "cancellation":
                 changedCall = call with { CancellationId = Guid.NewGuid() };
                 break;
-            case "module":
-                changedCall = call with { ModuleId = "other-module" };
+            case "registration":
+                changedCall = call with { SourceId = "other-registration" };
                 break;
             case "graph":
                 changedCall = call with { GraphId = "other-graph" };
@@ -1503,7 +1503,7 @@ public sealed class SidecarCapabilityTransportTests
             new ExtensionFeature(
                 "reservation.feature",
                 1,
-                "module-a",
+                "registration-a",
                 128,
                 JsonDocument.Parse("{\"mode\":\"snapshot\"}").RootElement.Clone()),
         });
@@ -1533,7 +1533,7 @@ public sealed class SidecarCapabilityTransportTests
                         new ExtensionFeature(
                             "mutated.feature",
                             1,
-                            "module-a",
+                            "registration-a",
                             1,
                             JsonDocument.Parse("{}").RootElement.Clone());
                     request.Headers["x-request"][0] = "mutated-header";
@@ -1821,7 +1821,7 @@ public sealed class SidecarCapabilityTransportTests
             protocolMessageBytes: 65536,
             authenticateEndpointRouteAuthority: AuthenticateRoute);
         var receiving = CreateFixture(
-            moduleId: "module-receiving",
+            SourceId: "registration-receiving",
             graphId: "graph-receiving",
             actionInputBytes: 4096,
             protocolMessageBytes: 65536,
@@ -3776,7 +3776,7 @@ public sealed class SidecarCapabilityTransportTests
             new ExtensionFeature(
                 "endpoint.test",
                 1,
-                "module-a",
+                "registration-a",
                 128,
                 JsonDocument.Parse("{\"mode\":\"wire\"}").RootElement.Clone()),
         ]);
@@ -3835,7 +3835,7 @@ public sealed class SidecarCapabilityTransportTests
             new ExtensionFeature(
                 "endpoint.test",
                 1,
-                "module-a",
+                "registration-a",
                 128,
                 JsonDocument.Parse("{\"mode\":\"owned\"}").RootElement.Clone()),
         ]);
@@ -3882,7 +3882,7 @@ public sealed class SidecarCapabilityTransportTests
             new ExtensionFeature(
                 "mutated.input.feature",
                 1,
-                "module-a",
+                "registration-a",
                 1,
                 JsonDocument.Parse("{}").RootElement.Clone()));
         ((ISet<string>)returnedContext!.Caller.Roles!).Add("mutated-returned-role");
@@ -3890,7 +3890,7 @@ public sealed class SidecarCapabilityTransportTests
             new ExtensionFeature(
                 "mutated.returned.feature",
                 1,
-                "module-a",
+                "registration-a",
                 1,
                 JsonDocument.Parse("{}").RootElement.Clone()));
         wireRelay.Request.Headers["x-request"][0] = "mutated-input-header";
@@ -3944,15 +3944,15 @@ public sealed class SidecarCapabilityTransportTests
             relay.Proof == KeyedEndpointProof("relay", hash);
 
         var source = CreateFixture(
-            moduleId: "module-source",
+            SourceId: "registration-source",
             graphId: "graph-source");
         var remote = CreateFixture(
-            moduleId: "module-remote",
+            SourceId: "registration-remote",
             graphId: "graph-remote",
             authenticateEndpointRouteAuthority: AuthenticateAuthority,
             authenticateEndpointRouteRelay: AuthenticateRelay);
         var receiving = CreateFixture(
-            moduleId: "module-receiving",
+            SourceId: "registration-receiving",
             graphId: "graph-receiving",
             authenticateEndpointRouteAuthority: AuthenticateAuthority,
             authenticateEndpointRouteRelay: AuthenticateRelay);
@@ -4021,7 +4021,7 @@ public sealed class SidecarCapabilityTransportTests
             new ExtensionFeature(
                 "endpoint.test",
                 1,
-                "module-a",
+                "registration-a",
                 128,
                 JsonDocument.Parse("{\"mode\":\"sign\"}").RootElement.Clone()),
         ]);
@@ -4051,7 +4051,7 @@ public sealed class SidecarCapabilityTransportTests
                             .Add(new ExtensionFeature(
                                 "mutated.feature",
                                 1,
-                                "module-a",
+                                "registration-a",
                                 1,
                                 JsonDocument.Parse("{}").RootElement.Clone()));
                         break;
@@ -4105,7 +4105,7 @@ public sealed class SidecarCapabilityTransportTests
             new ExtensionFeature(
                 "endpoint.test",
                 1,
-                "module-a",
+                "registration-a",
                 128,
                 JsonDocument.Parse("{\"mode\":\"relay\"}").RootElement.Clone()),
         ]);
@@ -4138,7 +4138,7 @@ public sealed class SidecarCapabilityTransportTests
                             .Add(new ExtensionFeature(
                                 "mutated.feature",
                                 1,
-                                "module-a",
+                                "registration-a",
                                 1,
                                 JsonDocument.Parse("{}").RootElement.Clone()));
                         break;
@@ -4196,7 +4196,7 @@ public sealed class SidecarCapabilityTransportTests
             new ExtensionFeature(
                 "relay.snapshot.feature",
                 1,
-                "module-a",
+                "registration-a",
                 128,
                 JsonDocument.Parse("{\"mode\":\"relay-snapshot\"}").RootElement.Clone()),
         });
@@ -4248,7 +4248,7 @@ public sealed class SidecarCapabilityTransportTests
                         new ExtensionFeature(
                             "mutated.reservation.feature",
                             1,
-                            "module-a",
+                            "registration-a",
                             1,
                             JsonDocument.Parse("{}").RootElement.Clone());
                     reservation.Request.Headers["x-request"][0] = "mutated-reservation-header";
@@ -4271,7 +4271,7 @@ public sealed class SidecarCapabilityTransportTests
                         new ExtensionFeature(
                             "mutated.request.feature",
                             1,
-                            "module-a",
+                            "registration-a",
                             1,
                             JsonDocument.Parse("{}").RootElement.Clone());
                     inputs.Request.Headers["x-request"][0] = "mutated-request-header";
@@ -4544,7 +4544,7 @@ public sealed class SidecarCapabilityTransportTests
                 changed = context with
                 {
                     Features = new ExtensionFeatureSet([
-                        new ExtensionFeature("other.feature", 1, "module-a", 1, JsonDocument.Parse("{}").RootElement.Clone()),
+                        new ExtensionFeature("other.feature", 1, "registration-a", 1, JsonDocument.Parse("{}").RootElement.Clone()),
                     ]),
                 };
                 break;
@@ -5943,16 +5943,16 @@ public sealed class SidecarCapabilityTransportTests
             fixture,
             new RequestPrincipal("tool"),
             HostActionEntryIngress.Tool);
-        var crossModuleContext = IssueContext(
+        var crossRegistrationContext = IssueContext(
             fixture,
-            new RequestPrincipal("cross-module"),
-            HostActionEntryIngress.CrossModule);
+            new RequestPrincipal("cross-registration"),
+            HostActionEntryIngress.CrossRegistration);
 
         Assert.False(new HostEndpointInvocation(
             endpointContext.InvocationId,
             "/other",
             endpointContext).IsWellFormed(fixture.Now));
-        Assert.False(new ModuleCliInvocation(
+        Assert.False(new CliInvocation(
             cliContext.InvocationId,
             "other",
             [],
@@ -5964,11 +5964,11 @@ public sealed class SidecarCapabilityTransportTests
             "other.tool",
             JsonDocument.Parse("{}").RootElement.Clone(),
             toolContext).IsWellFormed(fixture.Now));
-        Assert.False(new CrossModuleActionInvocation(
-            crossModuleContext.InvocationId,
+        Assert.False(new CrossSourceActionInvocation(
+            crossRegistrationContext.InvocationId,
             "other.source",
-            "target.module",
-            crossModuleContext).IsWellFormed(fixture.Now));
+            "target.registration",
+            crossRegistrationContext).IsWellFormed(fixture.Now));
     }
 
     [Fact]
@@ -6420,7 +6420,7 @@ public sealed class SidecarCapabilityTransportTests
         var fixture = CreateFixture();
         Assert.Throws<ArgumentException>(() =>
             new SidecarCapabilitySession(
-                fixture.Binding with { ModuleId = "spoofed.module" },
+                fixture.Binding with { SourceId = "spoofed.registration" },
                 _ => true,
                 new HashSet<string>(StringComparer.Ordinal).Add,
                 fixture.Now));
@@ -6569,7 +6569,7 @@ public sealed class SidecarCapabilityTransportTests
     {
         var mutations = new Func<SidecarExternalActionDispatchAuthority, SidecarExternalActionDispatchAuthority>[]
         {
-            authority => authority with { ModuleId = "changed.module" },
+            authority => authority with { SourceId = "changed.registration" },
             authority => authority with { GraphId = "changed.graph" },
             authority => authority with
             {
@@ -6663,7 +6663,7 @@ public sealed class SidecarCapabilityTransportTests
                 CallId = Guid.NewGuid(),
                 ReplayNonce = "entry-context-wrong-owner",
                 Sequence = 2,
-                ModuleId = "module-spoof",
+                SourceId = "registration-spoof",
             },
             SidecarCapabilityKind.Action,
             firstPayload,
@@ -7061,7 +7061,7 @@ public sealed class SidecarCapabilityTransportTests
 
         var deadline = actionCall.Deadline;
         var authority = new HostActionEntryAuthority(
-            fixture.Binding.ModuleId,
+            fixture.Binding.SourceId,
             fixture.Binding.GraphId,
             fixture.Binding.SessionId,
             fixture.Binding.RequestId,
@@ -7169,7 +7169,7 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
-    public async Task Module_host_entry_request_uses_session_issued_authority_without_module_proof_access()
+    public async Task Registration_host_entry_request_uses_session_issued_authority_without_registration_proof_access()
     {
         var now = new DateTimeOffset(2026, 8, 14, 12, 0, 0, TimeSpan.Zero);
         var caller = new RequestPrincipal("endpoint-user", Roles: new HashSet<string>(["reader"]));
@@ -7291,12 +7291,12 @@ public sealed class SidecarCapabilityTransportTests
         var cancellation = Cancellation(fixture);
         var calls = new SidecarStorageCapabilityRequest[]
         {
-            SidecarStorageCapabilityRequest.ListContracts(fixture.Call, "module-a", type, cancellation, fixture.Call.Deadline),
-            SidecarStorageCapabilityRequest.Invoke(fixture.Call, "module-a", "jobs", request, type, cancellation, fixture.Call.Deadline),
-            SidecarStorageCapabilityRequest.CommitMutationAndOutbox(fixture.Call, "module-a", "jobs", request, type, cancellation, fixture.Call.Deadline),
-            SidecarStorageCapabilityRequest.Claim(fixture.Call, "module-a", "jobs", request, type, cancellation, fixture.Call.Deadline),
-            SidecarStorageCapabilityRequest.RenewClaim(fixture.Call, "module-a", "jobs", request, type, cancellation, fixture.Call.Deadline),
-            SidecarStorageCapabilityRequest.RecoverClaim(fixture.Call, "module-a", "jobs", request, type, cancellation, fixture.Call.Deadline),
+            SidecarStorageCapabilityRequest.ListContracts(fixture.Call, "registration-a", type, cancellation, fixture.Call.Deadline),
+            SidecarStorageCapabilityRequest.Invoke(fixture.Call, "registration-a", "jobs", request, type, cancellation, fixture.Call.Deadline),
+            SidecarStorageCapabilityRequest.CommitMutationAndOutbox(fixture.Call, "registration-a", "jobs", request, type, cancellation, fixture.Call.Deadline),
+            SidecarStorageCapabilityRequest.Claim(fixture.Call, "registration-a", "jobs", request, type, cancellation, fixture.Call.Deadline),
+            SidecarStorageCapabilityRequest.RenewClaim(fixture.Call, "registration-a", "jobs", request, type, cancellation, fixture.Call.Deadline),
+            SidecarStorageCapabilityRequest.RecoverClaim(fixture.Call, "registration-a", "jobs", request, type, cancellation, fixture.Call.Deadline),
         };
 
         Assert.Equal(Enum.GetValues<SidecarStorageOperationKind>(), calls.Select(item => item.Operation).ToArray());
@@ -7310,7 +7310,7 @@ public sealed class SidecarCapabilityTransportTests
         var fixture = CreateFixture();
         var request = SidecarStorageCapabilityRequest.Invoke(
             fixture.Call,
-            "module-a",
+            "registration-a",
             "jobs",
             Payload("storage.request", new { key = "job-1" }),
             PayloadType("storage.result"),
@@ -7320,7 +7320,7 @@ public sealed class SidecarCapabilityTransportTests
         var response = new SidecarStorageCapabilityResponse(
             new SidecarStorageResultIdentity(Guid.NewGuid(), fixture.Call.CallId, resultPayload.ContentHash, true),
             resultPayload,
-            new ModuleStorageContractFailure(ModuleStorageErrors.RevisionConflict, "The revision is stale.", "job-1", 3, 4),
+            new ScopedStorageContractFailure(ScopedStorageErrors.RevisionConflict, "The revision is stale.", "job-1", 3, 4),
             fixture.SafeFailure,
             Completed: false);
 
@@ -7447,7 +7447,7 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Binding.RequestId,
             fixture.Binding.CancellationId,
             request.Call.CallId,
-            fixture.Binding.ModuleId,
+            fixture.Binding.SourceId,
             fixture.Binding.GraphId,
             request.Invocation,
             descriptor.Key,
@@ -7897,7 +7897,7 @@ public sealed class SidecarCapabilityTransportTests
     }
 
     [Fact]
-    public async Task Host_entry_uses_existing_action_exchange_without_module_snapshot()
+    public async Task Host_entry_uses_existing_action_exchange_without_registration_snapshot()
     {
         var fixture = CreateFixture();
         var call = fixture.Call with { Capability = SidecarCapabilityKind.Action };
@@ -7951,7 +7951,7 @@ public sealed class SidecarCapabilityTransportTests
         Assert.Equal(
             SidecarCapabilityErrors.InvalidPayload,
             SidecarCapabilityTransportValidation.ValidateActionRequest(
-                transport.Request with { Snapshot = new ActionPipelineSnapshot("module-graph", []) },
+                transport.Request with { Snapshot = new ActionPipelineSnapshot("registration-graph", []) },
                 fixture.Binding,
                 fixture.Now).Code);
         Assert.True(SidecarCapabilityTransportValidation.ValidateActionRequest(
@@ -7983,16 +7983,16 @@ public sealed class SidecarCapabilityTransportTests
             1,
             "runtime-cli-descriptor");
         var childDescriptor = new SidecarActionDescriptorIdentity(
-            new SharpClawActionKey("module.application.command"),
+            new SharpClawActionKey("registration.application.command"),
             1,
-            "module.application",
-            "module.application.input",
-            "module-application-input",
+            "registration.application",
+            "registration.application.input",
+            "registration-application-input",
             1,
-            "module.application.result",
-            "module-application-result",
+            "registration.application.result",
+            "registration-application-result",
             1,
-            "module-application-descriptor");
+            "registration-application-descriptor");
         var context = IssueContext(
             fixture,
             new RequestPrincipal("application-caller"),
@@ -8104,11 +8104,11 @@ public sealed class SidecarCapabilityTransportTests
         };
         var context = IssueContext(
             fixture,
-            new RequestPrincipal("module-user"),
+            new RequestPrincipal("registration-user"),
             HostActionEntryIngress.Endpoint,
             actionDeadline: call.Deadline,
             lineage: Lineage(descriptor, "input"));
-        var moduleRequest = new HostActionEntryRequest<string, string>(
+        var registrationRequest = new HostActionEntryRequest<string, string>(
             descriptor,
             "input",
             context);
@@ -8116,7 +8116,7 @@ public sealed class SidecarCapabilityTransportTests
         var proxy = new TransportHostActionEntryProxy(transport, call);
 
         var outcome = await proxy.InvokeAsync(
-            moduleRequest,
+            registrationRequest,
             new RecordingHostActionEntryTerminal<string, string>());
 
         Assert.Equal(ActionOutcomeKind.Cancelled, outcome.Kind);
@@ -8383,14 +8383,14 @@ public sealed class SidecarCapabilityTransportTests
                 ReplayNonce = $"ingress-terminal-{index}",
                 Sequence = index + 1,
             };
-            var key = new SharpClawActionKey($"module.{ingress.ToString().ToLowerInvariant()}");
+            var key = new SharpClawActionKey($"registration.{ingress.ToString().ToLowerInvariant()}");
             var inputType = ingress == HostActionEntryIngress.Endpoint
                 ? typeof(HostEndpointInvocation).AssemblyQualifiedName!
                 : typeof(string).AssemblyQualifiedName!;
             var descriptor = new SidecarActionDescriptorIdentity(
                 key,
                 1,
-                "module",
+                "registration",
                 inputType,
                 $"{key.Value}.input",
                 1,
@@ -8466,9 +8466,9 @@ public sealed class SidecarCapabilityTransportTests
             ReplayNonce = "terminal-authority",
         };
         var descriptor = new SidecarActionDescriptorIdentity(
-            new SharpClawActionKey("module.terminal"),
+            new SharpClawActionKey("registration.terminal"),
             1,
-            "module",
+            "registration",
             typeof(string).AssemblyQualifiedName!,
             "terminal.input",
             1,
@@ -8586,7 +8586,7 @@ public sealed class SidecarCapabilityTransportTests
                 request,
                 terminalRequest with
                 {
-                    Descriptor = descriptor with { Key = new SharpClawActionKey("module.other") },
+                    Descriptor = descriptor with { Key = new SharpClawActionKey("registration.other") },
                 },
                 fixture.Binding,
                 fixture.Now,
@@ -8635,7 +8635,7 @@ public sealed class SidecarCapabilityTransportTests
         var nestedContext = IssueContext(
             fixture,
             new RequestPrincipal("nested"),
-            HostActionEntryIngress.CrossModule);
+            HostActionEntryIngress.CrossRegistration);
         var rootAuthority = ActivateContext(fixture, rootContext);
         var nestedAuthority = ActivateContext(fixture, nestedContext);
         var rootCall = fixture.Call with
@@ -8699,9 +8699,9 @@ public sealed class SidecarCapabilityTransportTests
             ReplayNonce = "non-host-nested",
         };
         var descriptor = new SidecarActionDescriptorIdentity(
-            new SharpClawActionKey("module.run"),
+            new SharpClawActionKey("registration.run"),
             1,
-            "module",
+            "registration",
             typeof(string).AssemblyQualifiedName!,
             "run-input",
             1,
@@ -8802,9 +8802,9 @@ public sealed class SidecarCapabilityTransportTests
         var childAction = Payload(typeof(string).AssemblyQualifiedName!, "child");
         var contribution = new HostActionEntryContribution(
             new HostActionEntryIngressBinding(
-                HostActionEntryIngress.CrossModule,
-                "module-a",
-                "target-module"),
+                HostActionEntryIngress.CrossRegistration,
+                "registration-a",
+                "target-registration"),
             new HostActionEntryLineage(
                 childDescriptor.Key,
                 childDescriptor.Version,
@@ -8936,7 +8936,7 @@ public sealed class SidecarCapabilityTransportTests
             "child-release-descriptor");
         var action = Payload(typeof(string).AssemblyQualifiedName!, "child");
         var contribution = new HostActionEntryContribution(
-            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "module-a", "target-module"),
+            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossRegistration, "registration-a", "target-registration"),
             new HostActionEntryLineage(
                 descriptor.Key,
                 descriptor.Version,
@@ -9038,7 +9038,7 @@ public sealed class SidecarCapabilityTransportTests
             "child-expiry-descriptor");
         var action = Payload(typeof(string).AssemblyQualifiedName!, "child");
         var contribution = new HostActionEntryContribution(
-            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "module-a", "target-module"),
+            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossRegistration, "registration-a", "target-registration"),
             new HostActionEntryLineage(
                 descriptor.Key,
                 descriptor.Version,
@@ -9192,7 +9192,7 @@ public sealed class SidecarCapabilityTransportTests
         var parentContext = IssueContext(
             fixture,
             new RequestPrincipal("storage-parent-caller"),
-            HostActionEntryIngress.CrossModule,
+            HostActionEntryIngress.CrossRegistration,
             lineage: new HostActionEntryLineage(
                 parentDescriptor.Key,
                 parentDescriptor.Version,
@@ -9248,7 +9248,7 @@ public sealed class SidecarCapabilityTransportTests
         var continuationPayload = Payload("agent_job_imports.request", new { jobId = "job-1" });
         var continuationRequest = SidecarStorageCapabilityRequest.Invoke(
             continuationCall,
-            fixture.Binding.ModuleId,
+            fixture.Binding.SourceId,
             "agent_job_imports/get",
             continuationPayload,
             PayloadType("agent_job_imports.result"),
@@ -9406,7 +9406,7 @@ public sealed class SidecarCapabilityTransportTests
         var parentContext = IssueContext(
             fixture,
             new RequestPrincipal("storage-receipt-caller"),
-            HostActionEntryIngress.CrossModule,
+            HostActionEntryIngress.CrossRegistration,
             lineage: new HostActionEntryLineage(
                 parentDescriptor.Key,
                 parentDescriptor.Version,
@@ -9447,7 +9447,7 @@ public sealed class SidecarCapabilityTransportTests
         var storagePayload = Payload("storage.receipt.request", new { value = 3 });
         var storageRequest = SidecarStorageCapabilityRequest.Invoke(
             storageCall,
-            fixture.Binding.ModuleId,
+            fixture.Binding.SourceId,
             "storage_receipt/get",
             storagePayload,
             PayloadType("storage.receipt.result"),
@@ -9476,7 +9476,7 @@ public sealed class SidecarCapabilityTransportTests
         var target = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "module-b",
+            SourceId: "registration-b",
             graphId: "graph-b",
             authenticateStorageContinuationAuthority: (authority, hash) =>
                 hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority) &&
@@ -9489,7 +9489,7 @@ public sealed class SidecarCapabilityTransportTests
         var sourceContext = IssueContext(
             source,
             new RequestPrincipal("issuer-caller"),
-            HostActionEntryIngress.CrossModule,
+            HostActionEntryIngress.CrossRegistration,
             lineage: new HostActionEntryLineage(
                 descriptor.Key,
                 descriptor.Version,
@@ -9502,7 +9502,7 @@ public sealed class SidecarCapabilityTransportTests
         var targetContext = IssueContext(
             target,
             new RequestPrincipal("target-caller"),
-            HostActionEntryIngress.CrossModule,
+            HostActionEntryIngress.CrossRegistration,
             lineage: new HostActionEntryLineage(
                 descriptor.Key,
                 descriptor.Version,
@@ -9564,7 +9564,7 @@ public sealed class SidecarCapabilityTransportTests
         var storagePayload = Payload("agent_job_imports.request", new { jobId = "issuer-lifetime-job" });
         var storageRequest = SidecarStorageCapabilityRequest.Invoke(
             storageCall,
-            target.Binding.ModuleId,
+            target.Binding.SourceId,
             "agent_job_imports/get",
             storagePayload,
             PayloadType("agent_job_imports.result"),
@@ -9929,9 +9929,9 @@ public sealed class SidecarCapabilityTransportTests
         };
         var contribution = new HostActionEntryContribution(
             new HostActionEntryIngressBinding(
-                HostActionEntryIngress.CrossModule,
-                "module-a",
-                "module-b"),
+                HostActionEntryIngress.CrossRegistration,
+                "registration-a",
+                "registration-b"),
             new HostActionEntryLineage(
                 childDescriptor.Key,
                 childDescriptor.Version,
@@ -10455,7 +10455,7 @@ public sealed class SidecarCapabilityTransportTests
                 parentAction.ContentHash)).Accepted);
 
         var contribution = new HostActionEntryContribution(
-            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "parent", "child"),
+            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossRegistration, "parent", "child"),
             new HostActionEntryLineage(
                 childDescriptor.Key,
                 childDescriptor.Version,
@@ -10598,7 +10598,7 @@ public sealed class SidecarCapabilityTransportTests
                 child,
                 descriptor,
                 new HostActionEntryContribution(
-                    new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "module-a", "module-b"),
+                    new HostActionEntryIngressBinding(HostActionEntryIngress.CrossRegistration, "registration-a", "registration-b"),
                     new HostActionEntryLineage(
                         descriptor.Key,
                         descriptor.Version,
@@ -10643,7 +10643,7 @@ public sealed class SidecarCapabilityTransportTests
         var childDescriptor = new SidecarActionDescriptorIdentity(
             new SharpClawActionKey("child.runtime"),
             1,
-            "module",
+            "registration",
             typeof(string).AssemblyQualifiedName!,
             "child-input",
             1,
@@ -10699,7 +10699,7 @@ public sealed class SidecarCapabilityTransportTests
             rootAction.ContentHash);
         Assert.True(fixture.Session.RecordTerminal(parentCall.CallId, Guid.NewGuid(), rootReceipt).Accepted);
         var contribution = new HostActionEntryContribution(
-            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossModule, "module-a", "module-b"),
+            new HostActionEntryIngressBinding(HostActionEntryIngress.CrossRegistration, "registration-a", "registration-b"),
             new HostActionEntryLineage(
                 childDescriptor.Key,
                 childDescriptor.Version,
@@ -10735,7 +10735,7 @@ public sealed class SidecarCapabilityTransportTests
             rootContext.Attempt,
             rootContext.Deadline,
             rootDescriptor.Key,
-            fixture.Binding.ModuleId,
+            fixture.Binding.SourceId,
             rootContext.Caller,
             "root",
             rootContext.Features,
@@ -10842,7 +10842,7 @@ public sealed class SidecarCapabilityTransportTests
             fixture.Binding.RequestId,
             fixture.Binding.CancellationId,
             request.Call.CallId,
-            fixture.Binding.ModuleId,
+            fixture.Binding.SourceId,
             fixture.Binding.GraphId,
             request.Invocation,
             request.Descriptor.Key,
@@ -10958,7 +10958,7 @@ public sealed class SidecarCapabilityTransportTests
             Proof = terminalRequest.Authority.CanonicalBindingHash,
         };
         var authority = new SidecarExternalActionDispatchAuthority(
-            call.ModuleId,
+            call.SourceId,
             call.GraphId,
             call,
             descriptor,
@@ -10986,7 +10986,7 @@ public sealed class SidecarCapabilityTransportTests
         var peer = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "module-b",
+            SourceId: "registration-b",
             graphId: "graph-b",
             authenticateHostTerminalAuthority: VerifyHostProof,
             authenticateStorageContinuationAuthority: (authority, hash) =>
@@ -11421,7 +11421,7 @@ public sealed class SidecarCapabilityTransportTests
         var storagePayload = Payload("agent_job_imports.request", new { jobId = "nested-job" });
         var storageRequest = SidecarStorageCapabilityRequest.Invoke(
             storageCall,
-            peer.Binding.ModuleId,
+            peer.Binding.SourceId,
             "agent_job_imports/get",
             storagePayload,
             PayloadType("agent_job_imports.result"),
@@ -11506,13 +11506,13 @@ public sealed class SidecarCapabilityTransportTests
         var host = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "module-b",
+            SourceId: "registration-b",
             graphId: "graph-b",
             authenticateHostTerminalAuthority: VerifyHostProof);
         var peer = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "module-b",
+            SourceId: "registration-b",
             graphId: "graph-b",
             authenticateHostTerminalAuthority: VerifyHostProof);
         ConsumeStorageCalls(peer, 8, "two-root-boundary");
@@ -11737,13 +11737,13 @@ public sealed class SidecarCapabilityTransportTests
         var host = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "module-b",
+            SourceId: "registration-b",
             graphId: "graph-b",
             authenticateHostTerminalAuthority: VerifyHostProof);
         var peer = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "module-b",
+            SourceId: "registration-b",
             graphId: "graph-b",
             authenticateHostTerminalAuthority: VerifyHostProof);
         ConsumeStorageCalls(peer, 8, "peer-root-reservation");
@@ -11915,7 +11915,7 @@ public sealed class SidecarCapabilityTransportTests
         var host = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "module-root-storage",
+            SourceId: "registration-root-storage",
             graphId: "graph-root-storage",
             authenticateHostTerminalAuthority: VerifyHostProof,
             authenticateStorageContinuationAuthority: VerifyStorageProof);
@@ -12062,7 +12062,7 @@ public sealed class SidecarCapabilityTransportTests
         var storagePayload = Payload("root.storage.request", "payload");
         var storageRequest = SidecarStorageCapabilityRequest.Invoke(
             storageCall,
-            peer.Binding.ModuleId,
+            peer.Binding.SourceId,
             "root_storage/get",
             storagePayload,
             PayloadType("root.storage.result"),
@@ -12209,7 +12209,7 @@ public sealed class SidecarCapabilityTransportTests
             binding.CancellationId,
             Guid.NewGuid(),
             "mirrored-call-nonce-1",
-            binding.ModuleId,
+            binding.SourceId,
             binding.GraphId,
             SidecarCapabilityKind.Storage,
             1,
@@ -12221,7 +12221,7 @@ public sealed class SidecarCapabilityTransportTests
         int maxInFlight = 2,
         int maxCalls = 4,
         IReadOnlyList<SidecarCapabilityKind>? capabilities = null,
-        string moduleId = "module-a",
+        string SourceId = "registration-a",
         string graphId = "graph-a",
         Func<SidecarHostTerminalAuthority, string, bool>? authenticateHostTerminalAuthority = null,
         Func<SidecarHostEntryStorageContinuationAuthority, string, bool>? authenticateStorageContinuationAuthority = null,
@@ -12239,12 +12239,12 @@ public sealed class SidecarCapabilityTransportTests
         var safeFailure = new SidecarSafeFailureIdentity(Guid.NewGuid(), "sidecar.test.failure", "The test failure is safe.");
         var proof = new SidecarAuthenticationProof("hmac-sha256", "host-a", "nonce-a", "signature", "", now, expires);
         var binding = new SidecarCapabilitySessionBinding(
-            moduleId,
+            SourceId,
             graphId,
             1,
             new SidecarCapabilityGrant(
                 "grant-a",
-                moduleId,
+                SourceId,
                 graphId,
                 capabilities ?? [SidecarCapabilityKind.Storage, SidecarCapabilityKind.Action],
                 "authorization-hash",
@@ -12295,7 +12295,7 @@ public sealed class SidecarCapabilityTransportTests
             binding.CancellationId,
             Guid.NewGuid(),
             "call-nonce-1",
-            binding.ModuleId,
+            binding.SourceId,
             binding.GraphId,
             SidecarCapabilityKind.Storage,
             1,
@@ -12316,11 +12316,11 @@ public sealed class SidecarCapabilityTransportTests
         }
 
         var source = CreateFixture(
-            moduleId: "source-module",
+            SourceId: "source-registration",
             graphId: "source-graph",
             authenticateHostTerminalAuthority: Authenticate);
         var target = CreateFixture(
-            moduleId: "target-module",
+            SourceId: "target-registration",
             graphId: "target-graph",
             authenticateHostTerminalAuthority: Authenticate);
         var cross = CreateCrossRelay(source, target);
@@ -12562,14 +12562,14 @@ public sealed class SidecarCapabilityTransportTests
     [InlineData(7)]
     public void CrossSidecarPeerRelayImportsTargetCarrierThroughTerminalExchange(int priorCalls)
     {
-        var source = CreateFixture(maxInFlight: 4, maxCalls: 8, moduleId: "source-module", graphId: "source-graph");
-        var hostTarget = CreateFixture(maxInFlight: 4, maxCalls: 8, moduleId: "target-module", graphId: "target-graph");
+        var source = CreateFixture(maxInFlight: 4, maxCalls: 8, SourceId: "source-registration", graphId: "source-graph");
+        var hostTarget = CreateFixture(maxInFlight: 4, maxCalls: 8, SourceId: "target-registration", graphId: "target-graph");
         var targetPeer = CreateMirroredFixture(
             hostTarget,
             static (authority, hash) => authority.Proof == hash,
             static (authority, hash) => hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority));
         ConsumeStorageCalls(hostTarget, priorCalls, "peer-host-prior");
-        ConsumeStorageCalls(targetPeer, priorCalls, "peer-module-prior");
+        ConsumeStorageCalls(targetPeer, priorCalls, "peer-registration-prior");
         var parent = PrepareCrossParent(source, "peer-source.parent");
         var descriptor = new SidecarActionDescriptorIdentity(
             new SharpClawActionKey("peer-target.action"),
@@ -12582,11 +12582,11 @@ public sealed class SidecarCapabilityTransportTests
             "peer-target-result-schema",
             1,
             "peer-target-descriptor");
-        var entry = new SidecarModuleActionEntryDefinition(
-            hostTarget.Binding.ModuleId,
+        var entry = new SidecarActionEntryDefinition(
+            hostTarget.Binding.SourceId,
             hostTarget.Binding.GraphId,
             descriptor,
-            hostTarget.Binding.ModuleId,
+            hostTarget.Binding.SourceId,
             hostTarget.Binding.GraphId);
         var childRequest = new SidecarCrossSidecarActionEntryRequest(
             descriptor.Key,
@@ -12757,7 +12757,7 @@ public sealed class SidecarCapabilityTransportTests
                 peerReceipt).Accepted);
             var storageRequest = SidecarStorageCapabilityRequest.Invoke(
                 storageCall,
-                targetPeer.Binding.ModuleId,
+                targetPeer.Binding.SourceId,
                 "peer-storage/get",
                 storagePayload,
                 PayloadType("peer-storage.result"),
@@ -12814,7 +12814,7 @@ public sealed class SidecarCapabilityTransportTests
             authenticateStorageContinuationAuthority: (authority, hash) =>
                 hash == SidecarCapabilityTransportValidation.ComputeStorageContinuationBindingHash(authority) &&
                 source.Session.IsStorageContinuationAuthorityLive(authority, source.Now),
-            moduleId: "module-b",
+            SourceId: "registration-b",
             graphId: "graph-b");
         ConsumeStorageCalls(target, 6, "cross-boundary");
         var targetParent = PrepareCrossParent(target, "target.root", sequence: 7);
@@ -12917,7 +12917,7 @@ public sealed class SidecarCapabilityTransportTests
             new { jobId = "cross-sidecar-job" });
         var storageRequest = SidecarStorageCapabilityRequest.Invoke(
             storageCall,
-            target.Binding.ModuleId,
+            target.Binding.SourceId,
             "agent_job_imports/get",
             storagePayload,
             PayloadType("agent_job_imports.result"),
@@ -13005,12 +13005,12 @@ public sealed class SidecarCapabilityTransportTests
             authority.Proof == hash;
 
         var source = CreateFixture(
-            moduleId: "source-module",
+            SourceId: "source-registration",
             graphId: "source-graph");
         var hostTarget = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "target-module",
+            SourceId: "target-registration",
             graphId: "target-graph",
             authenticateHostTerminalAuthority: Authenticate,
             authenticateStorageContinuationAuthority: (authority, hash) =>
@@ -13160,7 +13160,7 @@ public sealed class SidecarCapabilityTransportTests
         var storagePayload = Payload("cross-target-storage.request", new { value = 4 });
         var storageRequest = SidecarStorageCapabilityRequest.Invoke(
             storageCall,
-            hostTarget.Binding.ModuleId,
+            hostTarget.Binding.SourceId,
             "cross-target-storage/get",
             storagePayload,
             PayloadType("cross-target-storage.result"),
@@ -13863,14 +13863,14 @@ public sealed class SidecarCapabilityTransportTests
         var target = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "target-module",
+            SourceId: "target-registration",
             graphId: "target-graph");
         ConsumeStorageCalls(target, 8, "cross-root-budget");
 
-        var sourceOne = CreateFixture(moduleId: "source-one", graphId: "source-one-graph");
-        var sourceTwo = CreateFixture(moduleId: "source-two", graphId: "source-two-graph");
-        var sourceThree = CreateFixture(moduleId: "source-three", graphId: "source-three-graph");
-        var sourceFour = CreateFixture(moduleId: "source-four", graphId: "source-four-graph");
+        var sourceOne = CreateFixture(SourceId: "source-one", graphId: "source-one-graph");
+        var sourceTwo = CreateFixture(SourceId: "source-two", graphId: "source-two-graph");
+        var sourceThree = CreateFixture(SourceId: "source-three", graphId: "source-three-graph");
+        var sourceFour = CreateFixture(SourceId: "source-four", graphId: "source-four-graph");
         var first = CreateCrossRelayAttempt(sourceOne, target, _ => (_, hash) => hash);
         var second = CreateCrossRelayAttempt(sourceTwo, target, _ => (_, hash) => hash);
         Assert.True(first.Result.Accepted, first.Result.Message);
@@ -13954,13 +13954,13 @@ public sealed class SidecarCapabilityTransportTests
         var target = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "target-expiry-module",
+            SourceId: "target-expiry-registration",
             graphId: "target-expiry-graph");
         ConsumeStorageCalls(target, 8, "cross-root-expiry");
 
-        var sourceOne = CreateFixture(moduleId: "expiry-source-one", graphId: "expiry-source-one-graph");
-        var sourceTwo = CreateFixture(moduleId: "expiry-source-two", graphId: "expiry-source-two-graph");
-        var sourceThree = CreateFixture(moduleId: "expiry-source-three", graphId: "expiry-source-three-graph");
+        var sourceOne = CreateFixture(SourceId: "expiry-source-one", graphId: "expiry-source-one-graph");
+        var sourceTwo = CreateFixture(SourceId: "expiry-source-two", graphId: "expiry-source-two-graph");
+        var sourceThree = CreateFixture(SourceId: "expiry-source-three", graphId: "expiry-source-three-graph");
         var first = CreateCrossRelayAttempt(sourceOne, target, _ => (_, hash) => hash);
         var second = CreateCrossRelayAttempt(sourceTwo, target, _ => (_, hash) => hash);
         Assert.True(first.Result.Accepted, first.Result.Message);
@@ -13991,7 +13991,7 @@ public sealed class SidecarCapabilityTransportTests
         var parentContext = IssueContext(
             fixture,
             new RequestPrincipal("source-user"),
-            HostActionEntryIngress.CrossModule,
+            HostActionEntryIngress.CrossRegistration,
             lineage: new HostActionEntryLineage(
                 new SharpClawActionKey("source.action"),
                 1,
@@ -14022,14 +14022,14 @@ public sealed class SidecarCapabilityTransportTests
 
         var targetBinding = fixture.Binding with
         {
-            ModuleId = "permission.module",
+            SourceId = "permission.registration",
             GraphId = "permission.graph",
             SessionId = Guid.NewGuid(),
             RequestId = Guid.NewGuid(),
             CancellationId = Guid.NewGuid(),
             Grant = fixture.Binding.Grant with
             {
-                ModuleId = "permission.module",
+                SourceId = "permission.registration",
                 GraphId = "permission.graph",
             },
             Authentication = fixture.Binding.Authentication with
@@ -14058,7 +14058,7 @@ public sealed class SidecarCapabilityTransportTests
         var childDescriptor = new SidecarActionDescriptorIdentity(
             childKey,
             1,
-            "module-owned",
+            "registration-owned",
             "permission.input",
             "permission-input-schema",
             1,
@@ -14066,11 +14066,11 @@ public sealed class SidecarCapabilityTransportTests
             "permission-result-schema",
             1,
             "permission-descriptor");
-        var childEntry = new SidecarModuleActionEntryDefinition(
-            "permission.module",
+        var childEntry = new SidecarActionEntryDefinition(
+            "permission.registration",
             "permission.graph",
             childDescriptor,
-            "permission.module",
+            "permission.registration",
             "permission.graph");
         var childRequest = new SidecarCrossSidecarActionEntryRequest(
             childKey,
@@ -14375,10 +14375,10 @@ public sealed class SidecarCapabilityTransportTests
     [Fact]
     public void CrossSidecarFailedAndCancelledOutcomesUseCompletedTerminalExecution()
     {
-        var failed = CreateCrossRelay(CreateFixture(), CreateFixture(moduleId: "module-b", graphId: "graph-b"));
+        var failed = CreateCrossRelay(CreateFixture(), CreateFixture(SourceId: "registration-b", graphId: "graph-b"));
         AssertCrossSidecarNonSuccessfulOutcome(failed, ActionOutcomeKind.Failed, includeError: true);
 
-        var cancelled = CreateCrossRelay(CreateFixture(), CreateFixture(moduleId: "module-c", graphId: "graph-c"));
+        var cancelled = CreateCrossRelay(CreateFixture(), CreateFixture(SourceId: "registration-c", graphId: "graph-c"));
         AssertCrossSidecarNonSuccessfulOutcome(cancelled, ActionOutcomeKind.Cancelled, includeError: false);
     }
 
@@ -14458,7 +14458,7 @@ public sealed class SidecarCapabilityTransportTests
         var parentContext = IssueContext(
             fixture,
             new RequestPrincipal("source-user"),
-            HostActionEntryIngress.CrossModule,
+            HostActionEntryIngress.CrossRegistration,
             lineage: new HostActionEntryLineage(
                 new SharpClawActionKey("source.action"),
                 1,
@@ -14478,18 +14478,18 @@ public sealed class SidecarCapabilityTransportTests
 
         var targetBinding = fixture.Binding with
         {
-            ModuleId = "permission.module",
+            SourceId = "permission.registration",
             GraphId = "permission.graph",
             SessionId = Guid.NewGuid(),
             RequestId = Guid.NewGuid(),
             CancellationId = Guid.NewGuid(),
-            Grant = fixture.Binding.Grant with { ModuleId = "permission.module", GraphId = "permission.graph" },
+            Grant = fixture.Binding.Grant with { SourceId = "permission.registration", GraphId = "permission.graph" },
             Authentication = fixture.Binding.Authentication with { Nonce = "target-negative", BindingHash = string.Empty },
         };
         targetBinding = targetBinding with { Authentication = targetBinding.Authentication with { BindingHash = SidecarCapabilitySessionValidator.ComputeBindingHash(targetBinding) } };
         var targetSession = new SidecarCapabilitySession(targetBinding, _ => true, new HashSet<string>(StringComparer.Ordinal).Add, fixture.Now);
-        var descriptor = new SidecarActionDescriptorIdentity(new SharpClawActionKey("permission.action"), 1, "module-owned", "permission.input", "permission-input-schema", 1, "permission.result", "permission-result-schema", 1, "permission-descriptor");
-        var entry = new SidecarModuleActionEntryDefinition("permission.module", "permission.graph", descriptor, "permission.module", "permission.graph");
+        var descriptor = new SidecarActionDescriptorIdentity(new SharpClawActionKey("permission.action"), 1, "registration-owned", "permission.input", "permission-input-schema", 1, "permission.result", "permission-result-schema", 1, "permission-descriptor");
+        var entry = new SidecarActionEntryDefinition("permission.registration", "permission.graph", descriptor, "permission.registration", "permission.graph");
         var request = new SidecarCrossSidecarActionEntryRequest(descriptor.Key, 1, Payload("permission.input", new { value = 2 }), parentCall.Deadline, fixture.Now.AddMinutes(2));
         var relayResult = fixture.Session.IssueCrossSidecarActionEntryRelay(parentCall, request, targetSession, entry, new ActionPipelineSnapshot("snapshot", []), fixture.Now, (authority, hash) => hash, out var relay);
         Assert.True(relayResult.Accepted, relayResult.Message);
@@ -14504,19 +14504,19 @@ public sealed class SidecarCapabilityTransportTests
             (authority, hash) => authority.Proof == hash);
         Assert.False(changedResult.Accepted);
 
-        var wrongEntry = entry with { ModuleId = "other.module", TerminalOwnerModuleId = "other.module" };
+        var wrongEntry = entry with { SourceId = "other.registration", TerminalOwnerId = "other.registration" };
         Assert.Equal(SidecarCapabilityErrors.SpoofedIdentity, fixture.Session.IssueCrossSidecarActionEntryRelay(parentCall, request, targetSession, wrongEntry, new ActionPipelineSnapshot("snapshot", []), fixture.Now, (authority, hash) => hash, out _).Code);
     }
 
     [Fact]
     public async Task CrossSidecarReciprocalRelayDoesNotDeadlock()
     {
-        var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
-        var target = CreateFixture(moduleId: "module-b", graphId: "graph-b");
+        var source = CreateFixture(SourceId: "registration-a", graphId: "graph-a");
+        var target = CreateFixture(SourceId: "registration-b", graphId: "graph-b");
         var sourceParent = PrepareCrossParent(source, "source.parent");
         var targetParent = PrepareCrossParent(target, "target.parent");
-        var sourceEntry = new SidecarModuleActionEntryDefinition(
-            source.Binding.ModuleId,
+        var sourceEntry = new SidecarActionEntryDefinition(
+            source.Binding.SourceId,
             source.Binding.GraphId,
             new SidecarActionDescriptorIdentity(
                 new SharpClawActionKey("source.child"),
@@ -14529,11 +14529,11 @@ public sealed class SidecarCapabilityTransportTests
                 "source-child-result-schema",
                 1,
                 "source-child-descriptor"),
-            source.Binding.ModuleId,
+            source.Binding.SourceId,
             source.Binding.GraphId);
         var targetEntry = sourceEntry with
         {
-            ModuleId = target.Binding.ModuleId,
+            SourceId = target.Binding.SourceId,
             GraphId = target.Binding.GraphId,
             Descriptor = sourceEntry.Descriptor with
             {
@@ -14545,7 +14545,7 @@ public sealed class SidecarCapabilityTransportTests
                 ResultSchemaHash = "target-child-result-schema",
                 DescriptorHash = "target-child-descriptor",
             },
-            TerminalOwnerModuleId = target.Binding.ModuleId,
+            TerminalOwnerId = target.Binding.SourceId,
             TerminalOwnerGraphId = target.Binding.GraphId,
         };
         var sourceRequest = new SidecarCrossSidecarActionEntryRequest(
@@ -14592,8 +14592,8 @@ public sealed class SidecarCapabilityTransportTests
     [Fact]
     public void CrossSidecarTargetExpiryReleasesSourceParent()
     {
-        var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
-        var target = CreateFixture(moduleId: "module-b", graphId: "graph-b");
+        var source = CreateFixture(SourceId: "registration-a", graphId: "graph-a");
+        var target = CreateFixture(SourceId: "registration-b", graphId: "graph-b");
         var cross = CreateCrossRelay(source, target);
 
         var removed = target.Session.SweepExpiredHostActionEntryCarriers(
@@ -14606,8 +14606,8 @@ public sealed class SidecarCapabilityTransportTests
     [Fact]
     public void CrossSidecarTargetDisconnectAtReservationBarrierReleasesSourceParent()
     {
-        var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
-        var target = CreateFixture(moduleId: "module-b", graphId: "graph-b");
+        var source = CreateFixture(SourceId: "registration-a", graphId: "graph-a");
+        var target = CreateFixture(SourceId: "registration-b", graphId: "graph-b");
         var attempt = CreateCrossRelayAttempt(
             source,
             target,
@@ -14625,8 +14625,8 @@ public sealed class SidecarCapabilityTransportTests
     [Fact]
     public void CrossSidecarTargetDisconnectReleasesSourceParent()
     {
-        var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
-        var target = CreateFixture(moduleId: "module-b", graphId: "graph-b");
+        var source = CreateFixture(SourceId: "registration-a", graphId: "graph-a");
+        var target = CreateFixture(SourceId: "registration-b", graphId: "graph-b");
         var cross = CreateCrossRelay(source, target);
 
         target.Session.Disconnect();
@@ -14637,8 +14637,8 @@ public sealed class SidecarCapabilityTransportTests
     [Fact]
     public void CrossSidecarNormalActivityDrainsExpiredPeerCleanup()
     {
-        var source = CreateFixture(moduleId: "module-a", graphId: "graph-a");
-        var target = CreateFixture(moduleId: "module-b", graphId: "graph-b");
+        var source = CreateFixture(SourceId: "registration-a", graphId: "graph-a");
+        var target = CreateFixture(SourceId: "registration-b", graphId: "graph-b");
         var cross = CreateCrossRelay(source, target);
         var now = cross.Relay.Carrier.ExpiresAt.AddSeconds(1);
         var call = target.Call with
@@ -14676,7 +14676,7 @@ public sealed class SidecarCapabilityTransportTests
         var context = IssueContext(
             fixture,
             new RequestPrincipal($"{key}-caller"),
-            HostActionEntryIngress.CrossModule,
+            HostActionEntryIngress.CrossRegistration,
             lineage: new HostActionEntryLineage(
                 new SharpClawActionKey(key),
                 1,
@@ -14722,11 +14722,11 @@ public sealed class SidecarCapabilityTransportTests
             "target-child-result-schema",
             1,
             "target-child-descriptor");
-        var entry = new SidecarModuleActionEntryDefinition(
-            target.Binding.ModuleId,
+        var entry = new SidecarActionEntryDefinition(
+            target.Binding.SourceId,
             target.Binding.GraphId,
             descriptor,
-            target.Binding.ModuleId,
+            target.Binding.SourceId,
             target.Binding.GraphId);
         var request = new SidecarCrossSidecarActionEntryRequest(
             descriptor.Key,
@@ -14761,12 +14761,12 @@ public sealed class SidecarCapabilityTransportTests
         bool recordHostReceipt = true)
     {
         var source = CreateFixture(
-            moduleId: "source-module",
+            SourceId: "source-registration",
             graphId: "source-graph");
         var hostTarget = CreateFixture(
             maxInFlight: 4,
             maxCalls: 8,
-            moduleId: "target-module",
+            SourceId: "target-registration",
             graphId: "target-graph",
             authenticateHostTerminalAuthority: static (authority, hash) => authority.Proof == hash,
             authenticateStorageContinuationAuthority: static (authority, hash) =>
@@ -14915,7 +14915,7 @@ public sealed class SidecarCapabilityTransportTests
         var storagePayload = Payload("receipt-storage.request", new { value = 4 });
         var storageRequest = SidecarStorageCapabilityRequest.Invoke(
             storageCall,
-            hostTarget.Binding.ModuleId,
+            hostTarget.Binding.SourceId,
             "receipt-storage/get",
             storagePayload,
             PayloadType("receipt-storage.result"),
@@ -14981,11 +14981,11 @@ public sealed class SidecarCapabilityTransportTests
             "target-child-barrier-result-schema",
             1,
             "target-child-barrier-descriptor");
-        var entry = new SidecarModuleActionEntryDefinition(
-            target.Binding.ModuleId,
+        var entry = new SidecarActionEntryDefinition(
+            target.Binding.SourceId,
             target.Binding.GraphId,
             descriptor,
-            target.Binding.ModuleId,
+            target.Binding.SourceId,
             target.Binding.GraphId);
         var request = new SidecarCrossSidecarActionEntryRequest(
             descriptor.Key,
@@ -15106,7 +15106,7 @@ public sealed class SidecarCapabilityTransportTests
                         ingress,
                         "clock_now",
                         conversationId?.ToString("D")),
-                    _ => new HostActionEntryIngressBinding(ingress, "source.module", "target.module"),
+                    _ => new HostActionEntryIngressBinding(ingress, "source.registration", "target.registration"),
                 },
                 bindPayload
                     ? lineage ?? throw new ArgumentException("A payload-bound context requires lineage.", nameof(lineage))
@@ -15530,7 +15530,7 @@ public sealed class SidecarCapabilityTransportTests
             Binding = binding,
             Call = fixture.Call with
             {
-                ModuleId = binding.ModuleId,
+                SourceId = binding.SourceId,
                 GraphId = binding.GraphId,
                 SessionId = binding.SessionId,
                 RequestId = binding.RequestId,
@@ -15598,7 +15598,7 @@ public sealed class SidecarCapabilityTransportTests
             SessionId = receiving.Binding.SessionId,
             RequestId = receiving.Binding.RequestId,
             CancellationId = receiving.Binding.CancellationId,
-            ModuleId = receiving.Binding.ModuleId,
+            SourceId = receiving.Binding.SourceId,
             GraphId = receiving.Binding.GraphId,
             ReplayNonce = $"{key}-peer",
         };

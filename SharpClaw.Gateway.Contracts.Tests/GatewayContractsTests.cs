@@ -1,6 +1,5 @@
 using System.Net;
 using System.Text.Json;
-using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using SharpClaw.Gateway.Contracts;
@@ -58,21 +57,6 @@ public sealed class GatewayContractsTests
     }
 
     [Fact]
-    public void GatewayModuleExtensionContractSupportsEndpointGroupsAndServices()
-    {
-        var extension = new DemoGatewayModuleExtension();
-        var services = new ServiceCollection();
-
-        extension.ConfigureGatewayServices(services);
-
-        var descriptor = Assert.Single(services);
-        var group = Assert.Single(extension.GetEndpointGroups());
-        Assert.Equal("demo.gateway", extension.ModuleId);
-        Assert.Equal("demo.gateway.search", group.GroupId);
-        Assert.Equal(ServiceLifetime.Singleton, descriptor.Lifetime);
-    }
-
-    [Fact]
     public async Task GatewayDispatcherContractReturnsQueuedResponse()
     {
         IGatewayDispatcher dispatcher = new DemoGatewayDispatcher();
@@ -81,28 +65,6 @@ public sealed class GatewayContractsTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal("""{"ok":true}""", response.JsonBody);
-    }
-
-    private sealed class DemoGatewayModuleExtension : IGatewayModuleExtension
-    {
-        public string ModuleId => "demo.gateway";
-        public string DisplayName => "Demo Gateway";
-
-        public IReadOnlyList<GatewayEndpointGroup> GetEndpointGroups() =>
-        [
-            new(
-                "demo.gateway.search",
-                "Gateway Search",
-                "Search endpoint group.",
-                "gateway-search",
-                DefaultEnabled: true),
-        ];
-
-        public void ConfigureGatewayServices(IServiceCollection services) =>
-            services.AddSingleton<DemoGatewayState>();
-
-        public void MapEndpoints(IGatewayEndpointGroupBuilder builder) =>
-            builder.MapGet("/health", () => Results.Ok(new { ok = true }));
     }
 
     private sealed class DemoGatewayDispatcher : IGatewayDispatcher
@@ -144,6 +106,4 @@ public sealed class GatewayContractsTests
             RequestServices = services,
         };
     }
-
-    private sealed class DemoGatewayState;
 }

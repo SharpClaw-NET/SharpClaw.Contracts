@@ -4,9 +4,8 @@ namespace SharpClaw.Gateway.Contracts;
 
 /// <summary>
 /// Helpers for translating a <see cref="QueuedResponse"/> into an
-/// <see cref="IResult"/> so module-contributed endpoints can return the
-/// dispatcher's outcome directly without leaking gateway implementation types
-/// into module code.
+/// <see cref="IResult"/> so Gateway endpoints can return the dispatcher's
+/// outcome without duplicate response logic.
 /// </summary>
 public static class QueuedResponseExtensions
 {

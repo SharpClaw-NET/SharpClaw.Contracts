@@ -1,11 +1,11 @@
 namespace SharpClaw.Gateway.Contracts;
 
 /// <summary>
-/// Mutation forwarder a module injects to perform <c>POST</c>/<c>PUT</c>/<c>DELETE</c>
+/// Mutation forwarder a registration injects to perform <c>POST</c>/<c>PUT</c>/<c>DELETE</c>
 /// requests against the internal SharpClaw Runtime Host. The implementation
 /// routes mutations through the gateway's request queue when enabled so that
 /// sequential processing, circuit breaking, and queue metrics apply uniformly
-/// to module-contributed endpoints.
+/// to registration-contributed endpoints.
 /// </summary>
 public interface IGatewayDispatcher
 {

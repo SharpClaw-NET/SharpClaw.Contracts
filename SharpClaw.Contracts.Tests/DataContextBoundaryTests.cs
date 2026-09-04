@@ -12,12 +12,12 @@ public sealed class DataContextBoundaryTests
 
         Assert.Equal(
             [
+                nameof(ISharpClawDataContext.ConfigurationEntries),
                 nameof(ISharpClawDataContext.Models),
-                nameof(ISharpClawDataContext.ModuleConfigEntries),
-                nameof(ISharpClawDataContext.ModuleStates),
-                nameof(ISharpClawDataContext.ModuleStorageIndexEntries),
-                nameof(ISharpClawDataContext.ModuleStorageRecords),
-                nameof(ISharpClawDataContext.Providers)
+                nameof(ISharpClawDataContext.Providers),
+                nameof(ISharpClawDataContext.RegistrationStates),
+                nameof(ISharpClawDataContext.ScopedStorageIndexEntries),
+                nameof(ISharpClawDataContext.ScopedStorageRecords)
             ],
             typeof(ISharpClawDataContext)
                 .GetProperties()
@@ -27,20 +27,20 @@ public sealed class DataContextBoundaryTests
 
         Assert.NotNull(context.Providers);
         Assert.NotNull(context.Models);
-        Assert.NotNull(context.ModuleStates);
-        Assert.NotNull(context.ModuleConfigEntries);
-        Assert.NotNull(context.ModuleStorageRecords);
-        Assert.NotNull(context.ModuleStorageIndexEntries);
+        Assert.NotNull(context.RegistrationStates);
+        Assert.NotNull(context.ConfigurationEntries);
+        Assert.NotNull(context.ScopedStorageRecords);
+        Assert.NotNull(context.ScopedStorageIndexEntries);
     }
 
     private sealed class MinimalDataContext : ISharpClawDataContext
     {
         public IQueryable<ProviderDB> Providers { get; } = Empty<ProviderDB>();
         public IQueryable<ModelDB> Models { get; } = Empty<ModelDB>();
-        public IQueryable<ModuleStateDB> ModuleStates { get; } = Empty<ModuleStateDB>();
-        public IQueryable<ModuleConfigEntryDB> ModuleConfigEntries { get; } = Empty<ModuleConfigEntryDB>();
-        public IQueryable<ModuleStorageRecordDB> ModuleStorageRecords { get; } = Empty<ModuleStorageRecordDB>();
-        public IQueryable<ModuleStorageIndexEntryDB> ModuleStorageIndexEntries { get; } = Empty<ModuleStorageIndexEntryDB>();
+        public IQueryable<RegistrationStateDB> RegistrationStates { get; } = Empty<RegistrationStateDB>();
+        public IQueryable<ConfigurationEntryDB> ConfigurationEntries { get; } = Empty<ConfigurationEntryDB>();
+        public IQueryable<ScopedStorageRecordDB> ScopedStorageRecords { get; } = Empty<ScopedStorageRecordDB>();
+        public IQueryable<ScopedStorageIndexEntryDB> ScopedStorageIndexEntries { get; } = Empty<ScopedStorageIndexEntryDB>();
 
         private static IQueryable<T> Empty<T>() => Array.Empty<T>().AsQueryable();
     }

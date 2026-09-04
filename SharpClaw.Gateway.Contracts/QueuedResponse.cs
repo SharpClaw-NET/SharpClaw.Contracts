@@ -5,7 +5,7 @@ namespace SharpClaw.Gateway.Contracts;
 /// <summary>
 /// The result of a processed gateway request, returned by
 /// <see cref="IGatewayDispatcher"/> mutation methods and by the internal
-/// request-queue processor. Module code can inspect status, body, and queue
+/// request-queue processor. Registration code can inspect status, body, and queue
 /// metadata without taking a reference on the gateway implementation.
 /// </summary>
 public sealed class QueuedResponse

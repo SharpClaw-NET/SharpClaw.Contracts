@@ -12,8 +12,8 @@
     <FileVersion>0.5.0.0</FileVersion>
     <InformationalVersion>0.5.0-beta.4</InformationalVersion>
     <Authors>mkn8rn</Authors>
-    <Description>Gateway contracts for SharpClaw module-contributed endpoint groups, gateway dispatch, and queued gateway responses.</Description>
-    <PackageTags>sharpclaw;gateway;contracts;modules</PackageTags>
+    <Description>Neutral request and response contracts for the SharpClaw Gateway.</Description>
+    <PackageTags>sharpclaw;gateway;contracts</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/SharpClaw-NET/SharpClaw.Contracts</RepositoryUrl>
     <RepositoryType>git</RepositoryType>

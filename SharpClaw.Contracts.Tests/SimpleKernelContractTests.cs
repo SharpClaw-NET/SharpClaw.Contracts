@@ -1,7 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Reflection;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 
 namespace SharpClaw.Contracts.Tests;
 
@@ -59,7 +59,7 @@ public sealed class SimpleKernelContractTests
             2,
             DateTimeOffset.UtcNow.AddMinutes(1),
             new SharpClawActionKey("demo.action"),
-            "demo.module",
+            "demo.registration",
             caller,
             "value",
             ExtensionFeatureSet.Empty,
@@ -73,7 +73,7 @@ public sealed class SimpleKernelContractTests
             typed.Depth,
             typed.Attempt,
             typed.Deadline,
-            typed.OwnerModuleId,
+            typed.OwnerId,
             caller,
             ExtensionFeatureSet.Empty,
             snapshot.ContractHash,
@@ -366,7 +366,7 @@ public sealed class SimpleKernelContractTests
     {
         var actionBytes = SidecarCapabilityTransportCodec.Serialize(action);
         var authority = new HostActionEntryAuthority(
-            "module-a",
+            "registration-a",
             "graph-a",
             Guid.NewGuid(),
             context.RequestId,
@@ -437,7 +437,7 @@ public sealed class SimpleKernelContractTests
                     HostActionEntryIngress.Endpoint => new HostActionEntryIngressBinding(ingress, "/demo"),
                     HostActionEntryIngress.Cli => new HostActionEntryIngressBinding(ingress, "demo"),
                     HostActionEntryIngress.Tool => new HostActionEntryIngressBinding(ingress, "clock_now"),
-                    _ => new HostActionEntryIngressBinding(ingress, "source.module", "target.module"),
+                    _ => new HostActionEntryIngressBinding(ingress, "source.registration", "target.registration"),
                 },
                 lineage),
         };
@@ -569,7 +569,7 @@ public sealed class SimpleKernelContractTests
             Guid.NewGuid(),
             Guid.NewGuid(),
             DateTimeOffset.UtcNow,
-            "demo.module",
+            "demo.registration",
             CreateElement(new { value = 7 }));
 
         var json = JsonSerializer.Serialize(envelope, JsonOptions);
@@ -608,7 +608,7 @@ public sealed class SimpleKernelContractTests
     public void SensitiveWildcardApprovalRequiresExactActionAndEventVersion()
     {
         var approval = new SensitiveWildcardApproval(
-            "trusted.module",
+            "trusted.registration",
             new Dictionary<string, int> { ["security.secret.read"] = 2 },
             new Dictionary<string, int> { ["security.changed"] = 1 });
 
@@ -678,13 +678,13 @@ public sealed class SimpleKernelContractTests
             $"{family}.after"
         }).ToArray();
 
-        Assert.Equal(172, SharpClawActionCatalog.Kernel.Count);
+        Assert.Equal(157, SharpClawActionCatalog.Kernel.Count);
         Assert.Equal(expectedFamilies, SharpClawActionCatalog.JobsFamilies);
         Assert.Equal(expectedKeys, SharpClawActionCatalog.Jobs.Select(key => key.Value));
         Assert.Equal(46, SharpClawActionCatalog.JobsFamilies.Count);
         Assert.Equal(138, SharpClawActionCatalog.Jobs.Count);
-        Assert.Equal(310, SharpClawActionCatalog.All.Count);
-        Assert.Equal(310, SharpClawActionCatalog.All.Select(key => key.Value).Distinct().Count());
+        Assert.Equal(295, SharpClawActionCatalog.All.Count);
+        Assert.Equal(295, SharpClawActionCatalog.All.Select(key => key.Value).Distinct().Count());
 
         foreach (var family in SharpClawActionCatalog.JobsFamilies)
         {
@@ -788,7 +788,7 @@ public sealed class SimpleKernelContractTests
     {
         var header = Header();
         var definition = new SidecarActionDefinition(
-            new SharpClawActionKey("module.action"),
+            new SharpClawActionKey("registration.action"),
             1,
             "demo",
             new JsonSchemaReference("demo.input", 1, "input-hash"),
@@ -803,7 +803,7 @@ public sealed class SimpleKernelContractTests
             ContractVersionRange.Exact(1));
         var discovery = new SidecarDiscoveryEnvelope(
             header,
-            "demo.module",
+            "demo.registration",
             "contract-hash",
             new SidecarProtocolOffer(1, 1, [SidecarPayloadMode.Untyped], new SidecarPayloadLimits()),
             [new SidecarActionSubscription(
@@ -838,7 +838,7 @@ public sealed class SimpleKernelContractTests
                 new JsonSchemaReference("demo.start.result", 1),
                 ContractVersionRange.Exact(1),
                 TimeSpan.FromSeconds(5))],
-            [new ModuleFeatureDescriptor("demo.feature", 1, "demo.module", 1024)]);
+            [new FeatureDescriptor("demo.feature", 1, "demo.registration", 1024)]);
 
         var validation = SidecarDiscoveryValidator.Validate(
             discovery,
@@ -1014,7 +1014,7 @@ public sealed class SimpleKernelContractTests
             Guid.NewGuid(),
             Guid.NewGuid(),
             DateTimeOffset.UtcNow,
-            "demo.module",
+            "demo.registration",
             input);
         var deliveries = Enum.GetValues<EventDelivery>()
             .Select((delivery, index) => (ISidecarProtocolMessage)new SidecarEventListenerDelivery(
@@ -1101,7 +1101,7 @@ public sealed class SimpleKernelContractTests
             ContractVersionRange.Exact(1));
         var discovery = new SidecarDiscoveryEnvelope(
             Header(),
-            "forged.module",
+            "forged.registration",
             "contract-hash",
             new SidecarProtocolOffer(1, 1, [SidecarPayloadMode.Untyped], new SidecarPayloadLimits()),
             [new SidecarActionSubscription(
@@ -1168,7 +1168,7 @@ public sealed class SimpleKernelContractTests
             ActionKey: actionKey,
             ActionGrant: actionGrant,
             ActionVersion: 1,
-            HostAuthorization: new SidecarHostAuthorization("module-a", [actionGrant], []));
+            HostAuthorization: new SidecarHostAuthorization("registration-a", [actionGrant], []));
         var effect = new SidecarEffectRequest(
             Header(2),
             handle,
@@ -1243,7 +1243,7 @@ public sealed class SimpleKernelContractTests
             ActionKey: actionKey,
             ActionGrant: actionGrant,
             ActionVersion: 1,
-            HostAuthorization: new SidecarHostAuthorization("module-a", [actionGrant], []));
+            HostAuthorization: new SidecarHostAuthorization("registration-a", [actionGrant], []));
         var replacementAccepted = SidecarProtocolStateMachine.Validate(
             replacementState,
             effect with { Header = Header(2) },
@@ -1528,7 +1528,7 @@ public sealed class SimpleKernelContractTests
         var forgedState = started.State! with
         {
             HostAuthorization = new SidecarHostAuthorization(
-                "module-a",
+                "registration-a",
                 [fixture.Grant with { Capabilities = ActionInterceptionCapabilities.Inspect }],
                 []),
         };
@@ -1635,7 +1635,7 @@ public sealed class SimpleKernelContractTests
                 "Oversized result"),
             now);
         Assert.False(oversized.Accepted);
-        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, oversized.ErrorCode);
+        Assert.Equal(SidecarProtocolErrors.PayloadTooLarge, oversized.ErrorCode);
 
         var directReplacement = new SidecarResultReplacement(
             Header(2),
@@ -1755,7 +1755,7 @@ public sealed class SimpleKernelContractTests
         var changedCategoryState = categoryStart.State! with
         {
             ActionGrant = changedCategoryGrant,
-            HostAuthorization = new SidecarHostAuthorization("module-a", [changedCategoryGrant], []),
+            HostAuthorization = new SidecarHostAuthorization("registration-a", [changedCategoryGrant], []),
         };
         var categoryFailure = SidecarProtocolStateMachine.Validate(
             changedCategoryState,
@@ -1780,7 +1780,7 @@ public sealed class SimpleKernelContractTests
         var changedWildcardState = wildcardStart.State! with
         {
             ActionGrant = changedWildcardGrant,
-            HostAuthorization = new SidecarHostAuthorization("module-a", [changedWildcardGrant], []),
+            HostAuthorization = new SidecarHostAuthorization("registration-a", [changedWildcardGrant], []),
         };
         var wildcardFailure = SidecarProtocolStateMachine.Validate(
             changedWildcardState,
@@ -1823,7 +1823,7 @@ public sealed class SimpleKernelContractTests
             NegotiatedProtocolVersion: 1,
             HostLimits: limits,
             HostAuthorization: new SidecarHostAuthorization(
-                "module-a",
+                "registration-a",
                 [new ActionCapabilityGrant(
                     new SharpClawActionKey("demo.action"),
                     1,
@@ -1964,7 +1964,7 @@ public sealed class SimpleKernelContractTests
             null,
             Guid.NewGuid(),
             now,
-            "demo.module",
+            "demo.registration",
             CreateElement(new { value = 1 }));
         var listenerState = new SidecarProtocolState(
             SidecarExchangeKind.EventListener,
@@ -2096,7 +2096,7 @@ public sealed class SimpleKernelContractTests
             SidecarContinuationCommand.ContinueOriginal);
         var oversized = SidecarProtocolStateMachine.Validate(state, forgedMaximum, now);
         Assert.False(oversized.Accepted);
-        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, oversized.ErrorCode);
+        Assert.Equal(SidecarProtocolErrors.PayloadTooLarge, oversized.ErrorCode);
     }
 
     [Fact]
@@ -2128,7 +2128,7 @@ public sealed class SimpleKernelContractTests
             []);
         var discovery = new SidecarDiscoveryEnvelope(
             Header(),
-            "demo.module",
+            "demo.registration",
             "contract-hash",
             new SidecarProtocolOffer(1, 1, [SidecarPayloadMode.Untyped], new SidecarPayloadLimits()),
             [new SidecarActionSubscription(
@@ -2195,7 +2195,7 @@ public sealed class SimpleKernelContractTests
             sensitiveHost.Actions,
             [],
             sensitiveWildcardApproval: new SensitiveWildcardApproval(
-                "demo.module",
+                "demo.registration",
                 new Dictionary<string, int> { ["demo.sensitive"] = 1 },
                 new Dictionary<string, int>()));
         Assert.True(SidecarDiscoveryValidator.Validate(discovery, approved).Accepted);
@@ -2239,7 +2239,7 @@ public sealed class SimpleKernelContractTests
             AcceptUnknownNonSensitiveSchemas: true);
         var discovery = new SidecarDiscoveryEnvelope(
             Header(),
-            "demo.module",
+            "demo.registration",
             "contract-hash",
             new SidecarProtocolOffer(1, 1, [SidecarPayloadMode.Untyped], new SidecarPayloadLimits()),
             [],
@@ -2319,7 +2319,7 @@ public sealed class SimpleKernelContractTests
     [Fact]
     public void ForgedSensitiveApprovalIsRejectedByStrictDiscoveryDeserialization()
     {
-        const string forged = "{\"moduleId\":\"module\",\"sensitiveApproval\":{\"moduleId\":\"module\"}}";
+        const string forged = "{\"SourceId\":\"registration\",\"sensitiveApproval\":{\"SourceId\":\"registration\"}}";
         var options = new JsonSerializerOptions(JsonSerializerDefaults.Web)
         {
             UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
@@ -2368,13 +2368,13 @@ public sealed class SimpleKernelContractTests
     [Fact]
     public void StorageContractsCarryHostClaimAuthorityAndAtomicOutboxIdentity()
     {
-        var authority = new ModuleStorageClaimAuthority(
-            "module-a",
+        var authority = new ScopedStorageClaimAuthority(
+            "registration-a",
             Guid.NewGuid(),
             DateTimeOffset.UtcNow.AddMinutes(1),
             Generation: 3,
             Revision: 7);
-        var commit = new ModuleStorageCommitIdentity(Guid.NewGuid(), "idempotency-1");
+        var commit = new ScopedStorageCommitIdentity(Guid.NewGuid(), "idempotency-1");
         var eventEnvelope = new UntypedEventEnvelope(
             new UntypedEventDescriptor(
                 new SharpClawEventKey("jobs.completed"),
@@ -2387,48 +2387,48 @@ public sealed class SimpleKernelContractTests
             Guid.NewGuid(),
             Guid.NewGuid(),
             DateTimeOffset.UtcNow,
-            "module-a",
+            "registration-a",
             JsonSerializer.SerializeToElement(new { id = "job-1" }));
-        var request = new ModuleStorageMutationAndOutboxRequest(
+        var request = new ScopedStorageMutationAndOutboxRequest(
             commit,
-            [new ModuleStorageMutation(
-                ModuleStorageOperations.Upsert,
+            [new ScopedStorageMutation(
+                ScopedStorageOperations.Upsert,
                 "job-1",
                 JsonSerializer.SerializeToElement(new { status = "complete" }),
                 ExpectedRevision: 7)],
-            [new ModuleStorageOutboxMessage(
+            [new ScopedStorageOutboxMessage(
                 eventEnvelope,
                 EventDelivery.Durable)],
             authority);
 
         var json = JsonSerializer.Serialize(request, JsonOptions);
-        var roundTrip = JsonSerializer.Deserialize<ModuleStorageMutationAndOutboxRequest>(json, JsonOptions)!;
+        var roundTrip = JsonSerializer.Deserialize<ScopedStorageMutationAndOutboxRequest>(json, JsonOptions)!;
 
         Assert.Equal(commit.OperationId, roundTrip.Commit.OperationId);
-        Assert.Equal("module-a", roundTrip.Authority!.OwnerId);
+        Assert.Equal("registration-a", roundTrip.Authority!.OwnerId);
         Assert.Equal(3, roundTrip.Authority.Generation);
         Assert.Equal(7, roundTrip.Mutations[0].ExpectedRevision);
         Assert.Equal("idempotency-1", roundTrip.Commit.IdempotencyKey);
         Assert.Equal("jobs.completed", roundTrip.Outbox[0].Event.Descriptor.Key.Value);
         Assert.Equal("jobs", roundTrip.Outbox[0].Event.Descriptor.Category);
         Assert.Equal(EventDelivery.Durable, roundTrip.Outbox[0].Delivery);
-        Assert.Equal("revision_conflict", ModuleStorageErrors.RevisionConflict);
-        Assert.Equal("stale_claim", ModuleStorageErrors.StaleClaim);
-        Assert.Equal("fencing_rejected", ModuleStorageErrors.FencingRejected);
-        Assert.Equal("commit_identity_conflict", ModuleStorageErrors.CommitIdentityConflict);
+        Assert.Equal("revision_conflict", ScopedStorageErrors.RevisionConflict);
+        Assert.Equal("stale_claim", ScopedStorageErrors.StaleClaim);
+        Assert.Equal("fencing_rejected", ScopedStorageErrors.FencingRejected);
+        Assert.Equal("commit_identity_conflict", ScopedStorageErrors.CommitIdentityConflict);
     }
 
     [Fact]
     public void StorageClaimsExposeHostAuthorityRenewalAndRecoveryData()
     {
-        var authority = new ModuleStorageClaimAuthority(
-            "module-a",
+        var authority = new ScopedStorageClaimAuthority(
+            "registration-a",
             Guid.NewGuid(),
             DateTimeOffset.UtcNow.AddMinutes(1),
             Generation: 4,
             Revision: 12);
-        var payload = new ModuleStorageClaimRequest(
-            "module-a",
+        var payload = new ScopedStorageClaimRequest(
+            "registration-a",
             [],
             null,
             1,
@@ -2436,20 +2436,20 @@ public sealed class SimpleKernelContractTests
             ExpectedRevision: 12,
             Authority: authority,
             Indexes: null);
-        var write = new ModuleDocumentWrite<string>(
+        var write = new ScopedDocumentWrite<string>(
             "job-1",
             "complete",
             ExpectedRevision: 12);
-        var delete = new ModuleDocumentDelete(
+        var delete = new ScopedDocumentDelete(
             "job-1",
             ExpectedRevision: 13,
             Authority: authority);
-        var renewal = new ModuleStorageClaimRenewalRequest(
+        var renewal = new ScopedStorageClaimRenewalRequest(
             authority.OwnerId,
             authority.HostToken,
             authority.Generation,
             DateTimeOffset.UtcNow.AddMinutes(2));
-        var recovery = new ModuleStorageClaimRecoveryRequest(
+        var recovery = new ScopedStorageClaimRecoveryRequest(
             authority.OwnerId,
             authority.HostToken,
             authority.Generation,
@@ -2460,7 +2460,7 @@ public sealed class SimpleKernelContractTests
         Assert.Contains("expectedRevision", json, StringComparison.Ordinal);
         Assert.Contains(authority.HostToken.ToString(), json, StringComparison.Ordinal);
         Assert.Equal(12, payload.ExpectedRevision);
-        Assert.Equal("module-a", payload.OwnerId);
+        Assert.Equal("registration-a", payload.OwnerId);
         Assert.Equal(12, write.ExpectedRevision);
         Assert.Equal(13, delete.ExpectedRevision);
         Assert.True(authority.HasFiniteLease);
@@ -2472,11 +2472,11 @@ public sealed class SimpleKernelContractTests
     [Fact]
     public void StorageConflictAndAtomicCommitSurfacesPreserveRecoveryData()
     {
-        var conflict = new ModuleStorageRevisionConflict("job-1", 6, 7);
-        var commit = new ModuleStorageCommitIdentity(Guid.NewGuid(), "retry-1");
-        var result = new ModuleStorageMutationAndOutboxResult(
+        var conflict = new ScopedStorageRevisionConflict("job-1", 6, 7);
+        var commit = new ScopedStorageCommitIdentity(Guid.NewGuid(), "retry-1");
+        var result = new ScopedStorageMutationAndOutboxResult(
             commit,
-            [new ModuleStorageRevision("job-1", 8)],
+            [new ScopedStorageRevision("job-1", 8)],
             ["outbox-1"],
             CommitRevision: 8,
             AlreadyCommitted: true);
@@ -2489,7 +2489,7 @@ public sealed class SimpleKernelContractTests
         Assert.Equal(8, roundTrip.GetProperty("result").GetProperty("commitRevision").GetInt64());
         Assert.True(roundTrip.GetProperty("result").GetProperty("alreadyCommitted").GetBoolean());
         Assert.Equal("outbox-1", roundTrip.GetProperty("result").GetProperty("outboxMessageIds")[0].GetString());
-        Assert.Equal("atomic_commit_rejected", ModuleStorageErrors.AtomicCommitRejected);
+        Assert.Equal("atomic_commit_rejected", ScopedStorageErrors.AtomicCommitRejected);
     }
 
     [Fact]
@@ -2497,61 +2497,61 @@ public sealed class SimpleKernelContractTests
     {
         var missingGetKey = new StubStorageGateway(_ =>
             JsonSerializer.SerializeToElement(new { found = true, value = "value", revision = 1 }));
-        var getStore = new ModuleDocumentStore<string>(missingGetKey, "module-a", "documents", "module-a");
-        var getFailure = await Assert.ThrowsAsync<ModuleStorageContractException>(() =>
+        var getStore = new ScopedDocumentStore<string>(missingGetKey, "registration-a", "documents", "registration-a");
+        var getFailure = await Assert.ThrowsAsync<ScopedStorageContractException>(() =>
             getStore.GetRecordAsync("job-1"));
-        Assert.Equal(ModuleStorageErrors.MissingRecordKey, getFailure.Failure.Code);
+        Assert.Equal(ScopedStorageErrors.MissingRecordKey, getFailure.Failure.Code);
 
         var missingListRevision = new StubStorageGateway(_ =>
             JsonSerializer.SerializeToElement(new
             {
                 records = new[] { new { key = "job-1", value = "value" } },
             }));
-        var listStore = new ModuleDocumentStore<string>(missingListRevision, "module-a", "documents", "module-a");
-        var listFailure = await Assert.ThrowsAsync<ModuleStorageContractException>(() =>
+        var listStore = new ScopedDocumentStore<string>(missingListRevision, "registration-a", "documents", "registration-a");
+        var listFailure = await Assert.ThrowsAsync<ScopedStorageContractException>(() =>
             listStore.ListAsync());
-        Assert.Equal(ModuleStorageErrors.MissingRevision, listFailure.Failure.Code);
+        Assert.Equal(ScopedStorageErrors.MissingRevision, listFailure.Failure.Code);
 
         var negativeQueryRevision = new StubStorageGateway(_ =>
             JsonSerializer.SerializeToElement(new
             {
                 records = new[] { new { key = "job-1", value = "value", revision = -1 } },
             }));
-        var queryStore = new ModuleDocumentStore<string>(negativeQueryRevision, "module-a", "documents", "module-a");
-        var queryFailure = await Assert.ThrowsAsync<ModuleStorageContractException>(() =>
+        var queryStore = new ScopedDocumentStore<string>(negativeQueryRevision, "registration-a", "documents", "registration-a");
+        var queryFailure = await Assert.ThrowsAsync<ScopedStorageContractException>(() =>
             queryStore.Query().ToRecordsAsync());
-        Assert.Equal(ModuleStorageErrors.InvalidRevision, queryFailure.Failure.Code);
+        Assert.Equal(ScopedStorageErrors.InvalidRevision, queryFailure.Failure.Code);
 
         var missingClaimAuthority = new StubStorageGateway(_ =>
             JsonSerializer.SerializeToElement(new
             {
                 records = Array.Empty<object>(),
             }));
-        var claimStore = new ModuleDocumentStore<string>(missingClaimAuthority, "module-a", "documents", "module-a");
-        var claimFailure = await Assert.ThrowsAsync<ModuleStorageContractException>(() =>
+        var claimStore = new ScopedDocumentStore<string>(missingClaimAuthority, "registration-a", "documents", "registration-a");
+        var claimFailure = await Assert.ThrowsAsync<ScopedStorageContractException>(() =>
             claimStore.Claim()
                 .Patch(new { status = "claimed" })
                 .ToRecordsAsync());
-        Assert.Equal(ModuleStorageErrors.InvalidClaimAuthority, claimFailure.Failure.Code);
+        Assert.Equal(ScopedStorageErrors.InvalidClaimAuthority, claimFailure.Failure.Code);
     }
 
     [Fact]
     public void StorageClaimResultPreservesOwnerLeaseGenerationAndRevision()
     {
-        var authority = new ModuleStorageClaimAuthority(
-            "module-a",
+        var authority = new ScopedStorageClaimAuthority(
+            "registration-a",
             Guid.NewGuid(),
             DateTimeOffset.UtcNow.AddMinutes(1),
             Generation: 9,
             Revision: 21);
-        var result = new ModuleStorageClaimResult<string>(
-            [new ModuleStorageClaimRecord<string>("job-1", "claimed", 21, authority)],
+        var result = new ScopedStorageClaimResult<string>(
+            [new ScopedStorageClaimRecord<string>("job-1", "claimed", 21, authority)],
             authority);
         var expired = authority with { LeaseExpiresAt = DateTimeOffset.UtcNow.AddSeconds(-1) };
         var json = JsonSerializer.Serialize(result, JsonOptions);
-        var roundTrip = JsonSerializer.Deserialize<ModuleStorageClaimResult<string>>(json, JsonOptions)!;
+        var roundTrip = JsonSerializer.Deserialize<ScopedStorageClaimResult<string>>(json, JsonOptions)!;
 
-        Assert.Equal("module-a", roundTrip.Authority.OwnerId);
+        Assert.Equal("registration-a", roundTrip.Authority.OwnerId);
         Assert.Equal(9, roundTrip.Authority.Generation);
         Assert.Equal(21, roundTrip.Records[0].Revision);
         Assert.False(expired.IsActiveAt(DateTimeOffset.UtcNow));
@@ -2562,125 +2562,125 @@ public sealed class SimpleKernelContractTests
     public void StorageClaimValidationRejectsInvalidAndConflictingAuthority()
     {
         var now = DateTimeOffset.UtcNow;
-        var request = new ModuleStorageClaimRequest(
-            "module-a",
+        var request = new ScopedStorageClaimRequest(
+            "registration-a",
             [],
             Patch: new { status = "claimed" });
-        var authority = new ModuleStorageClaimAuthority(
-            "module-a",
+        var authority = new ScopedStorageClaimAuthority(
+            "registration-a",
             Guid.NewGuid(),
             now.AddMinutes(1),
             Generation: 2,
             Revision: 7);
-        var record = new ModuleStorageClaimRecord<string>("job-1", "claimed", 7, authority);
-        var result = new ModuleStorageClaimResult<string>([record], authority);
+        var record = new ScopedStorageClaimRecord<string>("job-1", "claimed", 7, authority);
+        var result = new ScopedStorageClaimResult<string>([record], authority);
 
-        Assert.Same(result, ModuleStorageClaimValidation.Validate(request, result, now));
+        Assert.Same(result, ScopedStorageClaimValidation.Validate(request, result, now));
 
         var emptyOwner = result with
         {
             Authority = authority with { OwnerId = "" },
         };
-        var emptyOwnerFailure = Assert.Throws<ModuleStorageContractException>(() =>
-            ModuleStorageClaimValidation.Validate(request, emptyOwner, now));
-        Assert.Equal(ModuleStorageErrors.InvalidClaimAuthority, emptyOwnerFailure.Failure.Code);
+        var emptyOwnerFailure = Assert.Throws<ScopedStorageContractException>(() =>
+            ScopedStorageClaimValidation.Validate(request, emptyOwner, now));
+        Assert.Equal(ScopedStorageErrors.InvalidClaimAuthority, emptyOwnerFailure.Failure.Code);
 
         var emptyToken = result with
         {
             Authority = authority with { HostToken = Guid.Empty },
         };
-        var emptyTokenFailure = Assert.Throws<ModuleStorageContractException>(() =>
-            ModuleStorageClaimValidation.Validate(request, emptyToken, now));
-        Assert.Equal(ModuleStorageErrors.InvalidClaimAuthority, emptyTokenFailure.Failure.Code);
+        var emptyTokenFailure = Assert.Throws<ScopedStorageContractException>(() =>
+            ScopedStorageClaimValidation.Validate(request, emptyToken, now));
+        Assert.Equal(ScopedStorageErrors.InvalidClaimAuthority, emptyTokenFailure.Failure.Code);
 
         var expired = result with
         {
             Authority = authority with { LeaseExpiresAt = now.AddSeconds(-1) },
         };
-        var expiredFailure = Assert.Throws<ModuleStorageContractException>(() =>
-            ModuleStorageClaimValidation.Validate(request, expired, now));
-        Assert.Equal(ModuleStorageErrors.InvalidClaimAuthority, expiredFailure.Failure.Code);
+        var expiredFailure = Assert.Throws<ScopedStorageContractException>(() =>
+            ScopedStorageClaimValidation.Validate(request, expired, now));
+        Assert.Equal(ScopedStorageErrors.InvalidClaimAuthority, expiredFailure.Failure.Code);
 
         var wrongOwner = result with
         {
-            Authority = authority with { OwnerId = "module-b" },
+            Authority = authority with { OwnerId = "registration-b" },
         };
-        var wrongOwnerFailure = Assert.Throws<ModuleStorageContractException>(() =>
-            ModuleStorageClaimValidation.Validate(request, wrongOwner, now));
-        Assert.Equal(ModuleStorageErrors.ClaimOwnerMismatch, wrongOwnerFailure.Failure.Code);
+        var wrongOwnerFailure = Assert.Throws<ScopedStorageContractException>(() =>
+            ScopedStorageClaimValidation.Validate(request, wrongOwner, now));
+        Assert.Equal(ScopedStorageErrors.ClaimOwnerMismatch, wrongOwnerFailure.Failure.Code);
 
         var wrongRecordAuthority = result with
         {
             Records = [record with { Authority = authority with { Generation = 3 } }],
         };
-        var wrongRecordAuthorityFailure = Assert.Throws<ModuleStorageContractException>(() =>
-            ModuleStorageClaimValidation.Validate(request, wrongRecordAuthority, now));
-        Assert.Equal(ModuleStorageErrors.ClaimAuthorityMismatch, wrongRecordAuthorityFailure.Failure.Code);
+        var wrongRecordAuthorityFailure = Assert.Throws<ScopedStorageContractException>(() =>
+            ScopedStorageClaimValidation.Validate(request, wrongRecordAuthority, now));
+        Assert.Equal(ScopedStorageErrors.ClaimAuthorityMismatch, wrongRecordAuthorityFailure.Failure.Code);
 
         var independentRecordRevision = result with
         {
             Records = [record with { Revision = 8 }],
         };
-        Assert.Same(independentRecordRevision, ModuleStorageClaimValidation.Validate(request, independentRecordRevision, now));
+        Assert.Same(independentRecordRevision, ScopedStorageClaimValidation.Validate(request, independentRecordRevision, now));
 
         var staleFence = result with
         {
             Records = [record with { Authority = authority with { HostToken = Guid.NewGuid() } }],
         };
-        var staleFenceFailure = Assert.Throws<ModuleStorageContractException>(() =>
-            ModuleStorageClaimValidation.Validate(request, staleFence, now));
-        Assert.Equal(ModuleStorageErrors.ClaimAuthorityMismatch, staleFenceFailure.Failure.Code);
+        var staleFenceFailure = Assert.Throws<ScopedStorageContractException>(() =>
+            ScopedStorageClaimValidation.Validate(request, staleFence, now));
+        Assert.Equal(ScopedStorageErrors.ClaimAuthorityMismatch, staleFenceFailure.Failure.Code);
     }
 
     [Fact]
     public void StorageClaimsAllowIndependentRecordRevisionsUnderOneBatchFence()
     {
         var now = DateTimeOffset.UtcNow;
-        var authority = new ModuleStorageClaimAuthority(
-            "module-a",
+        var authority = new ScopedStorageClaimAuthority(
+            "registration-a",
             Guid.NewGuid(),
             now.AddMinutes(1),
             Generation: 4,
             Revision: 20);
-        var request = new ModuleStorageClaimRequest("module-a", []);
-        var result = new ModuleStorageClaimResult<string>(
+        var request = new ScopedStorageClaimRequest("registration-a", []);
+        var result = new ScopedStorageClaimResult<string>(
             [
-                new ModuleStorageClaimRecord<string>("job-1", "one", 7, authority),
-                new ModuleStorageClaimRecord<string>("job-2", "two", 13, authority),
+                new ScopedStorageClaimRecord<string>("job-1", "one", 7, authority),
+                new ScopedStorageClaimRecord<string>("job-2", "two", 13, authority),
             ],
             authority);
 
-        Assert.Same(result, ModuleStorageClaimValidation.Validate(request, result, now));
+        Assert.Same(result, ScopedStorageClaimValidation.Validate(request, result, now));
 
         var wrongRecordFence = result with
         {
             Records = [result.Records[0] with { Authority = authority with { Generation = 5 } }, result.Records[1]],
         };
-        var wrongRecordFailure = Assert.Throws<ModuleStorageContractException>(() =>
-            ModuleStorageClaimValidation.Validate(request, wrongRecordFence, now));
-        Assert.Equal(ModuleStorageErrors.ClaimAuthorityMismatch, wrongRecordFailure.Failure.Code);
+        var wrongRecordFailure = Assert.Throws<ScopedStorageContractException>(() =>
+            ScopedStorageClaimValidation.Validate(request, wrongRecordFence, now));
+        Assert.Equal(ScopedStorageErrors.ClaimAuthorityMismatch, wrongRecordFailure.Failure.Code);
 
         var wrongBatchRevision = result with
         {
             Records = [result.Records[0] with { Authority = authority with { Revision = 19 } }, result.Records[1]],
         };
-        var wrongBatchRevisionFailure = Assert.Throws<ModuleStorageContractException>(() =>
-            ModuleStorageClaimValidation.Validate(request, wrongBatchRevision, now));
-        Assert.Equal(ModuleStorageErrors.ClaimAuthorityMismatch, wrongBatchRevisionFailure.Failure.Code);
+        var wrongBatchRevisionFailure = Assert.Throws<ScopedStorageContractException>(() =>
+            ScopedStorageClaimValidation.Validate(request, wrongBatchRevision, now));
+        Assert.Equal(ScopedStorageErrors.ClaimAuthorityMismatch, wrongBatchRevisionFailure.Failure.Code);
 
         var staleBatchFence = result with
         {
             Authority = authority with { Generation = 3 },
         };
-        var staleBatchFailure = Assert.Throws<ModuleStorageContractException>(() =>
-            ModuleStorageClaimValidation.Validate(request, staleBatchFence, now));
-        Assert.Equal(ModuleStorageErrors.ClaimAuthorityMismatch, staleBatchFailure.Failure.Code);
+        var staleBatchFailure = Assert.Throws<ScopedStorageContractException>(() =>
+            ScopedStorageClaimValidation.Validate(request, staleBatchFence, now));
+        Assert.Equal(ScopedStorageErrors.ClaimAuthorityMismatch, staleBatchFailure.Failure.Code);
     }
 
     [Fact]
     public async Task StorageAtomicCommitRetryPreservesOneIdentityAndRejectsMismatch()
     {
-        var commit = new ModuleStorageCommitIdentity(Guid.NewGuid(), "retry-1");
+        var commit = new ScopedStorageCommitIdentity(Guid.NewGuid(), "retry-1");
         var eventEnvelope = new UntypedEventEnvelope(
             new UntypedEventDescriptor(
                 new SharpClawEventKey("jobs.completed"),
@@ -2693,38 +2693,38 @@ public sealed class SimpleKernelContractTests
             Guid.NewGuid(),
             Guid.NewGuid(),
             DateTimeOffset.UtcNow,
-            "module-a",
+            "registration-a",
             CreateElement(new { id = "job-1" }));
-        var request = new ModuleStorageMutationAndOutboxRequest(
+        var request = new ScopedStorageMutationAndOutboxRequest(
             commit,
-            [new ModuleStorageMutation(
-                ModuleStorageOperations.Upsert,
+            [new ScopedStorageMutation(
+                ScopedStorageOperations.Upsert,
                 "job-1",
                 CreateElement(new { status = "complete" }),
                 ExpectedRevision: 7)],
-            [new ModuleStorageOutboxMessage(eventEnvelope, EventDelivery.Durable)]);
+            [new ScopedStorageOutboxMessage(eventEnvelope, EventDelivery.Durable)]);
         var gateway = new StatefulCommitGateway();
 
         await Assert.ThrowsAsync<TimeoutException>(() =>
-            gateway.CommitMutationAndOutboxAsync("module-a", "documents", request));
+            gateway.CommitMutationAndOutboxAsync("registration-a", "documents", request));
 
-        var retry = await gateway.CommitMutationAndOutboxAsync("module-a", "documents", request);
-        var validated = ModuleStorageCommitValidation.Validate(request, retry);
+        var retry = await gateway.CommitMutationAndOutboxAsync("registration-a", "documents", request);
+        var validated = ScopedStorageCommitValidation.Validate(request, retry);
         Assert.True(validated.AlreadyCommitted);
         Assert.Equal(commit, validated.Commit);
         Assert.Single(gateway.CommittedEventIds);
 
         var mismatched = retry with
         {
-            Commit = new ModuleStorageCommitIdentity(Guid.NewGuid(), "other"),
+            Commit = new ScopedStorageCommitIdentity(Guid.NewGuid(), "other"),
         };
-        var mismatchFailure = Assert.Throws<ModuleStorageContractException>(() =>
-            ModuleStorageCommitValidation.Validate(request, mismatched));
-        Assert.Equal(ModuleStorageErrors.CommitIdentityConflict, mismatchFailure.Failure.Code);
+        var mismatchFailure = Assert.Throws<ScopedStorageContractException>(() =>
+            ScopedStorageCommitValidation.Validate(request, mismatched));
+        Assert.Equal(ScopedStorageErrors.CommitIdentityConflict, mismatchFailure.Failure.Code);
 
-        await Assert.ThrowsAsync<ModuleStorageContractException>(() =>
+        await Assert.ThrowsAsync<ScopedStorageContractException>(() =>
             gateway.CommitMutationAndOutboxAsync(
-                "module-a",
+                "registration-a",
                 "documents",
                 request with
                 {
@@ -2735,44 +2735,44 @@ public sealed class SimpleKernelContractTests
     [Fact]
     public void StorageAtomicCommitValidationRejectsIncompleteTerminalEvidence()
     {
-        var commit = new ModuleStorageCommitIdentity(Guid.NewGuid(), "atomic-validation");
+        var commit = new ScopedStorageCommitIdentity(Guid.NewGuid(), "atomic-validation");
         var firstEvent = CreateStorageEvent("job-1");
         var secondEvent = CreateStorageEvent("job-2");
-        var request = new ModuleStorageMutationAndOutboxRequest(
+        var request = new ScopedStorageMutationAndOutboxRequest(
             commit,
             [
-                new ModuleStorageMutation(ModuleStorageOperations.Upsert, "job-1", CreateElement(new { value = 1 }), ExpectedRevision: 1),
-                new ModuleStorageMutation(ModuleStorageOperations.Upsert, "job-2", CreateElement(new { value = 2 }), ExpectedRevision: 2),
+                new ScopedStorageMutation(ScopedStorageOperations.Upsert, "job-1", CreateElement(new { value = 1 }), ExpectedRevision: 1),
+                new ScopedStorageMutation(ScopedStorageOperations.Upsert, "job-2", CreateElement(new { value = 2 }), ExpectedRevision: 2),
             ],
             [
-                new ModuleStorageOutboxMessage(firstEvent, EventDelivery.Durable),
-                new ModuleStorageOutboxMessage(secondEvent, EventDelivery.Durable),
+                new ScopedStorageOutboxMessage(firstEvent, EventDelivery.Durable),
+                new ScopedStorageOutboxMessage(secondEvent, EventDelivery.Durable),
             ]);
-        var valid = new ModuleStorageMutationAndOutboxResult(
+        var valid = new ScopedStorageMutationAndOutboxResult(
             commit,
-            [new ModuleStorageRevision("job-1", 2), new ModuleStorageRevision("job-2", 3)],
+            [new ScopedStorageRevision("job-1", 2), new ScopedStorageRevision("job-2", 3)],
             ["outbox-1", "outbox-2"],
             CommitRevision: 3);
 
-        Assert.Same(valid, ModuleStorageCommitValidation.Validate(request, valid));
-        AssertFailure(valid with { OutboxMessageIds = ["", "outbox-2"] }, ModuleStorageErrors.InvalidOutboxIdentity);
-        AssertFailure(valid with { OutboxMessageIds = ["same", "same"] }, ModuleStorageErrors.InvalidOutboxIdentity);
-        AssertFailure(valid with { Revisions = [new ModuleStorageRevision("job-1", 2)] }, ModuleStorageErrors.MissingMutationRevision);
+        Assert.Same(valid, ScopedStorageCommitValidation.Validate(request, valid));
+        AssertFailure(valid with { OutboxMessageIds = ["", "outbox-2"] }, ScopedStorageErrors.InvalidOutboxIdentity);
+        AssertFailure(valid with { OutboxMessageIds = ["same", "same"] }, ScopedStorageErrors.InvalidOutboxIdentity);
+        AssertFailure(valid with { Revisions = [new ScopedStorageRevision("job-1", 2)] }, ScopedStorageErrors.MissingMutationRevision);
         AssertFailure(
-            valid with { Revisions = [new ModuleStorageRevision("job-1", 2), new ModuleStorageRevision("job-1", 3)] },
-            ModuleStorageErrors.DuplicateMutationRevision);
+            valid with { Revisions = [new ScopedStorageRevision("job-1", 2), new ScopedStorageRevision("job-1", 3)] },
+            ScopedStorageErrors.DuplicateMutationRevision);
         AssertFailure(
-            valid with { Revisions = [new ModuleStorageRevision("job-1", -1), new ModuleStorageRevision("job-2", 3)] },
-            ModuleStorageErrors.InvalidRevision);
-        AssertFailure(valid with { CommitRevision = -1 }, ModuleStorageErrors.InvalidCommitRevision);
+            valid with { Revisions = [new ScopedStorageRevision("job-1", -1), new ScopedStorageRevision("job-2", 3)] },
+            ScopedStorageErrors.InvalidRevision);
+        AssertFailure(valid with { CommitRevision = -1 }, ScopedStorageErrors.InvalidCommitRevision);
         AssertFailure(
-            valid with { Revisions = [new ModuleStorageRevision("job-1", 2), new ModuleStorageRevision("other", 3)] },
-            ModuleStorageErrors.MutationRevisionMismatch);
+            valid with { Revisions = [new ScopedStorageRevision("job-1", 2), new ScopedStorageRevision("other", 3)] },
+            ScopedStorageErrors.MutationRevisionMismatch);
 
-        void AssertFailure(ModuleStorageMutationAndOutboxResult candidate, string code)
+        void AssertFailure(ScopedStorageMutationAndOutboxResult candidate, string code)
         {
-            var failure = Assert.Throws<ModuleStorageContractException>(() =>
-                ModuleStorageCommitValidation.Validate(request, candidate));
+            var failure = Assert.Throws<ScopedStorageContractException>(() =>
+                ScopedStorageCommitValidation.Validate(request, candidate));
             Assert.Equal(code, failure.Failure.Code);
         }
     }
@@ -2794,7 +2794,7 @@ public sealed class SimpleKernelContractTests
             null,
             Guid.NewGuid(),
             now,
-            "module-a",
+            "registration-a",
             CreateElement(new { value = 1 }));
         var grant = new EventCapabilityGrant(
             descriptor.Key,
@@ -2814,7 +2814,7 @@ public sealed class SimpleKernelContractTests
             EventGrant: grant,
             EventKey: descriptor.Key,
             EventVersion: descriptor.Version,
-            HostAuthorization: new SidecarHostAuthorization("module-a", [], [grant]));
+            HostAuthorization: new SidecarHostAuthorization("registration-a", [], [grant]));
         var start = new EventInterceptStart(
             Header(1),
             "event-hook",
@@ -2877,7 +2877,7 @@ public sealed class SimpleKernelContractTests
             ActionVersion: 1,
             ActionGrant: new ActionCapabilityGrant(actionKey, 1, ActionInterceptionCapabilities.Inspect),
             HostAuthorization: new SidecarHostAuthorization(
-                "module-a",
+                "registration-a",
                 [new ActionCapabilityGrant(actionKey, 1, ActionInterceptionCapabilities.Inspect)],
                 []));
 
@@ -2938,7 +2938,7 @@ public sealed class SimpleKernelContractTests
             new JsonSchemaReference("demo.input", 1, "input-hash"),
             new JsonSchemaReference("demo.result", 1, "result-hash"),
             ContainsSensitiveData: false);
-        var authorization = new SidecarHostAuthorization("module-a", [actionGrant], []);
+        var authorization = new SidecarHostAuthorization("registration-a", [actionGrant], []);
         var invocationId = Guid.NewGuid();
         var handle = new ContinuationHandle(Guid.NewGuid(), invocationId, "hook-a", now.AddMinutes(1), 1);
         var smallHeader = Header(1) with
@@ -2975,7 +2975,7 @@ public sealed class SimpleKernelContractTests
                 handle),
             now);
         Assert.False(actionInput.Accepted);
-        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, actionInput.ErrorCode);
+        Assert.Equal(SidecarProtocolErrors.PayloadTooLarge, actionInput.ErrorCode);
 
         var invokingState = new SidecarProtocolState(
             SidecarExchangeKind.ActionHook,
@@ -3000,7 +3000,7 @@ public sealed class SimpleKernelContractTests
                 large),
             now);
         Assert.False(replacementInput.Accepted);
-        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, replacementInput.ErrorCode);
+        Assert.Equal(SidecarProtocolErrors.PayloadTooLarge, replacementInput.ErrorCode);
 
         var actionResult = SidecarProtocolStateMachine.Validate(
             invokingState with { Phase = SidecarProtocolPhase.SidecarOutcomeSent },
@@ -3011,7 +3011,7 @@ public sealed class SimpleKernelContractTests
                 "large result"),
             now);
         Assert.False(actionResult.Accepted);
-        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, actionResult.ErrorCode);
+        Assert.Equal(SidecarProtocolErrors.PayloadTooLarge, actionResult.ErrorCode);
 
         var eventKey = new SharpClawEventKey("demo.event");
         var eventDescriptor = new UntypedEventDescriptor(
@@ -3033,14 +3033,14 @@ public sealed class SimpleKernelContractTests
             HostLimits: limits,
             EventDescriptor: eventDescriptor,
             EventGrant: eventGrant,
-            HostAuthorization: new SidecarHostAuthorization("module-a", [], [eventGrant]));
+            HostAuthorization: new SidecarHostAuthorization("registration-a", [], [eventGrant]));
         var eventEnvelope = new UntypedEventEnvelope(
             eventDescriptor,
             Guid.NewGuid(),
             null,
             Guid.NewGuid(),
             now,
-            "module-a",
+            "registration-a",
             large);
         var eventPayload = SidecarProtocolStateMachine.Validate(
             eventState,
@@ -3052,7 +3052,7 @@ public sealed class SimpleKernelContractTests
                 new ContinuationHandle(Guid.NewGuid(), Guid.NewGuid(), "event-hook", now.AddMinutes(1), 1)),
             now);
         Assert.False(eventPayload.Accepted);
-        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, eventPayload.ErrorCode);
+        Assert.Equal(SidecarProtocolErrors.PayloadTooLarge, eventPayload.ErrorCode);
 
         var streamId = Guid.NewGuid();
         var streamPayload = SidecarProtocolStateMachine.Validate(
@@ -3074,7 +3074,7 @@ public sealed class SimpleKernelContractTests
                 IsFinal: false),
             now);
         Assert.False(streamPayload.Accepted);
-        Assert.Equal(SidecarProtocolErrors.ModulePayloadTooLarge, streamPayload.ErrorCode);
+        Assert.Equal(SidecarProtocolErrors.PayloadTooLarge, streamPayload.ErrorCode);
     }
 
     [Fact]
@@ -3099,7 +3099,7 @@ public sealed class SimpleKernelContractTests
                 ActionKey: key,
                 ActionVersion: grant.ActionVersion,
                 ActionGrant: grant,
-                HostAuthorization: new SidecarHostAuthorization("module-a", [grant], []));
+                HostAuthorization: new SidecarHostAuthorization("registration-a", [grant], []));
 
         var inspectOnly = new ActionCapabilityGrant(key, 1, ActionInterceptionCapabilities.Inspect);
         Assert.False(SidecarProtocolStateMachine.CanApply(
@@ -3191,7 +3191,7 @@ public sealed class SimpleKernelContractTests
                 now.AddMinutes(1),
                 NegotiatedProtocolVersion: 1,
                 HostLimits: new SidecarPayloadLimits(),
-                HostAuthorization: new SidecarHostAuthorization("module-a", [grant], []));
+                HostAuthorization: new SidecarHostAuthorization("registration-a", [grant], []));
 
         HookInvokeStart ActionStart(
             UntypedActionDescriptor descriptor,
@@ -3291,7 +3291,7 @@ public sealed class SimpleKernelContractTests
                 null,
                 Guid.NewGuid(),
                 now,
-                "module-a",
+                "registration-a",
                 CreateElement(new { value = 1 }));
             return new(
                 Header(sequence),
@@ -3312,7 +3312,7 @@ public sealed class SimpleKernelContractTests
                 now.AddMinutes(1),
                 NegotiatedProtocolVersion: 1,
                 HostLimits: new SidecarPayloadLimits(),
-                HostAuthorization: new SidecarHostAuthorization("module-a", [], [grant]));
+                HostAuthorization: new SidecarHostAuthorization("registration-a", [], [grant]));
 
         var exactEventDescriptor = EventDescriptor(eventKey, sensitive: true, acceptsUnknown: false);
         var exactEventGrant = new EventCapabilityGrant(eventKey, 1, eventCapabilities, SensitiveApproved: true);
@@ -3382,7 +3382,7 @@ public sealed class SimpleKernelContractTests
             EventGrant: grant,
             EventKey: descriptor.Key,
             EventVersion: descriptor.Version,
-            HostAuthorization: new SidecarHostAuthorization("module-a", [], [grant]));
+            HostAuthorization: new SidecarHostAuthorization("registration-a", [], [grant]));
 
         var continuedWithPayload = SidecarProtocolStateMachine.Validate(
             state,
@@ -3428,15 +3428,15 @@ public sealed class SimpleKernelContractTests
     [Fact]
     public void StorageAtomicCommitRejectsIncompleteImmutableEventIdentity()
     {
-        var commit = new ModuleStorageCommitIdentity(Guid.NewGuid(), "event-identity");
+        var commit = new ScopedStorageCommitIdentity(Guid.NewGuid(), "event-identity");
         var eventEnvelope = CreateStorageEvent("job-1");
-        var request = new ModuleStorageMutationAndOutboxRequest(
+        var request = new ScopedStorageMutationAndOutboxRequest(
             commit,
-            [new ModuleStorageMutation(ModuleStorageOperations.Upsert, "job-1", CreateElement(new { value = 1 }))],
-            [new ModuleStorageOutboxMessage(eventEnvelope, EventDelivery.Durable)]);
-        var valid = new ModuleStorageMutationAndOutboxResult(
+            [new ScopedStorageMutation(ScopedStorageOperations.Upsert, "job-1", CreateElement(new { value = 1 }))],
+            [new ScopedStorageOutboxMessage(eventEnvelope, EventDelivery.Durable)]);
+        var valid = new ScopedStorageMutationAndOutboxResult(
             commit,
-            [new ModuleStorageRevision("job-1", 1)],
+            [new ScopedStorageRevision("job-1", 1)],
             ["outbox-1"],
             CommitRevision: 1);
 
@@ -3444,7 +3444,7 @@ public sealed class SimpleKernelContractTests
         {
             eventEnvelope with { EventId = Guid.Empty },
             eventEnvelope with { TraceId = Guid.Empty },
-            eventEnvelope with { OwnerModuleId = "" },
+            eventEnvelope with { OwnerId = "" },
             eventEnvelope with { Payload = default },
             eventEnvelope with
             {
@@ -3455,34 +3455,33 @@ public sealed class SimpleKernelContractTests
             },
         })
         {
-            var failure = Assert.Throws<ModuleStorageContractException>(() =>
-                ModuleStorageCommitValidation.Validate(
+            var failure = Assert.Throws<ScopedStorageContractException>(() =>
+                ScopedStorageCommitValidation.Validate(
                     request with
                     {
-                        Outbox = [new ModuleStorageOutboxMessage(candidate, EventDelivery.Durable)],
+                        Outbox = [new ScopedStorageOutboxMessage(candidate, EventDelivery.Durable)],
                     },
                     valid));
-            Assert.Equal(ModuleStorageErrors.InvalidEventIdentity, failure.Failure.Code);
+            Assert.Equal(ScopedStorageErrors.InvalidEventIdentity, failure.Failure.Code);
         }
     }
 
     [Fact]
     public void RetiredLookupCliTypesAreAbsent_and_canonical_jobs_types_are_present()
     {
-        var names = typeof(ISharpClawModule).Assembly
+        var names = typeof(SharpClawActionKey).Assembly
             .GetTypes()
             .Select(type => type.FullName ?? type.Name)
             .ToArray();
 
-        Assert.DoesNotContain(names, name => name.EndsWith("ModuleCliCommand", StringComparison.Ordinal));
-        Assert.DoesNotContain(names, name => name.EndsWith("ModuleCliScope", StringComparison.Ordinal));
+        Assert.DoesNotContain(names, name => name.EndsWith("CliCommand", StringComparison.Ordinal));
+        Assert.DoesNotContain(names, name => name.EndsWith("CliScope", StringComparison.Ordinal));
         Assert.DoesNotContain(names, name => name.EndsWith("JobsContracts", StringComparison.Ordinal));
         Assert.DoesNotContain(names, name => name.EndsWith("JobHandlerResult", StringComparison.Ordinal));
-        Assert.Contains("SharpClaw.Contracts.Modules.JobDocument", names);
-        Assert.DoesNotContain(typeof(IModuleLifecycleManager).GetMethods(), method =>
+        Assert.Contains("SharpClaw.Contracts.Kernel.JobDocument", names);
+        Assert.DoesNotContain(typeof(IRegistrationLifecycleManager).GetMethods(), method =>
             method.Name is "FindToolByName" or "IsToolPrefixRegistered");
-        Assert.Contains(typeof(ICliContributionBuilder).GetMethods(), method =>
-            method.GetParameters().Any(parameter => parameter.ParameterType == typeof(ModuleCliCommandDescriptor)));
+        Assert.Same(typeof(SharpClawActionKey).Assembly, typeof(CliCommandDescriptor).Assembly);
     }
 
     [Fact]
@@ -3633,7 +3632,7 @@ public sealed class SimpleKernelContractTests
     {
         var error = new GraphCompilationError(
             "unsupported_effect",
-            "trusted.module",
+            "trusted.registration",
             "jobs.external_call",
             "replace_result",
             "The selected grant does not support this effect.");
@@ -3646,7 +3645,7 @@ public sealed class SimpleKernelContractTests
     public void External_dispatch_authority_requires_complete_host_and_sidecar_state()
     {
         var authority = new SidecarExternalActionDispatchAuthority(
-            "module-a",
+            "registration-a",
             "graph-a",
             null!,
             null!,
@@ -3676,7 +3675,7 @@ public sealed class SimpleKernelContractTests
             null,
             Guid.NewGuid(),
             DateTimeOffset.UtcNow,
-            "module-a",
+            "registration-a",
             CreateElement(new { key }));
 
     private static SidecarMessageHeader Header(long sequence = 1) =>
@@ -3761,12 +3760,12 @@ public sealed class SimpleKernelContractTests
             Sequence: 1);
         var wildcardApproval = targetKind == SidecarHookTargetKind.Wildcard && containsSensitiveData
             ? new SensitiveWildcardApproval(
-                "module-a",
+                "registration-a",
                 new Dictionary<string, int>(StringComparer.Ordinal) { [actionKey.Value] = 1 },
                 new Dictionary<string, int>(StringComparer.Ordinal))
             : null;
         var authorization = new SidecarHostAuthorization(
-            "module-a",
+            "registration-a",
             [grant],
             [],
             wildcardApproval);
@@ -3805,39 +3804,39 @@ public sealed class SimpleKernelContractTests
         return new DirectActionFixture(targetKind, state, start, grant, descriptor);
     }
 
-    private sealed class StatefulCommitGateway : IModuleStorageGateway
+    private sealed class StatefulCommitGateway : IScopedStorageGateway
     {
-        private ModuleStorageMutationAndOutboxRequest? _committedRequest;
-        private ModuleStorageMutationAndOutboxResult? _committedResult;
+        private ScopedStorageMutationAndOutboxRequest? _committedRequest;
+        private ScopedStorageMutationAndOutboxResult? _committedResult;
 
         public HashSet<Guid> CommittedEventIds { get; } = [];
 
-        public IReadOnlyList<ModuleStorageContractDescriptor> ListContracts() => [];
+        public IReadOnlyList<ScopedStorageContractDescriptor> ListContracts() => [];
 
         public Task<JsonElement> InvokeAsync(
-            string moduleId,
+            string SourceId,
             string storageName,
             string operation,
             JsonElement parameters,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public Task<ModuleStorageMutationAndOutboxResult> CommitMutationAndOutboxAsync(
-            string moduleId,
+        public Task<ScopedStorageMutationAndOutboxResult> CommitMutationAndOutboxAsync(
+            string SourceId,
             string storageName,
-            ModuleStorageMutationAndOutboxRequest request,
+            ScopedStorageMutationAndOutboxRequest request,
             CancellationToken ct = default)
         {
             if (_committedResult is not null)
             {
                 if (_committedRequest!.Commit != request.Commit)
-                    throw new ModuleStorageContractException(new ModuleStorageContractFailure(
-                        ModuleStorageErrors.CommitIdentityConflict,
+                    throw new ScopedStorageContractException(new ScopedStorageContractFailure(
+                        ScopedStorageErrors.CommitIdentityConflict,
                         "The retry uses a different commit identity."));
 
                 if (!SameExpectedRevisions(_committedRequest, request))
-                    throw new ModuleStorageContractException(new ModuleStorageContractFailure(
-                        ModuleStorageErrors.RevisionConflict,
+                    throw new ScopedStorageContractException(new ScopedStorageContractFailure(
+                        ScopedStorageErrors.RevisionConflict,
                         "The retry uses a stale expected revision."));
 
                 return Task.FromResult(_committedResult with { AlreadyCommitted = true });
@@ -3847,10 +3846,10 @@ public sealed class SimpleKernelContractTests
             foreach (var item in request.Outbox)
                 CommittedEventIds.Add(item.Event.EventId);
 
-            _committedResult = new ModuleStorageMutationAndOutboxResult(
+            _committedResult = new ScopedStorageMutationAndOutboxResult(
                 request.Commit,
                 request.Mutations
-                    .Select(item => new ModuleStorageRevision(item.Key, (item.ExpectedRevision ?? 0) + 1))
+                    .Select(item => new ScopedStorageRevision(item.Key, (item.ExpectedRevision ?? 0) + 1))
                     .ToArray(),
                 request.Outbox
                     .Select((_, index) => $"outbox-{index}")
@@ -3860,30 +3859,30 @@ public sealed class SimpleKernelContractTests
             throw new TimeoutException("The response was lost after the atomic commit.");
         }
 
-        public Task<ModuleStorageClaimResult<T>> ClaimAsync<T>(
-            string moduleId,
+        public Task<ScopedStorageClaimResult<T>> ClaimAsync<T>(
+            string SourceId,
             string storageName,
-            ModuleStorageClaimRequest request,
+            ScopedStorageClaimRequest request,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public Task<ModuleStorageClaimRenewalResult> RenewClaimAsync(
-            string moduleId,
+        public Task<ScopedStorageClaimRenewalResult> RenewClaimAsync(
+            string SourceId,
             string storageName,
-            ModuleStorageClaimRenewalRequest request,
+            ScopedStorageClaimRenewalRequest request,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public Task<ModuleStorageClaimRecoveryResult> RecoverClaimAsync(
-            string moduleId,
+        public Task<ScopedStorageClaimRecoveryResult> RecoverClaimAsync(
+            string SourceId,
             string storageName,
-            ModuleStorageClaimRecoveryRequest request,
+            ScopedStorageClaimRecoveryRequest request,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
 
         private static bool SameExpectedRevisions(
-            ModuleStorageMutationAndOutboxRequest left,
-            ModuleStorageMutationAndOutboxRequest right) =>
+            ScopedStorageMutationAndOutboxRequest left,
+            ScopedStorageMutationAndOutboxRequest right) =>
             left.Mutations.Count == right.Mutations.Count &&
             left.Mutations.Zip(right.Mutations).All(pair =>
                 string.Equals(pair.First.Key, pair.Second.Key, StringComparison.Ordinal) &&
@@ -3891,48 +3890,48 @@ public sealed class SimpleKernelContractTests
     }
 
     private sealed class StubStorageGateway(
-        Func<string, JsonElement> responseFactory) : IModuleStorageGateway
+        Func<string, JsonElement> responseFactory) : IScopedStorageGateway
     {
-        public IReadOnlyList<ModuleStorageContractDescriptor> ListContracts() => [];
+        public IReadOnlyList<ScopedStorageContractDescriptor> ListContracts() => [];
 
         public Task<JsonElement> InvokeAsync(
-            string moduleId,
+            string SourceId,
             string storageName,
             string operation,
             JsonElement parameters,
             CancellationToken ct = default) =>
             Task.FromResult(responseFactory(operation));
 
-        public Task<ModuleStorageMutationAndOutboxResult> CommitMutationAndOutboxAsync(
-            string moduleId,
+        public Task<ScopedStorageMutationAndOutboxResult> CommitMutationAndOutboxAsync(
+            string SourceId,
             string storageName,
-            ModuleStorageMutationAndOutboxRequest request,
+            ScopedStorageMutationAndOutboxRequest request,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public Task<ModuleStorageClaimResult<T>> ClaimAsync<T>(
-            string moduleId,
+        public Task<ScopedStorageClaimResult<T>> ClaimAsync<T>(
+            string SourceId,
             string storageName,
-            ModuleStorageClaimRequest request,
+            ScopedStorageClaimRequest request,
             CancellationToken ct = default)
         {
-            var response = responseFactory(ModuleStorageOperations.Claim);
-            var result = response.Deserialize<ModuleStorageClaimResult<T>>(
+            var response = responseFactory(ScopedStorageOperations.Claim);
+            var result = response.Deserialize<ScopedStorageClaimResult<T>>(
                 new JsonSerializerOptions(JsonSerializerDefaults.Web));
             return Task.FromResult(result!);
         }
 
-        public Task<ModuleStorageClaimRenewalResult> RenewClaimAsync(
-            string moduleId,
+        public Task<ScopedStorageClaimRenewalResult> RenewClaimAsync(
+            string SourceId,
             string storageName,
-            ModuleStorageClaimRenewalRequest request,
+            ScopedStorageClaimRenewalRequest request,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public Task<ModuleStorageClaimRecoveryResult> RecoverClaimAsync(
-            string moduleId,
+        public Task<ScopedStorageClaimRecoveryResult> RecoverClaimAsync(
+            string SourceId,
             string storageName,
-            ModuleStorageClaimRecoveryRequest request,
+            ScopedStorageClaimRecoveryRequest request,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
     }

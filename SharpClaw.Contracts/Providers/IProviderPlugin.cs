@@ -1,7 +1,7 @@
 namespace SharpClaw.Contracts.Providers;
 
 /// <summary>
-/// Plugin contract that a provider module contributes to DI. Replaces
+/// Plugin contract that a provider registration contributes to DI. Replaces
 /// the fixed <c>IProviderApiClient</c> dictionary previously held by
 /// <c>ProviderApiClientFactory</c>. Each plugin owns one provider key
 /// end-to-end: its API client, its model-capability rules, its cost
@@ -21,12 +21,12 @@ public interface IProviderPlugin
     string DisplayName { get; }
 
     /// <summary>
-    /// Module ID that owns this plugin, used by
+    /// Registration ID that owns this plugin, used by
     /// <c>ProviderApiClientFactory</c> to filter out plugins whose owning
-    /// module is currently disabled. Returns an empty string when the
-    /// plugin is registered outside the module system (no filtering).
+    /// registration is currently disabled. Returns an empty string when the
+    /// plugin is registered outside the registration system (no filtering).
     /// </summary>
-    string OwnerModuleId => string.Empty;
+    string OwnerId => string.Empty;
 
     /// <summary>
     /// When <see langword="true"/>, <see cref="CreateClient"/> requires a
@@ -117,7 +117,7 @@ public interface IProviderPlugin
     /// implementation slugifies the provider's display name; plugins
     /// that host models from external download sources (e.g. local
     /// GGUFs from HuggingFace vs. direct URLs) override this to derive
-    /// a stable identifier from module-owned data keyed by the model.
+    /// a stable identifier from registration-owned data keyed by the model.
     /// </summary>
     /// <param name="providerName">
     /// Display name of the provider record the model belongs to.
