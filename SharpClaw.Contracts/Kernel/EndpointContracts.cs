@@ -24,7 +24,21 @@ public sealed record EndpointRouteDescriptor(
 /// <summary>Identifies one route pattern as the HTTP matcher sees it.</summary>
 public readonly record struct EndpointRouteMatchIdentity(
     string CanonicalPath,
-    string Method);
+    string Method)
+{
+    public bool Equals(EndpointRouteMatchIdentity other) =>
+        StringComparer.OrdinalIgnoreCase.Equals(CanonicalPath, other.CanonicalPath) &&
+        StringComparer.OrdinalIgnoreCase.Equals(Method, other.Method);
+
+    public override int GetHashCode() =>
+        HashCode.Combine(
+            CanonicalPath is null
+                ? 0
+                : StringComparer.OrdinalIgnoreCase.GetHashCode(CanonicalPath),
+            Method is null
+                ? 0
+                : StringComparer.OrdinalIgnoreCase.GetHashCode(Method));
+}
 
 /// <summary>Applies one endpoint route collision policy before host route mapping.</summary>
 public static class EndpointRouteCollisionPolicy
@@ -104,7 +118,7 @@ public static class EndpointRouteCollisionPolicy
 
             if (insideParameter && character == '}')
                 insideParameter = false;
-            canonical.Append(char.ToLowerInvariant(character));
+            canonical.Append(character);
             index++;
         }
 

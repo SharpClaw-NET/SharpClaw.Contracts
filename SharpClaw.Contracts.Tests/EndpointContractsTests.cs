@@ -42,6 +42,7 @@ public sealed class EndpointContractsTests
     [InlineData("/Models/{id}", "/models/{name}")]
     [InlineData("/models", "/models/")]
     [InlineData("/models/{id:guid}", "/MODELS/{modelId:guid}")]
+    [InlineData("/\u03A3", "/\u03C2")]
     public void MatchEquivalentRoutesConflictBeforeHostMapping(
         string firstPath,
         string secondPath)
@@ -59,6 +60,26 @@ public sealed class EndpointContractsTests
 
         Assert.True(EndpointRouteCollisionPolicy.Conflicts(first, second));
         Assert.Equal(
+            EndpointRouteCollisionPolicy.GetMatchIdentity(first),
+            EndpointRouteCollisionPolicy.GetMatchIdentity(second));
+    }
+
+    [Fact]
+    public void OrdinallyDistinctUnicodeLiteralsDoNotConflict()
+    {
+        var first = new EndpointRouteDescriptor(
+            "first",
+            "/K",
+            "GET",
+            HostEndpointTransport.Http);
+        var second = new EndpointRouteDescriptor(
+            "second",
+            "/\u212A",
+            "GET",
+            HostEndpointTransport.Http);
+
+        Assert.False(EndpointRouteCollisionPolicy.Conflicts(first, second));
+        Assert.NotEqual(
             EndpointRouteCollisionPolicy.GetMatchIdentity(first),
             EndpointRouteCollisionPolicy.GetMatchIdentity(second));
     }
