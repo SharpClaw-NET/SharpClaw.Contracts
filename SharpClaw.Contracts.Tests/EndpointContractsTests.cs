@@ -38,6 +38,48 @@ public sealed class EndpointContractsTests
         Assert.False(descriptor.IsWellFormed);
     }
 
+    [Theory]
+    [InlineData("/Models/{id}", "/models/{name}")]
+    [InlineData("/models", "/models/")]
+    [InlineData("/models/{id:guid}", "/MODELS/{modelId:guid}")]
+    public void MatchEquivalentRoutesConflictBeforeHostMapping(
+        string firstPath,
+        string secondPath)
+    {
+        var first = new EndpointRouteDescriptor(
+            "first",
+            firstPath,
+            "GET",
+            HostEndpointTransport.Http);
+        var second = new EndpointRouteDescriptor(
+            "second",
+            secondPath,
+            "GET",
+            HostEndpointTransport.Http);
+
+        Assert.True(EndpointRouteCollisionPolicy.Conflicts(first, second));
+        Assert.Equal(
+            EndpointRouteCollisionPolicy.GetMatchIdentity(first),
+            EndpointRouteCollisionPolicy.GetMatchIdentity(second));
+    }
+
+    [Fact]
+    public void ExactHttpAndWebSocketRoutesShareOneHostMapping()
+    {
+        var http = new EndpointRouteDescriptor(
+            "http",
+            "/editor/{sessionId}",
+            "GET",
+            HostEndpointTransport.Http);
+        var webSocket = new EndpointRouteDescriptor(
+            "websocket",
+            "/editor/{sessionId}",
+            "GET",
+            HostEndpointTransport.WebSocket);
+
+        Assert.False(EndpointRouteCollisionPolicy.Conflicts(http, webSocket));
+    }
+
     [Fact]
     public void JsonResponseContainsBoundedHttpMetadata()
     {
