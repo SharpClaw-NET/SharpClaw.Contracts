@@ -746,6 +746,10 @@ public sealed class SimpleKernelContractTests
                 ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap),
             new RequestPrincipal("user-1"),
             ExtensionFeatureSet.Empty,
+            HookContext(new ActionCapabilityGrant(
+                new SharpClawActionKey("jobs.external_call"),
+                1,
+                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap)),
             handle);
         var replacement = new SidecarEffectRequest(
             Header(5),
@@ -1802,6 +1806,46 @@ public sealed class SimpleKernelContractTests
     }
 
     [Fact]
+    public void SidecarActionHookRejectsIncompleteExecutionContext()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var fixture = CreateDirectActionFixture(
+            now,
+            "execution-context",
+            SidecarPayloadMode.Untyped,
+            SidecarHookTargetKind.Exact);
+        var valid = fixture.Start.Context;
+
+        Assert.True(SidecarProtocolStateMachine.Validate(fixture.State, fixture.Start, now).Accepted);
+        AssertMalformed(valid with { IdempotencyKey = Guid.Empty });
+        AssertMalformed(valid with { Depth = -1 });
+        AssertMalformed(valid with { Attempt = 0 });
+        AssertMalformed(valid with { OwnerId = " " });
+        AssertMalformed(valid with
+        {
+            Snapshot = valid.Snapshot with { ContractHash = " " },
+        });
+        AssertMalformed(valid with
+        {
+            Snapshot = valid.Snapshot with { ActionGrants = null! },
+        });
+        AssertMalformed(valid with
+        {
+            Snapshot = valid.Snapshot with { ActionGrants = [] },
+        });
+
+        void AssertMalformed(SidecarHookExecutionContext context)
+        {
+            var result = SidecarProtocolStateMachine.Validate(
+                fixture.State,
+                fixture.Start with { Context = context },
+                now);
+            Assert.False(result.Accepted);
+            Assert.Equal(SidecarProtocolErrors.MalformedMessage, result.ErrorCode);
+        }
+    }
+
+    [Fact]
     public void SidecarStateRejectsCrossExchangeIdentitiesAndPrematureAcknowledgements()
     {
         var now = DateTimeOffset.UtcNow;
@@ -1848,6 +1892,10 @@ public sealed class SimpleKernelContractTests
                     ActionInterceptionCapabilities.Inspect),
                 new RequestPrincipal("user-1"),
                 ExtensionFeatureSet.Empty,
+                HookContext(new ActionCapabilityGrant(
+                    new SharpClawActionKey("demo.action"),
+                    1,
+                    ActionInterceptionCapabilities.Inspect)),
                 startHandle),
             now);
         Assert.True(started.Accepted);
@@ -2972,6 +3020,7 @@ public sealed class SimpleKernelContractTests
                 actionGrant,
                 new RequestPrincipal("user-1"),
                 ExtensionFeatureSet.Empty,
+                HookContext(actionGrant),
                 handle),
             now);
         Assert.False(actionInput.Accepted);
@@ -3213,6 +3262,7 @@ public sealed class SimpleKernelContractTests
                 grant,
                 new RequestPrincipal("user-1"),
                 ExtensionFeatureSet.Empty,
+                HookContext(grant),
                 new ContinuationHandle(Guid.NewGuid(), invocationId, "action-hook", now.AddMinutes(1), sequence));
         }
 
@@ -3681,6 +3731,14 @@ public sealed class SimpleKernelContractTests
     private static SidecarMessageHeader Header(long sequence = 1) =>
         new(1, sequence, DateTimeOffset.UtcNow.AddMinutes(1), new SidecarMessageSizeAuthority(128, 1024));
 
+    private static SidecarHookExecutionContext HookContext(ActionCapabilityGrant grant) =>
+        new(
+            Guid.NewGuid(),
+            0,
+            1,
+            "test-owner",
+            new ActionPipelineSnapshot("test-action-snapshot", [grant]));
+
     private static HostActionEntryRequestContext ToolContext(
         Guid invocationId,
         string toolName,
@@ -3799,6 +3857,7 @@ public sealed class SimpleKernelContractTests
             grant,
             new RequestPrincipal("user-1"),
             ExtensionFeatureSet.Empty,
+            HookContext(grant),
             continuation);
 
         return new DirectActionFixture(targetKind, state, start, grant, descriptor);

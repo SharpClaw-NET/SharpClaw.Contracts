@@ -769,6 +769,25 @@ public sealed record ContinuationHandle(
     long Sequence,
     bool IsSingleUse = true);
 
+/// <summary>Preserves one action hook's host-issued execution context.</summary>
+public sealed record SidecarHookExecutionContext(
+    Guid IdempotencyKey,
+    int Depth,
+    int Attempt,
+    string OwnerId,
+    ActionPipelineSnapshot Snapshot)
+{
+    /// <summary>Gets whether the context contains complete action lineage.</summary>
+    public bool IsWellFormed =>
+        IdempotencyKey != Guid.Empty &&
+        Depth >= 0 &&
+        Attempt >= 1 &&
+        !string.IsNullOrWhiteSpace(OwnerId) &&
+        Snapshot is not null &&
+        !string.IsNullOrWhiteSpace(Snapshot.ContractHash) &&
+        Snapshot.ActionGrants is not null;
+}
+
 public sealed record HookInvokeStart(
     SidecarMessageHeader Header,
     Guid InvocationId,
@@ -783,6 +802,7 @@ public sealed record HookInvokeStart(
     ActionCapabilityGrant Grant,
     RequestPrincipal Caller,
     ExtensionFeatureSet Features,
+    SidecarHookExecutionContext Context,
     ContinuationHandle Continuation) : ISidecarProtocolMessage
 {
     public SidecarProtocolMessageKind MessageKind => SidecarProtocolMessageKind.HookInvokeStart;
@@ -1485,6 +1505,7 @@ public static class SidecarProtocolStateMachine
         ISidecarProtocolMessage message) =>
         message switch
         {
+            HookInvokeStart item => ValidateHookInvokeStartShape(item),
             SidecarEffectRequest item => ValidateEffectShape(item),
             EventInterceptOutcome item => ValidateEventOutcomeShape(item),
             SidecarResultReplacement item => ValidateResultReplacementShape(item),
@@ -1492,6 +1513,18 @@ public static class SidecarProtocolStateMachine
                 ValidateDirectHookOutcomeShape(item),
             _ => null,
         };
+
+    private static SidecarProtocolTransitionResult? ValidateHookInvokeStartShape(
+        HookInvokeStart item) =>
+        item.Context is { IsWellFormed: true }
+        && item.Caller is not null
+        && !string.IsNullOrWhiteSpace(item.Caller.SubjectId)
+        && item.Features?.Items is not null
+        && item.Context.Snapshot.ActionGrants.Any(grant => Equals(grant, item.Grant))
+            ? null
+            : Reject(
+                SidecarProtocolErrors.MalformedMessage,
+                "The action hook execution context is invalid.");
 
     private static SidecarProtocolTransitionResult? ValidateResultReplacementShape(
         SidecarResultReplacement item) =>

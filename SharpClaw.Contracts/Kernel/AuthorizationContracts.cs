@@ -89,6 +89,19 @@ public interface IAuthorizationPolicy
         CancellationToken cancellationToken = default);
 }
 
+/// <summary>Supplies immutable authority and lineage to one independent restriction.</summary>
+public sealed record AuthorizationRestrictionContext(
+    AuthorizationRequest Request,
+    RequestPrincipal Caller,
+    ExtensionFeatureSet Features,
+    Guid InvocationId,
+    Guid? ParentInvocationId,
+    Guid TraceId,
+    Guid IdempotencyKey,
+    int Depth,
+    int Attempt,
+    DateTimeOffset Deadline);
+
 /// <summary>Preserves or denies an authorization request without granting access.</summary>
 public readonly record struct AuthorizationRestriction
 {
@@ -119,7 +132,7 @@ public readonly record struct AuthorizationRestriction
 public interface IAuthorizationRestriction
 {
     ValueTask<AuthorizationRestriction> EvaluateAsync(
-        ActionContext<AuthorizationRequest> context,
+        AuthorizationRestrictionContext context,
         CancellationToken cancellationToken = default);
 }
 
