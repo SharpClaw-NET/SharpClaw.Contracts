@@ -483,7 +483,10 @@ public static class SidecarCrossSidecarActionEntryValidation
             authorityExecution is not null &&
             authorityExecution.Completed &&
             authorityExecution.Result == outcome?.Result &&
-            authorityExecution.Failure == (result.Kind == SidecarCrossSidecarActionEntryOutcomeKind.Completed ? null : result.Failure);
+            authorityExecution.Failure == (result.Kind == SidecarCrossSidecarActionEntryOutcomeKind.Completed ? null : result.Failure) &&
+            (authorityExecution.Error is null ||
+             ExecutionErrorValueComparer.Matches(authorityExecution.Error, outcome?.Error)) &&
+            (result.Kind == SidecarCrossSidecarActionEntryOutcomeKind.Failed || authorityExecution.Error is null);
         if (!validOutcome ||
             outcome!.Receipt != result.ResultReceipt ||
             !terminalAuthorityMatches)

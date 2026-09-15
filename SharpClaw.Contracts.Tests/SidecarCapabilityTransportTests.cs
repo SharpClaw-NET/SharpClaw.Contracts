@@ -7520,6 +7520,22 @@ public sealed class SidecarCapabilityTransportTests
                 Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true),
             },
             fixture.Binding).Accepted);
+        var declaredError = new ExecutionError(
+            "policy_unavailable",
+            "The policy is unavailable.",
+            IsRetryable: true,
+            new Dictionary<string, string> { ["policy"] = "tenant" });
+        Assert.True(SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+            terminalRequest,
+            terminalResponse with
+            {
+                ResultIdentity = null,
+                Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true)
+                {
+                    Error = declaredError,
+                },
+            },
+            fixture.Binding).Accepted);
         Assert.Equal(
             SidecarCapabilityErrors.SpoofedIdentity,
             SidecarCapabilityTransportValidation.ValidateActionTerminalRequest(
@@ -7551,6 +7567,31 @@ public sealed class SidecarCapabilityTransportTests
                 {
                     ResultIdentity = null,
                     Execution = new SidecarTerminalExecutionResult(null, null, true),
+                },
+                fixture.Binding).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                terminalResponse with
+                {
+                    Execution = new SidecarTerminalExecutionResult(outcomePayload, null, true)
+                    {
+                        Error = declaredError,
+                    },
+                },
+                fixture.Binding).Code);
+        Assert.Equal(
+            SidecarCapabilityErrors.InvalidResponse,
+            SidecarCapabilityTransportValidation.ValidateActionTerminalResponse(
+                terminalRequest,
+                terminalResponse with
+                {
+                    ResultIdentity = null,
+                    Execution = new SidecarTerminalExecutionResult(null, fixture.SafeFailure, true)
+                    {
+                        Error = new ExecutionError(string.Empty, "The policy is unavailable."),
+                    },
                 },
                 fixture.Binding).Code);
         Assert.Equal(
@@ -14415,20 +14456,60 @@ public sealed class SidecarCapabilityTransportTests
             cross.Relay.Carrier.Authority.TargetChildCall.CallId,
             terminal.TerminalId,
             receipt).Accepted);
+        var outcomeError = includeError
+            ? new ExecutionError(
+                "cross.error",
+                "The operation failed.",
+                IsRetryable: true,
+                new Dictionary<string, string> { ["policy"] = "tenant" })
+            : null;
         var outcome = new SidecarActionOutcomeEnvelope(
             kind,
             null,
             null,
-            includeError ? new ExecutionError("cross.error", "The operation failed.") : null,
+            outcomeError,
             null,
             receipt,
             failure,
             1);
+        var execution = new SidecarTerminalExecutionResult(null, failure, true)
+        {
+            Error = outcomeError is null
+                ? null
+                : new ExecutionError(
+                    outcomeError.Code,
+                    outcomeError.Message,
+                    outcomeError.IsRetryable,
+                    new Dictionary<string, string> { ["policy"] = "tenant" }),
+        };
+        if (includeError)
+        {
+            var rejected = cross.TargetSession.CompleteCrossSidecarActionEntry(
+                cross.Relay.Carrier,
+                outcome,
+                receipt,
+                execution with
+                {
+                    Error = new ExecutionError(
+                        outcomeError!.Code,
+                        outcomeError.Message,
+                        outcomeError.IsRetryable,
+                        new Dictionary<string, string> { ["policy"] = "other" }),
+                },
+                null,
+                failure,
+                cross.Now,
+                (authority, hash) => hash,
+                out _);
+            Assert.False(rejected.Accepted);
+            Assert.Equal(SidecarCapabilityErrors.InvalidResponse, rejected.Code);
+        }
+
         var complete = cross.TargetSession.CompleteCrossSidecarActionEntry(
             cross.Relay.Carrier,
             outcome,
             receipt,
-            new SidecarTerminalExecutionResult(null, failure, true),
+            execution,
             null,
             failure,
             cross.Now,

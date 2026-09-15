@@ -6706,6 +6706,9 @@ public sealed class SidecarCapabilitySession : ISidecarExternalActionDispatchAut
                 !execution.Completed ||
                 execution.Result != outcome.Result ||
                 execution.Failure != (outcome.Kind == ActionOutcomeKind.Completed ? null : responseSafeFailure) ||
+                execution.Error is not null &&
+                    !ExecutionErrorValueComparer.Matches(execution.Error, outcome.Error) ||
+                outcome.Kind != ActionOutcomeKind.Failed && execution.Error is not null ||
                 outcome.SafeFailure != responseSafeFailure ||
                 (outcome.Kind == ActionOutcomeKind.Completed
                     ? execution.Failure is not null
@@ -9718,7 +9721,10 @@ public sealed record SidecarActionTerminalTransportRequest(
 public sealed record SidecarTerminalExecutionResult(
     SidecarSerializedPayload? Result,
     SidecarSafeFailureIdentity? Failure,
-    bool Completed);
+    bool Completed)
+{
+    public ExecutionError? Error { get; init; }
+}
 
 public sealed record SidecarActionTerminalTransportResponse(
     SidecarActionResultIdentity? ResultIdentity,
@@ -10592,6 +10598,7 @@ public static class SidecarCapabilityTransportValidation
             (nestedKind == SidecarNestedHostActionEntryRelayOutcomeKind.Issued
                 ? response.Execution?.Result is not null &&
                   response.Execution.Failure is null &&
+                  response.Execution.Error is null &&
                   response.ResultIdentity is not null
                 : response.Execution?.Result is null &&
                   response.Execution?.Failure is not null &&
@@ -10606,8 +10613,10 @@ public static class SidecarCapabilityTransportValidation
             response.Receipt != request.Receipt ||
             response.SafeFailure is null ||
             !SameSafeFailure(response.SafeFailure, binding.SafeFailure) ||
-            response.Execution.Result is not null && response.Execution.Failure is not null ||
+            response.Execution.Result is not null &&
+                (response.Execution.Failure is not null || response.Execution.Error is not null) ||
             response.Execution.Result is null && response.Execution.Failure is null ||
+            response.Execution.Error is not null && response.Execution.Failure is null ||
             response.Execution.Failure is not null && response.ResultIdentity is not null)
         {
             return SidecarCapabilityValidationResult.Reject(
@@ -10644,6 +10653,13 @@ public static class SidecarCapabilityTransportValidation
             return SidecarCapabilityValidationResult.Reject(
                 SidecarCapabilityErrors.InvalidResponse,
                 "The terminal failure is not the session safe-failure identity.");
+        }
+
+        if (!IsValidExecutionError(response.Execution.Error))
+        {
+            return SidecarCapabilityValidationResult.Reject(
+                SidecarCapabilityErrors.InvalidResponse,
+                "The terminal declared error is malformed.");
         }
 
         return SidecarCapabilityValidationResult.Accept();
@@ -10779,6 +10795,7 @@ public static class SidecarCapabilityTransportValidation
             response.Execution.Completed ||
             response.Execution.Result is not null ||
             response.Execution.Failure is not null ||
+            response.Execution.Error is not null ||
             response.SafeFailure != sourceBinding.SafeFailure)
         {
             return SidecarCapabilityValidationResult.Reject(
@@ -10791,6 +10808,13 @@ public static class SidecarCapabilityTransportValidation
 
     private static bool IsValidDescriptor(SidecarActionDescriptorIdentity descriptor) =>
         descriptor is not null && descriptor.IsWellFormed;
+
+    private static bool IsValidExecutionError(ExecutionError? error) =>
+        error is null ||
+        !string.IsNullOrWhiteSpace(error.Code) &&
+        !string.IsNullOrWhiteSpace(error.Message) &&
+        (error.Details is null || error.Details.All(static detail =>
+            !string.IsNullOrWhiteSpace(detail.Key) && detail.Value is not null));
 
     private static bool MatchesCrossSidecarContext(
         SidecarActionTerminalExecutionContext context,

@@ -72,6 +72,56 @@ public sealed record ExecutionError(
     bool IsRetryable = false,
     IReadOnlyDictionary<string, string>? Details = null);
 
+internal static class ExecutionErrorValueComparer
+{
+    public static bool Matches(ExecutionError? left, ExecutionError? right)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+        if (left is null || right is null)
+            return false;
+        if (!string.Equals(left.Code, right.Code, StringComparison.Ordinal) ||
+            !string.Equals(left.Message, right.Message, StringComparison.Ordinal) ||
+            left.IsRetryable != right.IsRetryable)
+        {
+            return false;
+        }
+
+        return DetailsMatch(left.Details, right.Details);
+    }
+
+    private static bool DetailsMatch(
+        IReadOnlyDictionary<string, string>? left,
+        IReadOnlyDictionary<string, string>? right)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+        if (left is null || right is null || left.Count != right.Count)
+            return false;
+
+        foreach (var entry in left)
+        {
+            var found = false;
+            foreach (var candidate in right)
+            {
+                if (!string.Equals(entry.Key, candidate.Key, StringComparison.Ordinal))
+                    continue;
+
+                if (!string.Equals(entry.Value, candidate.Value, StringComparison.Ordinal))
+                    return false;
+
+                found = true;
+                break;
+            }
+
+            if (!found)
+                return false;
+        }
+
+        return true;
+    }
+}
+
 /// <summary>Identifies the caller that started an action or chat turn.</summary>
 public sealed record RequestPrincipal(
     string SubjectId,
